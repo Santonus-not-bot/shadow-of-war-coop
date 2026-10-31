@@ -1,0 +1,5 @@
+build/
+test-run*/
+test-run*.log
+*.obj
+*.pdb

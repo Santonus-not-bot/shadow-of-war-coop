@@ -1,0 +1,3329 @@
+// simhook: run game calls on the game's simulation thread (see simhook.h).
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <sstream>
+#include <vector>
+
+#include "input.h"
+#include "probe.h"
+#include "simhook.h"
+
+namespace {
+
+const uint8_t* Base() { return reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr)); }
+
+// True when p is inside an executable section of the game's own image.
+bool IsGameCode(const void* p) {
+  const uint8_t* base = Base();
+  auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+  const auto* sec = IMAGE_FIRST_SECTION(nt);
+  const auto* b = static_cast<const uint8_t*>(p);
+  for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec)
+    if ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) && b >= base + sec->VirtualAddress &&
+        b < base + sec->VirtualAddress + sec->Misc.VirtualSize)
+      return true;
+  return false;
+}
+
+bool ReadPtr(void* const* at, void** out) {
+  __try {
+    *out = *at;
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+bool WriteSlot(void** slot, void* value) {
+  DWORD old = 0;
+  if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) return false;
+  InterlockedExchangePointer(slot, value);
+  VirtualProtect(slot, sizeof(void*), old, &old);
+  return true;
+}
+
+void PutRel32(uint8_t* at, const void* from_end, const void* to) {
+  const int32_t rel = (int32_t)(static_cast<const uint8_t*>(to) - static_cast<const uint8_t*>(from_end));
+  memcpy(at, &rel, 4);
+}
+
+// ---------------------------------------------------------------- count
+
+// Per slot, 28 bytes of code that touch only rax and the flags (not arguments in the
+// Windows x64 convention), then continue into the original:
+//   F0 48 FF 05 <rel32>       lock inc qword [rip+calls]
+//   65 8B 04 25 48 00 00 00   mov eax, gs:[48h]          ; TEB thread id
+//   89 05 <rel32>             mov [rip+thread], eax
+//   FF 25 <rel32>             jmp [rip+original]
+struct CountData {
+  volatile LONG64 calls;
+  volatile DWORD thread;
+  DWORD pad;
+  void* original;
+};
+
+}  // namespace
+
+std::string SimCountSlots(uintptr_t vtable_rva, unsigned first, unsigned n, unsigned ms) {
+  if (n == 0 || n > 64 || ms == 0 || ms > 30000) return "err usage: count <vtable rva> <first slot> <1..64 slots> <1..30000 ms>\n";
+  void** vt = reinterpret_cast<void**>(const_cast<uint8_t*>(Base()) + vtable_rva) + first;
+  void* p = nullptr;
+  for (unsigned i = 0; i < n; ++i)
+    if (!ReadPtr(&vt[i], &p) || !IsGameCode(p)) {
+      char e[96];
+      snprintf(e, sizeof e, "err slot %u does not point into the game's code\n", first + i);
+      return e;
+    }
+  // One page, never freed: a stub may still be running on another thread after the restore.
+  auto* page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+  if (!page) return "err no memory for the counting stubs\n";
+  auto* data = reinterpret_cast<CountData*>(page + 2048);
+  for (unsigned i = 0; i < n; ++i) {
+    uint8_t* s = page + 32 * i;
+    data[i] = CountData{0, 0, 0, vt[i]};
+    const uint8_t code[] = {0xF0, 0x48, 0xFF, 0x05, 0, 0, 0, 0, 0x65, 0x8B, 0x04, 0x25, 0x48, 0x00,
+                            0x00, 0x00, 0x89, 0x05, 0, 0, 0, 0, 0xFF, 0x25, 0, 0, 0, 0};
+    memcpy(s, code, sizeof code);
+    PutRel32(s + 4, s + 8, const_cast<LONG64*>(&data[i].calls));
+    PutRel32(s + 18, s + 22, const_cast<DWORD*>(&data[i].thread));
+    PutRel32(s + 24, s + 28, &data[i].original);
+  }
+  FlushInstructionCache(GetCurrentProcess(), page, 4096);
+  for (unsigned i = 0; i < n; ++i) WriteSlot(&vt[i], page + 32 * i);
+  SowLog(L"probe: counting calls to %u slots of vtable rva:%llX for %u ms", n, (unsigned long long)vtable_rva, ms);
+  Sleep(ms);
+  for (unsigned i = 0; i < n; ++i) WriteSlot(&vt[i], data[i].original);
+  const DWORD sim = InputGameThread();
+  std::string out = "ok simulation thread " + std::to_string(sim) + "\n";
+  char line[160];
+  for (unsigned i = 0; i < n; ++i) {
+    const LONG64 c = data[i].calls;
+    snprintf(line, sizeof line, "slot %u rva:%llX calls=%lld per_s=%.1f thread=%lu%s\n", first + i,
+             (unsigned long long)(static_cast<const uint8_t*>(data[i].original) - Base()), c, c * 1000.0 / ms,
+             data[i].thread, c && data[i].thread == sim ? " (simulation)" : "");
+    out += line;
+  }
+  return out;
+}
+
+namespace {
+
+// ---------------------------------------------------------------- simulation-thread hook
+
+// Pre-hook stub: saves rax, rcx, rdx, r8-r11, xmm0-5 and the flags, calls SimWork, restores
+// them and jumps to the original. Entry rsp is 8 mod 16; eight pushes keep it there; the
+// sub makes it 16-aligned for the call.
+//   0  9C                       pushfq
+//   1  50 51 52                 push rax, rcx, rdx
+//   4  41 50 41 51 41 52 41 53  push r8, r9, r10, r11
+//  12  48 81 EC 88 00 00 00     sub rsp, 88h
+//  19  movdqu [rsp+20h+16*i], xmm0..5      (6 x 6 bytes)
+//  55  48 B8 <imm64>            mov rax, SimWork
+//  65  FF D0                    call rax
+//  67  movdqu xmm0..5, [rsp+20h+16*i]      (6 x 6 bytes)
+// 103  48 81 C4 88 00 00 00     add rsp, 88h
+// 110  41 5B 41 5A 41 59 41 58  pop r11, r10, r9, r8
+// 118  5A 59 58                 pop rdx, rcx, rax
+// 121  9D                       popfq
+// 122  FF 25 <rel32>            jmp [rip+original]   (original at page+224)
+constexpr size_t kPreStubSize = 128;
+
+// UNWIND_INFO: version 1, prologue 19 bytes, 10 slots: sub rsp,88h (UWOP_ALLOC_LARGE, 17 in
+// the next slot), then the eight pushes as UWOP_ALLOC_SMALL 8 at their end offsets.
+const uint8_t kPreStubUnwind[24] = {0x01, 19, 10, 0x00, 19, 0x01, 17, 0x00, 12, 0x02, 10, 0x02,
+                                    8,    0x02, 6, 0x02, 4, 0x02, 3, 0x02, 2, 0x02, 1, 0x02};
+
+using Lkp_t = void(__fastcall*)(void* player, const float* pos);
+CRITICAL_SECTION g_lock;
+struct LockInit {
+  LockInit() { InitializeCriticalSection(&g_lock); }
+} g_lock_init;  // the probe may ask before sim_hook is in
+volatile LONG g_installed = 0;
+volatile LONG g_pending = 0;
+float g_pos[3] = {};
+Lkp_t g_lkp = nullptr;
+uintptr_t g_player_global = 0;
+volatile LONG g_shown = 0;
+volatile LONG g_wrong_thread_logged = 0;
+
+void* ReadPlayer() {
+  __try {
+    auto gc = *reinterpret_cast<uint8_t* const*>(g_player_global);
+    return gc ? *reinterpret_cast<void* const*>(gc + 0x888) : nullptr;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return nullptr;
+  }
+}
+
+void* PlayerEffect(void* player) {
+  __try {
+    return *reinterpret_cast<void* const*>(static_cast<uint8_t*>(player) + 0x3890);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return nullptr;
+  }
+}
+
+// Puppet state. The transform is what 1820FC builds: position, then the quaternion.
+struct Xform {
+  float pos[3];
+  float rot[4];
+};
+using Teleport_t = void(__fastcall*)(void* object, const Xform* xform);
+uintptr_t g_puppet = 0, g_puppet_vt = 0, g_puppet_health = 0;
+Teleport_t g_teleport = nullptr;
+volatile LONG g_move_pending = 0;
+Xform g_move{};
+// Direct: the transform written in place (+0xAC position, as the game's transform setter 14554C
+// writes it, and +0xB8 rotation) instead of the queued teleport, which puts a character on the
+// ground below the given point (a stand-in "teleported" to a sender in the air landed 2,374
+// units down, at the foot of the tower; session an).
+bool g_move_direct = false;
+
+bool WriteXform(uintptr_t owner, const Xform& x) {
+  for (float v : x.pos)
+    if (!std::isfinite(v)) return false;
+  __try {
+    memcpy(reinterpret_cast<void*>(owner + 0xAC), x.pos, sizeof x.pos);
+    memcpy(reinterpret_cast<void*>(owner + 0xB8), x.rot, sizeof x.rot);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return true;
+}
+volatile LONG g_moves = 0;
+
+bool ReadQ(uintptr_t at, uintptr_t* out) {
+  __try {
+    *out = *reinterpret_cast<const uintptr_t*>(at);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+// The puppet still is what was chosen: same class, and its health object still points
+// back at it (a freed or reused object fails this).
+bool PuppetAlive(uintptr_t owner, uintptr_t vt, uintptr_t health) {
+  uintptr_t v = 0, h = 0, back = 0;
+  return ReadQ(owner, &v) && v == vt && ReadQ(owner + 0x26A8, &h) && h == health && ReadQ(h + 0x28, &back) &&
+         back == owner;
+}
+
+void RunLkp(DWORD me) {
+  float pos[3];
+  EnterCriticalSection(&g_lock);
+  const bool run = InterlockedExchange(&g_pending, 0) != 0;
+  memcpy(pos, g_pos, sizeof pos);
+  LeaveCriticalSection(&g_lock);
+  void* player = run ? ReadPlayer() : nullptr;
+  if (!player) return;
+  g_lkp(player, pos);
+  const LONG n = InterlockedIncrement(&g_shown);
+  if (n <= 20 || n % 100 == 0)
+    SowLog(L"sim: last-known-position effect #%ld at %.1f,%.1f,%.1f (player+0x3890 = %p, thread %lu)", n, pos[0],
+           pos[1], pos[2], PlayerEffect(player), me);
+}
+
+void RunPuppetMove(DWORD me) {
+  EnterCriticalSection(&g_lock);
+  const bool run = InterlockedExchange(&g_move_pending, 0) != 0;
+  const Xform x = g_move;
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!run || !owner) return;
+  if (!PuppetAlive(owner, vt, health)) {
+    EnterCriticalSection(&g_lock);
+    if (g_puppet == owner) g_puppet = 0;
+    LeaveCriticalSection(&g_lock);
+    SowLog(L"sim: puppet abs:%llX is gone (unloaded or freed); no puppet now", (unsigned long long)owner);
+    return;
+  }
+  EnterCriticalSection(&g_lock);
+  const bool direct = g_move_direct;
+  LeaveCriticalSection(&g_lock);
+  if (direct) {
+    WriteXform(owner, x);
+    return;
+  }
+  g_teleport(reinterpret_cast<void*>(owner), &x);
+  const LONG n = InterlockedIncrement(&g_moves);
+  if (n <= 10 || n % 200 == 0)
+    SowLog(L"sim: puppet move #%ld to %.1f,%.1f,%.1f (thread %lu)", n, x.pos[0], x.pos[1], x.pos[2], me);
+}
+
+// Puppet AI and walking (defined below): queued work for the simulation thread.
+bool ExtraPending();
+void RunExtra();
+}  // namespace
+void RefreshInputOwner();
+bool InputsOn();
+void ApplyMirror();
+namespace {
+
+uintptr_t ImageEnd();  // below
+
+// Access violations in the game's own code, on any thread, go to the log with the faulting
+// address and the call stack (the first 16; the exception is passed on unchanged). A test
+// copy that dies otherwise leaves only its exit code.
+volatile LONG g_crashes_logged = 0;
+LONG CALLBACK CrashLogHandler(EXCEPTION_POINTERS* e) {
+  const EXCEPTION_RECORD* x = e->ExceptionRecord;
+  const uintptr_t rip = e->ContextRecord->Rip, base = reinterpret_cast<uintptr_t>(Base());
+  if (x->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rip < base || rip >= ImageEnd() ||
+      InterlockedIncrement(&g_crashes_logged) > 16)
+    return EXCEPTION_CONTINUE_SEARCH;
+  wchar_t line[512];
+  int n = swprintf_s(line, L"crash: access violation at rva:%llX (%s abs:%llX) thread %lu, stack",
+                     (unsigned long long)(rip - base), x->ExceptionInformation[0] ? L"writing" : L"reading",
+                     (unsigned long long)x->ExceptionInformation[1], GetCurrentThreadId());
+  CONTEXT c = *e->ContextRecord;
+  __try {
+    for (int k = 0; k < 12 && n > 0 && n < 480; ++k) {
+      DWORD64 image = 0;
+      PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
+      if (f) {
+        void* hd = nullptr;
+        DWORD64 fr = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, f, &c, &hd, &fr, nullptr);
+      } else {
+        c.Rip = *reinterpret_cast<const DWORD64*>(c.Rsp);
+        c.Rsp += 8;
+      }
+      if (c.Rip < 0x10000) break;
+      n += c.Rip >= base && c.Rip < ImageEnd()
+               ? swprintf_s(line + n, 512 - n, L" rva:%llX", (unsigned long long)(c.Rip - base))
+               : swprintf_s(line + n, 512 - n, L" abs:%llX", (unsigned long long)c.Rip);
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  SowLog(L"%s", line);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void CrashLogInstall() {
+  static PVOID handler = nullptr;
+  if (!handler) handler = AddVectoredExceptionHandler(0, CrashLogHandler);
+}
+
+// Called by the pre-stub every time the hooked slot runs; must stay cheap.
+void (*volatile g_frame_callback)() = nullptr;
+
+void SimWork() {
+  void (*const callback)() = g_frame_callback;
+  if (!callback && !g_pending && !g_move_pending && !ExtraPending() && !InputsOn()) return;
+  const DWORD me = GetCurrentThreadId(), sim = InputGameThread();
+  if (!sim) return;  // the world has not started; nothing runs yet
+  if (me != sim) {
+    if (InterlockedIncrement(&g_wrong_thread_logged) == 1)
+      SowLog(L"sim: hook ran on thread %lu, not the simulation thread %lu; work left queued", me, sim);
+    return;
+  }
+  if (InputsOn()) RefreshInputOwner();
+  if (callback) callback();
+  if (g_pending) RunLkp(me);
+  if (g_move_pending) RunPuppetMove(me);
+  if (ExtraPending()) RunExtra();
+  ApplyMirror();
+}
+
+}  // namespace
+
+bool SimHookInstall(uintptr_t vtable_rva, unsigned slot, std::string* err) {
+  void** vt = reinterpret_cast<void**>(const_cast<uint8_t*>(Base()) + vtable_rva);
+  void* current = nullptr;
+  if (!ReadPtr(&vt[slot], &current) || !IsGameCode(current)) {
+    *err = "the slot does not point into the game's code";
+    return false;
+  }
+  auto* page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+  if (!page) {
+    *err = "no memory for the stub";
+    return false;
+  }
+  std::vector<uint8_t> s = {0x9C, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52,
+                            0x41, 0x53, 0x48, 0x81, 0xEC, 0x88, 0x00, 0x00, 0x00};
+  for (uint8_t i = 0; i < 6; ++i) s.insert(s.end(), {0xF3, 0x0F, 0x7F, (uint8_t)(0x44 | i << 3), 0x24, (uint8_t)(0x20 + 16 * i)});
+  s.insert(s.end(), {0x48, 0xB8});
+  void* work = reinterpret_cast<void*>(&SimWork);
+  const auto* w = reinterpret_cast<const uint8_t*>(&work);
+  s.insert(s.end(), w, w + 8);
+  s.insert(s.end(), {0xFF, 0xD0});
+  for (uint8_t i = 0; i < 6; ++i) s.insert(s.end(), {0xF3, 0x0F, 0x6F, (uint8_t)(0x44 | i << 3), 0x24, (uint8_t)(0x20 + 16 * i)});
+  s.insert(s.end(), {0x48, 0x81, 0xC4, 0x88, 0x00, 0x00, 0x00, 0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58,
+                     0x5A, 0x59, 0x58, 0x9D, 0xFF, 0x25, 0, 0, 0, 0});
+  if (s.size() != kPreStubSize) {
+    *err = "stub size mismatch";
+    return false;
+  }
+  memcpy(page, s.data(), s.size());
+  void* original = vt[slot];
+  memcpy(page + 224, &original, 8);
+  PutRel32(page + 124, page + 128, page + 224);
+  memcpy(page + 160, kPreStubUnwind, sizeof kPreStubUnwind);
+  auto* fn = reinterpret_cast<RUNTIME_FUNCTION*>(page + 192);
+  fn->BeginAddress = 0;
+  fn->EndAddress = (DWORD)kPreStubSize;
+  fn->UnwindData = 160;
+  DWORD old = 0;
+  VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+  FlushInstructionCache(GetCurrentProcess(), page, 4096);
+  RtlAddFunctionTable(fn, 1, reinterpret_cast<DWORD64>(page));
+#ifndef SOWGUARD_MUTANT  // negative control: the hook is never wired in
+  if (!WriteSlot(&vt[slot], page)) {
+    *err = "cannot write the vtable slot";
+    return false;
+  }
+  InterlockedExchange(&g_installed, 1);
+#endif
+  CrashLogInstall();
+  SowLog(L"sim: pre-hook on vtable rva:%llX slot %u (rva:%llX)", (unsigned long long)vtable_rva, slot,
+         (unsigned long long)(static_cast<const uint8_t*>(original) - Base()));
+  return true;
+}
+
+// 19C0380 starts: mov [rsp+8],rbx; mov [rsp+10h],rsi; push rdi; sub rsp,40h;
+// mov rax,[rip+<GameClient+0x18>] (another client global, read for a visibility check).
+bool SimRequestLkp(uintptr_t lkp_rva, uintptr_t gameclient_rva, const float pos[3], std::string* err) {
+  if (!g_installed) {
+    *err = "simulation-thread hook not installed (sim_hook)";
+    return false;
+  }
+  if (!InputGameThread()) {
+    *err = "world not started yet (no GameModeSet seen)";
+    return false;
+  }
+  static const uint8_t kHead[] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24,
+                                  0x10, 0x57, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x8B, 0x05};
+  const uint8_t* base = Base();
+  const uint8_t* f = base + lkp_rva;
+  int32_t disp = 0;
+  memcpy(&disp, f + 18, 4);
+  if (memcmp(f, kHead, sizeof kHead) || f + 22 + disp != base + gameclient_rva + 0x18) {
+    *err = "last-known-position function bytes differ from the known build; refused";
+    return false;
+  }
+  EnterCriticalSection(&g_lock);
+  g_lkp = reinterpret_cast<Lkp_t>(const_cast<uint8_t*>(f));
+  g_player_global = reinterpret_cast<uintptr_t>(base) + gameclient_rva;
+  memcpy(g_pos, pos, sizeof g_pos);
+  InterlockedExchange(&g_pending, 1);
+  LeaveCriticalSection(&g_lock);
+  return true;
+}
+
+unsigned SimLkpShown() { return (unsigned)g_shown; }
+
+bool SimHookInstalled() { return g_installed != 0; }
+
+void SimSetFrameCallback(void (*callback)()) { g_frame_callback = callback; }
+
+namespace {
+size_t ScanPage(const uint64_t* p, uint64_t value, uintptr_t* out, size_t room);
+}
+
+// Only pages already in the game's working set are read: reading a committed page that
+// was never touched makes Windows give it RAM (seen 2026-10-21: a full scan grew the game
+// from ~2 GB to 6.3 GB).
+size_t SimScanHeap(uint64_t value, uintptr_t* out, size_t room, size_t* resident_bytes) {
+  ULONG_PTR stack_lo = 0, stack_hi = 0;  // this thread's stack holds value itself
+  GetCurrentThreadStackLimits(&stack_lo, &stack_hi);
+  std::vector<PSAPI_WORKING_SET_EX_INFORMATION> pages(4096);
+  size_t found = 0, resident = 0;
+  MEMORY_BASIC_INFORMATION mbi;
+  for (uintptr_t a = 0x10000; found < room && VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi);
+       a = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize) {
+    const uintptr_t start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    if (mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || (mbi.Protect & PAGE_GUARD) ||
+        !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) || (start >= stack_lo && start < stack_hi))
+      continue;
+    for (uintptr_t chunk = start; chunk < start + mbi.RegionSize && found < room; chunk += pages.size() * 4096) {
+      const size_t n = std::min<size_t>(pages.size(), (start + mbi.RegionSize - chunk) / 4096);
+      for (size_t i = 0; i < n; ++i) pages[i].VirtualAddress = reinterpret_cast<void*>(chunk + i * 4096);
+      if (!QueryWorkingSetEx(GetCurrentProcess(), pages.data(), (DWORD)(n * sizeof pages[0]))) continue;
+      for (size_t i = 0; i < n && found < room; ++i) {
+        if (!pages[i].VirtualAttributes.Valid) continue;
+        resident += 4096;
+        found += ScanPage(reinterpret_cast<const uint64_t*>(chunk + i * 4096), value, out + found, room - found);
+      }
+    }
+  }
+  if (resident_bytes) *resident_bytes = resident;
+  return found;
+}
+
+namespace {
+
+size_t ScanPage(const uint64_t* p, uint64_t value, uintptr_t* out, size_t room) {
+  size_t found = 0;
+  __try {
+    for (size_t i = 0; i < 4096 / 8 && found < room; ++i)
+      if (p[i] == value) out[found++] = reinterpret_cast<uintptr_t>(p + i);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return found;
+}
+
+bool ReadFloats(uintptr_t at, float* out, size_t n) {
+  __try {
+    memcpy(out, reinterpret_cast<const void*>(at), n * sizeof(float));
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+bool InImage(uintptr_t p) {
+  const uint8_t* base = Base();
+  auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+  return p >= reinterpret_cast<uintptr_t>(base) && p < reinterpret_cast<uintptr_t>(base) + nt->OptionalHeader.SizeOfImage;
+}
+
+}  // namespace
+
+bool SimSetPuppet(uintptr_t owner, std::string* err) {
+  if (!owner) {
+    EnterCriticalSection(&g_lock);
+    g_puppet = 0;
+    LeaveCriticalSection(&g_lock);
+    SowLog(L"sim: no puppet");
+    return true;
+  }
+  if (!g_installed) {
+    *err = "simulation-thread hook not installed (sim_hook)";
+    return false;
+  }
+  uintptr_t vt = 0, health = 0, back = 0;
+  if (!ReadQ(owner, &vt) || !InImage(vt) || !ReadQ(owner + 0x26A8, &health) || !health ||
+      !ReadQ(health + 0x28, &back) || back != owner) {
+    *err = "not a character (no health object pointing back at it)";
+    return false;
+  }
+  EnterCriticalSection(&g_lock);
+  g_puppet = owner;
+  g_puppet_vt = vt;
+  g_puppet_health = health;
+  LeaveCriticalSection(&g_lock);
+  SowLog(L"sim: puppet is abs:%llX (class vtable rva:%llX)", (unsigned long long)owner,
+         (unsigned long long)(vt - reinterpret_cast<uintptr_t>(Base())));
+  return true;
+}
+
+namespace {
+uintptr_t g_spawn_table_src = 0;  // an AI character whose spawn type leads to the spawn-type table
+}  // namespace
+
+bool SimPickNearestPuppet(uintptr_t gameclient_rva, std::string* report, bool make_puppet) {
+  const uintptr_t base = reinterpret_cast<uintptr_t>(Base());
+  uintptr_t gc = 0, player = 0, health = 0, health_vt = 0;
+  float ppos[3];
+  if (!ReadQ(base + gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &player) || !player ||
+      !ReadQ(player + 0x26A8, &health) || !health || !ReadQ(health, &health_vt) || !ReadFloats(player + 0xAC, ppos, 3)) {
+    *report = "no player (not in the world?)";
+    return false;
+  }
+  std::vector<uintptr_t> hits(8192);
+  const size_t n = SimScanHeap(health_vt, hits.data(), hits.size(), nullptr);
+  uintptr_t best = 0;
+  float best_d = 0, best_pos[3] = {}, best_hp = 0;
+  unsigned characters = 0;
+  for (size_t i = 0; i < n; ++i) {
+    uintptr_t owner = 0, back = 0, vt = 0;
+    float pos[3], hp[2];
+    if (!ReadQ(hits[i] + 0x28, &owner) || !owner || owner == player || !ReadQ(owner + 0x26A8, &back) ||
+        back != hits[i] || !ReadQ(owner, &vt) || !InImage(vt) || !ReadFloats(owner + 0xAC, pos, 3) ||
+        !ReadFloats(hits[i] + 0x428, hp, 2) || !(hp[1] > 0))
+      continue;
+    ++characters;
+    const float dx = pos[0] - ppos[0], dy = pos[1] - ppos[1], dz = pos[2] - ppos[2];
+    const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (!best || d < best_d) {
+      best = owner;
+      best_d = d;
+      memcpy(best_pos, pos, sizeof best_pos);
+      best_hp = hp[1];
+    }
+  }
+  char b[256];
+  if (!best) {
+    snprintf(b, sizeof b, "no living character found (%zu health objects, %u characters)", n, characters);
+    *report = b;
+    return false;
+  }
+  g_spawn_table_src = best;
+  if (!make_puppet) {
+    *report = "spawn-type table source found";
+    return true;
+  }
+  std::string err;
+  if (!SimSetPuppet(best, &err)) {
+    *report = err;
+    return false;
+  }
+  snprintf(b, sizeof b, "puppet abs:%llX distance=%.1f pos=%.1f,%.1f,%.1f health=%.0f (of %u characters)",
+           (unsigned long long)best, best_d, best_pos[0], best_pos[1], best_pos[2], best_hp, characters);
+  *report = b;
+  return true;
+}
+
+// 19B7AC4: sub rsp,38h; mov r8,rdx; mov r9b,1; mov rdx,rcx; mov rcx,[rip+<manager>];
+// call <queued teleport>; add rsp,38h; ret
+bool TeleportBytesOk(const uint8_t* f) {
+  static const uint8_t kHead[] = {0x48, 0x83, 0xEC, 0x38, 0x4C, 0x8B, 0xC2, 0x41, 0xB1,
+                                  0x01, 0x48, 0x8B, 0xD1, 0x48, 0x8B, 0x0D};
+  static const uint8_t kTail[] = {0x48, 0x83, 0xC4, 0x38, 0xC3};
+  return !memcmp(f, kHead, sizeof kHead) && f[20] == 0xE8 && !memcmp(f + 25, kTail, sizeof kTail);
+}
+
+bool SimRequestPuppetMove(uintptr_t teleport_rva, const float pos[3], const float rot[4], std::string* err,
+                          bool direct) {
+  if (!g_installed) {
+    *err = "simulation-thread hook not installed (sim_hook)";
+    return false;
+  }
+  if (!InputGameThread()) {
+    *err = "world not started yet (no GameModeSet seen)";
+    return false;
+  }
+  if (!g_puppet) {
+    *err = "no puppet chosen";
+    return false;
+  }
+  const uint8_t* f = Base() + teleport_rva;
+  if (!TeleportBytesOk(f)) {
+    *err = "teleport function bytes differ from the known build; refused";
+    return false;
+  }
+  EnterCriticalSection(&g_lock);
+  g_teleport = reinterpret_cast<Teleport_t>(const_cast<uint8_t*>(f));
+  memcpy(g_move.pos, pos, sizeof g_move.pos);
+  memcpy(g_move.rot, rot, sizeof g_move.rot);
+  g_move_direct = direct;
+  InterlockedExchange(&g_move_pending, 1);
+  LeaveCriticalSection(&g_lock);
+  return true;
+}
+
+bool SimHasPuppet() { return g_puppet != 0; }
+
+std::string SimPuppetStatus() {
+  char b[96];
+  EnterCriticalSection(&g_lock);
+  if (g_puppet) snprintf(b, sizeof b, "puppet abs:%llX moves=%ld", (unsigned long long)g_puppet, g_moves);
+  else snprintf(b, sizeof b, "puppet none (moves=%ld)", g_moves);
+  LeaveCriticalSection(&g_lock);
+  return b;
+}
+
+// ---------------------------------------------------------------- near pages
+
+namespace {
+
+uint8_t* g_near[5] = {};
+
+uintptr_t ImageEnd() {
+  const uint8_t* base = Base();
+  auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+  return reinterpret_cast<uintptr_t>(base) + nt->OptionalHeader.SizeOfImage;
+}
+
+// A page within rel32 reach of every address in [lo, hi): below lo or above hi.
+uint8_t* AllocNearImage(uintptr_t lo, uintptr_t hi) {
+  const uintptr_t gran = 0x10000, reach = 0x7FF00000 - (hi - lo);
+  const uintptr_t below = lo & ~(gran - 1), above = (hi + gran - 1) & ~(gran - 1);
+  for (uintptr_t step = gran; step < reach; step += gran) {
+    const uintptr_t candidates[2] = {below - step, above + step - gran};
+    for (uintptr_t a : candidates) {
+      MEMORY_BASIC_INFORMATION mbi;
+      if (!VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi) || mbi.State != MEM_FREE) continue;
+      void* p = VirtualAlloc(reinterpret_cast<void*>(a), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+      if (p) return static_cast<uint8_t*>(p);
+    }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+void SimReserveNearPages() {
+  const uintptr_t lo = reinterpret_cast<uintptr_t>(Base()), hi = ImageEnd();
+  int got = 0;
+  for (auto& p : g_near) {
+    if (!p) p = AllocNearImage(lo, hi);
+    got += p != nullptr;
+  }
+  SowLog(L"sim: %d code page(s) reserved within reach of the game image", got);
+}
+
+uint8_t* SimNearPage(unsigned i) { return i < sizeof g_near / sizeof g_near[0] ? g_near[i] : nullptr; }
+
+// ---------------------------------------------------------------- puppet AI and walking
+
+namespace {
+
+// The AI tick (2F79A4, slot 119 of the AI class) runs a character's behavior tree with
+//   49 8B 08      mov rcx,[r8]      ; r8 = character+0x2D38; the tree's +8 is the character
+//   33 D2         xor edx,edx
+//   E8 <rel32>    call 1919C8
+// That call is pointed at a jmp to BrainFilter, which leaves out the puppet's tree while its
+// AI is off. The code after the call reads only rdx (2F5EB4), so a skipped call is safe.
+const uint8_t kBrainSite[] = {0x49, 0x8B, 0x08, 0x33, 0xD2, 0xE8};
+const uint8_t kTreeHead[] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10};
+using Tree_t = void(__fastcall*)(void* tree, uint8_t arg);
+Tree_t g_tree = nullptr;
+uint8_t* g_brain_call = nullptr;  // the E8
+enum BrainState : LONG { kBrainNone = 0, kBrainQueued = 1, kBrainInstalled = 2, kBrainFailed = 3 };
+volatile LONG g_brain_state = kBrainNone;
+volatile LONG g_puppet_ai_off = 0;
+volatile LONG g_brain_skips = 0;
+
+void __fastcall BrainFilter(void* tree, uint8_t arg) {
+  const uintptr_t puppet = g_puppet;
+  uintptr_t owner = 0;
+  if (g_puppet_ai_off && puppet && ReadQ(reinterpret_cast<uintptr_t>(tree) + 8, &owner) && owner == puppet) {
+    InterlockedIncrement(&g_brain_skips);
+    return;
+  }
+  g_tree(tree, arg);
+}
+
+// On the simulation thread, so no call can be inside the patched bytes.
+void InstallBrainNow() {
+  uint8_t* page = SimNearPage(1);
+  const int64_t rel = page ? reinterpret_cast<intptr_t>(page) - reinterpret_cast<intptr_t>(g_brain_call + 5) : 0;
+  DWORD old = 0;
+  if (!page || rel < INT32_MIN || rel > INT32_MAX || !VirtualProtect(page, 4096, PAGE_READWRITE, &old)) {
+    InterlockedExchange(&g_brain_state, kBrainFailed);
+    SowLog(L"sim: no code page near the image; puppet AI stays on");
+    return;
+  }
+  const uint8_t jmp[6] = {0xFF, 0x25, 0, 0, 0, 0};  // jmp [rip+0]
+  memcpy(page, jmp, sizeof jmp);
+  void* filter = reinterpret_cast<void*>(&BrainFilter);
+  memcpy(page + 6, &filter, 8);
+  VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+  FlushInstructionCache(GetCurrentProcess(), page, 16);
+  const int32_t rel32 = (int32_t)rel;
+  if (!VirtualProtect(g_brain_call + 1, 4, PAGE_EXECUTE_READWRITE, &old)) {
+    InterlockedExchange(&g_brain_state, kBrainFailed);
+    SowLog(L"sim: cannot patch the behavior-tree call; puppet AI stays on");
+    return;
+  }
+  memcpy(g_brain_call + 1, &rel32, 4);
+  VirtualProtect(g_brain_call + 1, 4, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), g_brain_call, 5);
+  InterlockedExchange(&g_brain_state, kBrainInstalled);
+  SowLog(L"sim: behavior-tree call at rva:%llX goes through the puppet filter",
+         (unsigned long long)(g_brain_call - Base()));
+}
+
+// 3F4BD8 SetMoveRequest(controller, request) starts: sub rsp,28h; mov dword [rcx+68h],1
+// (mode 1: go to the request); mov al,[rdx]; mov [rcx+70h],al. Then it copies the request
+// to +0x70; with direct 0 it also asks the character's navigator ([character+0x2528],
+// vfunc +0x140) for a path, and the controller keeps mode 1 while the navigator has one
+// (41B188); direct 1 is checked another way (41B2C0) and fell back to mode 2 when tried.
+const uint8_t kSetMoveHead[] = {0x48, 0x83, 0xEC, 0x28, 0xC7, 0x41, 0x68, 0x01,
+                                0x00, 0x00, 0x00, 0x8A, 0x02, 0x88, 0x41, 0x70};
+struct MoveRequest {
+  uint8_t has_dest, pad0[3];
+  float dest[3];
+  float dir[2];  // destination minus position, x and z
+  int32_t type;  // 1 walk, 2 run
+  float dist;    // horizontal distance
+  float scale;   // 1 or [character+0x2CE8]+0x500 in the game's own requests; goes to the
+                 // motion system with the gait (374CA0)
+  uint8_t direct, pad1[3];  // 0: through the navigator (the game's go-to-point requests)
+};
+static_assert(sizeof(MoveRequest) == 0x28, "the game copies 0x25 bytes");
+using SetMove_t = void(__fastcall*)(void* controller, const MoveRequest* r);
+SetMove_t g_set_move = nullptr;
+volatile LONG g_walks = 0, g_idles = 0;
+volatile LONG g_walk_pending = 0;
+float g_walk_dest[3] = {};
+int g_walk_type = 0;
+float g_walk_scale = 1.0f;
+
+// The puppet's movement controller ([character+0x2C78], whose +0 is the character).
+bool PuppetController(uintptr_t* controller, float pos[3]) {
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  uintptr_t c = 0, back = 0;
+  if (!owner || !PuppetAlive(owner, vt, health) || !ReadQ(owner + 0x2C78, &c) || !c || !ReadQ(c, &back) ||
+      back != owner || !ReadFloats(owner + 0xAC, pos, 3))
+    return false;
+  *controller = c;
+  return true;
+}
+
+bool WalkNow(const float dest[3], int type, float scale) {
+  uintptr_t c = 0;
+  float pos[3];
+  if (!PuppetController(&c, pos)) return false;
+  if (type <= 0) {
+    // What the game does when a move ends (3F4A79, 4E7272): back to mode 2.
+    *reinterpret_cast<volatile int32_t*>(c + 0x68) = 2;
+    InterlockedIncrement(&g_idles);
+    return true;
+  }
+  MoveRequest r{};
+  r.has_dest = 1;
+  memcpy(r.dest, dest, sizeof r.dest);
+  r.dir[0] = dest[0] - pos[0];
+  r.dir[1] = dest[2] - pos[2];
+  r.type = type;
+  r.dist = std::sqrt(r.dir[0] * r.dir[0] + r.dir[1] * r.dir[1]);
+  r.scale = scale;
+  r.direct = 0;
+  g_set_move(reinterpret_cast<void*>(c), &r);
+  const LONG n = InterlockedIncrement(&g_walks);
+  if (n <= 5 || n % 500 == 0)
+    SowLog(L"sim: puppet move request #%ld to %.1f,%.1f,%.1f type %d scale %.2f (%.1f away)", n, dest[0], dest[1],
+           dest[2], type, scale, r.dist);
+  return true;
+}
+
+void RunQueuedWalk();
+
+// Probe "teleport": this copy's player, keeping its rotation.
+volatile LONG g_player_tp_pending = 0;
+float g_player_tp[3] = {};
+uintptr_t g_player_tp_global = 0;
+
+void RunPlayerTeleport() {
+  EnterCriticalSection(&g_lock);
+  const bool run = InterlockedExchange(&g_player_tp_pending, 0) != 0;
+  Xform x{};
+  memcpy(x.pos, g_player_tp, sizeof x.pos);
+  const uintptr_t global = g_player_tp_global;
+  LeaveCriticalSection(&g_lock);
+  uintptr_t gc = 0, player = 0;
+  if (!run || !ReadQ(global, &gc) || !gc || !ReadQ(gc + 0x888, &player) || !player ||
+      !ReadFloats(player + 0xB8, x.rot, 4))
+    return;
+  g_teleport(reinterpret_cast<void*>(player), &x);
+  SowLog(L"sim: player teleported to %.1f,%.1f,%.1f", x.pos[0], x.pos[1], x.pos[2]);
+}
+
+bool SpawnPending();
+void RunSpawnNow();
+}  // namespace
+bool AnimResPending();
+void RunAnimRes();
+bool TracePending();
+void RunTrace();
+bool HoldPending();
+void RunHold();
+bool AttackPending();
+void RunAttack();
+bool PlayPending();
+void RunPlay();
+bool MovePending();
+void RunMove();
+namespace {
+
+bool ExtraPending() {
+  return g_brain_state == kBrainQueued || g_walk_pending || g_player_tp_pending || SpawnPending() ||
+         AnimResPending() || TracePending() || HoldPending() || AttackPending() || PlayPending() ||
+         MovePending();
+}
+
+void RunExtra() {
+  if (g_brain_state == kBrainQueued) InstallBrainNow();
+  if (g_walk_pending) RunQueuedWalk();
+  if (g_player_tp_pending) RunPlayerTeleport();
+  if (SpawnPending()) RunSpawnNow();
+  if (AnimResPending()) RunAnimRes();
+  if (TracePending()) RunTrace();
+  if (HoldPending()) RunHold();
+  if (AttackPending()) RunAttack();
+  if (PlayPending()) RunPlay();
+  if (MovePending()) RunMove();
+}
+
+void RunQueuedWalk() {
+  EnterCriticalSection(&g_lock);
+  const bool run = InterlockedExchange(&g_walk_pending, 0) != 0;
+  float dest[3];
+  memcpy(dest, g_walk_dest, sizeof dest);
+  const int type = g_walk_type;
+  const float scale = g_walk_scale;
+  LeaveCriticalSection(&g_lock);
+  if (run) WalkNow(dest, type, scale);
+}
+
+int32_t PuppetMode() {
+  uintptr_t c = 0;
+  float pos[3];
+  int32_t mode = -1;
+  if (PuppetController(&c, pos)) {
+    __try {
+      mode = *reinterpret_cast<const int32_t*>(c + 0x6C);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+  }
+  return mode;
+}
+
+}  // namespace
+
+bool SimRequestBrainHook(uintptr_t site_rva, uintptr_t tree_rva, std::string* err) {
+  if (g_brain_state == kBrainQueued || g_brain_state == kBrainInstalled) return true;
+  if (!g_installed) {
+    *err = "simulation-thread hook not installed (sim_hook)";
+    return false;
+  }
+  const uint8_t* site = Base() + site_rva;
+  const uint8_t* tree = Base() + tree_rva;
+  int32_t rel = 0;
+  memcpy(&rel, site + sizeof kBrainSite, 4);
+  if (memcmp(site, kBrainSite, sizeof kBrainSite) || site + sizeof kBrainSite + 4 + rel != tree ||
+      memcmp(tree, kTreeHead, sizeof kTreeHead)) {
+    *err = "behavior-tree call bytes differ from the known build; refused";
+    return false;
+  }
+  g_tree = reinterpret_cast<Tree_t>(const_cast<uint8_t*>(tree));
+  g_brain_call = const_cast<uint8_t*>(site + 5);
+  InterlockedExchange(&g_brain_state, kBrainQueued);
+  return true;
+}
+
+void SimSetPuppetAi(bool on) {
+  if ((g_puppet_ai_off != 0) == !on) return;
+  InterlockedExchange(&g_puppet_ai_off, on ? 0 : 1);
+  SowLog(L"sim: puppet AI %s", on ? L"on" : L"off (its behavior tree is skipped)");
+}
+
+bool SimPuppetWalk(uintptr_t request_rva, const float dest[3], int type, float scale, std::string* err) {
+  if (!g_installed) {
+    *err = "simulation-thread hook not installed (sim_hook)";
+    return false;
+  }
+  if (!g_puppet) {
+    *err = "no puppet chosen";
+    return false;
+  }
+  const uint8_t* f = Base() + request_rva;
+  if (memcmp(f, kSetMoveHead, sizeof kSetMoveHead)) {
+    *err = "move-request function bytes differ from the known build; refused";
+    return false;
+  }
+  g_set_move = reinterpret_cast<SetMove_t>(const_cast<uint8_t*>(f));
+  if (GetCurrentThreadId() == InputGameThread()) {
+    if (!WalkNow(dest, type, scale)) {
+      *err = "puppet gone";
+      return false;
+    }
+    return true;
+  }
+  EnterCriticalSection(&g_lock);
+  memcpy(g_walk_dest, dest, sizeof g_walk_dest);
+  g_walk_type = type;
+  g_walk_scale = scale;
+  InterlockedExchange(&g_walk_pending, 1);
+  LeaveCriticalSection(&g_lock);
+  return true;
+}
+
+bool SimRequestPlayerTeleport(uintptr_t teleport_rva, uintptr_t gameclient_rva, const float pos[3], std::string* err) {
+  if (!g_installed) {
+    *err = "simulation-thread hook not installed (sim_hook)";
+    return false;
+  }
+  if (!InputGameThread()) {
+    *err = "world not started yet (no GameModeSet seen)";
+    return false;
+  }
+  const uint8_t* f = Base() + teleport_rva;
+  if (!TeleportBytesOk(f)) {
+    *err = "teleport function bytes differ from the known build; refused";
+    return false;
+  }
+  EnterCriticalSection(&g_lock);
+  g_teleport = reinterpret_cast<Teleport_t>(const_cast<uint8_t*>(f));
+  g_player_tp_global = reinterpret_cast<uintptr_t>(Base()) + gameclient_rva;
+  memcpy(g_player_tp, pos, sizeof g_player_tp);
+  InterlockedExchange(&g_player_tp_pending, 1);
+  LeaveCriticalSection(&g_lock);
+  return true;
+}
+
+bool SimPuppetPos(float pos[3]) {
+  uintptr_t c = 0;
+  return PuppetController(&c, pos);
+}
+
+bool SimPuppetXform(float pos[3], float rot[4]) {
+  uintptr_t c = 0;
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet;
+  LeaveCriticalSection(&g_lock);
+  return PuppetController(&c, pos) && ReadFloats(owner + 0xB8, rot, 4);
+}
+
+std::string SimPuppetDetail() {
+  float pos[3] = {};
+  const bool have = SimPuppetPos(pos);
+  const LONG state = g_brain_state;
+  char b[256];
+  snprintf(b, sizeof b, "walks=%ld idles=%ld ai=%s tree_skips=%ld tree_hook=%s mode=%d pos=%.1f,%.1f,%.1f", g_walks,
+           g_idles, g_puppet_ai_off ? "off" : "on", g_brain_skips,
+           state == kBrainInstalled ? "in" : state == kBrainQueued ? "queued" : state == kBrainFailed ? "failed" : "none",
+           have ? PuppetMode() : -1, pos[0], pos[1], pos[2]);
+  return b;
+}
+
+// ---------------------------------------------------------------- write watch (probe "spawn ... watch")
+
+namespace {
+
+// A hardware write watch (debug register 0, 1 byte) on the simulation thread: the first
+// writes are recorded with their instruction and call stack, then the watch clears itself.
+constexpr int kWatchHits = 4, kWatchDepth = 14;
+struct WatchHit {
+  uintptr_t frames[kWatchDepth];
+  int n;
+  uint8_t value;
+};
+WatchHit g_watch_hits[kWatchHits];
+volatile LONG g_watch_count = 0;
+uintptr_t g_watch_addr = 0;
+PVOID g_watch_handler = nullptr;
+
+LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* e) {
+  if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(e->ContextRecord->Dr6 & 1) || !g_watch_addr)
+    return EXCEPTION_CONTINUE_SEARCH;
+  const LONG i = InterlockedIncrement(&g_watch_count) - 1;
+  if (i < kWatchHits) {
+    WatchHit& h = g_watch_hits[i];
+    CONTEXT c = *e->ContextRecord;
+    h.n = 0;
+    h.frames[h.n++] = c.Rip;  // the instruction after the write
+    __try {
+      h.value = *reinterpret_cast<const uint8_t*>(g_watch_addr);
+      for (int k = 0; k < 40 && h.n < kWatchDepth; ++k) {
+        DWORD64 image = 0;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
+        if (f) {
+          void* hd = nullptr;
+          DWORD64 fr = 0;
+          RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, f, &c, &hd, &fr, nullptr);
+        } else {
+          c.Rip = *reinterpret_cast<const DWORD64*>(c.Rsp);
+          c.Rsp += 8;
+        }
+        if (c.Rip < 0x10000) break;
+        h.frames[h.n++] = c.Rip;
+      }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+  }
+  e->ContextRecord->Dr6 = 0;
+  if (i + 1 >= kWatchHits) e->ContextRecord->Dr7 = 0;
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// On the thread to be watched.
+void ArmWatch(uintptr_t addr) {
+  if (!g_watch_handler) g_watch_handler = AddVectoredExceptionHandler(1, WatchHandler);
+  g_watch_addr = addr;
+  InterlockedExchange(&g_watch_count, 0);
+  CONTEXT c{};
+  c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+  c.Dr0 = addr;
+  c.Dr7 = 1 | (1u << 16);  // local enable 0, break on write, length 1
+  SetThreadContext(GetCurrentThread(), &c);
+  SowLog(L"sim: write watch on abs:%llX (simulation thread)", (unsigned long long)addr);
+}
+
+}  // namespace
+
+std::string SimWatchReport() {
+  const LONG n = g_watch_count;
+  char b[64];
+  snprintf(b, sizeof b, "ok watch abs:%llX hits=%ld\n", (unsigned long long)g_watch_addr, n);
+  std::string out = b;
+  const uintptr_t base = reinterpret_cast<uintptr_t>(Base()), end = ImageEnd();
+  for (LONG i = 0; i < n && i < kWatchHits; ++i) {
+    const WatchHit& h = g_watch_hits[i];
+    snprintf(b, sizeof b, "hit value=%u\n ", h.value);
+    out += b;
+    for (int k = 0; k < h.n; ++k) {
+      const uintptr_t f = h.frames[k];
+      if (f >= base && f < end) snprintf(b, sizeof b, " rva:%llX", (unsigned long long)(f - base));
+      else snprintf(b, sizeof b, " abs:%llX", (unsigned long long)f);
+      out += b;
+    }
+    out += "\n";
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- spawn (probe "spawn")
+
+namespace {
+
+// The game's queued spawn requests (1A9290C and its neighbours) create a character with
+//   obj = 1036D0([[26FFAB0]+0xF58], name, &transform, record, 1, 1, 0, 0, 0)
+// and, when it is a character (274A04 walks its class chain), store the region at its
+// position (+0x26F0 = 168DA8(obj)) and the area (35DC38(obj, 607610(obj), 0)). The record
+// is a spawnable character type (type 0xA06, e.g. "AI_Talion"; the same names also exist
+// as appearance records, type 0xA66, which the spawn does not take). An AI character keeps
+// its own spawn type at +0x2E68, whose +0x18 is the table: count +0x28, an array at +0x38
+// of 40-byte entries with the name hash at +4 (the game's hash, 423E70).
+using Hash_t = uint32_t(__fastcall*)(const char* name, void* unused, uint32_t seed);
+using Spawn_t = void*(__fastcall*)(void* ctx, const char* name, const float* xform, void* record, uint8_t a5,
+                                   uint8_t a6, void* a7, void* a8, void* a9);
+using IsCharacter_t = int(__fastcall*)(void* obj);
+// Called by the game with rdx = r8 = 0, which they pass on (1A9290C: xor edx,edx; xor r8d,r8d).
+using AtPosition_t = void*(__fastcall*)(void* obj, void* zero1, void* zero2);
+using SetArea_t = void(__fastcall*)(void* obj, void* area, uint8_t force);
+// 10AFB0: the character set-up the spawner path (1045EC) and the player's model swap
+// (19BB3CC) both end with.
+using Setup_t = void(__fastcall*)(void* obj);
+
+struct SpawnFns {
+  Hash_t hash;
+  Spawn_t spawn;
+  IsCharacter_t is_character;
+  AtPosition_t region, area;
+  SetArea_t set_area;
+  Setup_t setup;
+  uintptr_t world_global;
+  uintptr_t type_table_global;  // [2702440], or 0
+};
+
+bool Head(const uint8_t* f, const char* hex) {
+  // Outside the image (a smaller exe, as in the tests) there is nothing to compare.
+  const uintptr_t a = reinterpret_cast<uintptr_t>(f);
+  if (a < reinterpret_cast<uintptr_t>(Base()) || a + strlen(hex) / 2 > ImageEnd()) return false;
+  for (size_t i = 0; hex[2 * i]; ++i) {
+    char b[3] = {hex[2 * i], hex[2 * i + 1], 0};
+    if (f[i] != (uint8_t)strtoul(b, nullptr, 16)) return false;
+  }
+  return true;
+}
+
+const uint8_t* Rel32Target(const uint8_t* call) {
+  int32_t rel = 0;
+  memcpy(&rel, call + 1, 4);
+  return call + 5 + rel;
+}
+
+// The entry of type kind with name hash h in a record table (count +0x28, array +0x38), or null.
+void* SearchTypeTable(uintptr_t table, uint32_t kind, uint32_t h) {
+  uintptr_t array = 0;
+  uint32_t count = 0;
+  if (!table || !ReadQ(table + 0x38, &array) || !array ||
+      !ReadFloats(table + 0x28, reinterpret_cast<float*>(&count), 1) || count == 0 || count > 100000)
+    return nullptr;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uintptr_t entry = array + 40ull * i;
+    uint32_t head[2] = {};
+    if (!ReadFloats(entry, reinterpret_cast<float*>(head), 2)) return nullptr;
+    if (head[1] == h && head[0] == kind) return reinterpret_cast<void*>(entry);
+  }
+  return nullptr;
+}
+
+// The spawn type named name. The table (type 0xA06) is held by a global ([2702440]; the game's
+// queued spawns read it, 1A9212F), or found through an AI character (the puppet or the one
+// remembered for it): its spawn type at +0x2E68, whose +0x18 is the table. Only the second
+// worked once this copy's player had died: the game freed the puppet when it put the player
+// back at the tower, and no AI character was loaded there to find the table through, so no
+// stand-in was spawned again (session ar).
+void* FindSpawnType(Hash_t hash, const char* name, uintptr_t table_global) {
+  const uint32_t h = hash(name, nullptr, 0);
+  uintptr_t table = 0;
+  if (table_global && ReadQ(table_global, &table))
+    if (void* found = SearchTypeTable(table, 0xA06, h)) return found;
+  const uintptr_t owner = g_puppet ? g_puppet : g_spawn_table_src;
+  uintptr_t own_type = 0;
+  uint32_t kind = 0;
+  if (!owner || !ReadQ(owner + 0x2E68, &own_type) || !own_type || !ReadQ(own_type + 0x18, &table) ||
+      !ReadFloats(own_type, reinterpret_cast<float*>(&kind), 1))
+    return nullptr;
+  return SearchTypeTable(table, kind, h);
+}
+
+// Appearance override for one spawn. The character set-up at creation (3FAAEC, from the
+// AI class's slot 12) asks for the spawn type's appearance record (type 0xA66) and applies
+// it (vfunc +0x440) before building the model from it:
+//   48 8B 0E      mov rcx,[rsi]         ; the spawn type
+//   48 85 C9 74 14 48 8B 1F
+//   E8 <rel32>    call 16680C           ; its appearance
+//   48 8B D0 48 8B CF FF 93 40 04 00 00 ; mov rdx,rax; mov rcx,rdi; call [rbx+440h]
+// That call is pointed at a jmp to AppearanceFilter (the code after it reads only rax and
+// saved registers), which answers with the override while our spawn runs. Appearance
+// records are looked up by name with 1B08BB0 (the table Player.SetCharacterModelOverride uses).
+using TypeAppearance_t = void*(__fastcall*)(void* type);
+using AppearanceLookup_t = void*(__fastcall*)(const char* name);
+TypeAppearance_t g_type_appearance = nullptr;
+void* volatile g_override_type = nullptr;
+void* volatile g_override_appearance = nullptr;
+volatile LONG g_appearance_used = 0;
+uint8_t* g_appearance_call = nullptr;  // the E8, once patched
+
+void* __fastcall AppearanceFilter(void* type) {
+  if (type && type == g_override_type && g_override_appearance) {
+    InterlockedIncrement(&g_appearance_used);
+    return g_override_appearance;
+  }
+  return g_type_appearance(type);
+}
+
+// On the simulation thread (RunSpawn), so no creation is inside the patched call.
+bool InstallAppearanceNow(uint8_t* call) {
+  if (g_appearance_call) return true;
+  uint8_t* page = SimNearPage(2);
+  const int64_t rel = page ? reinterpret_cast<intptr_t>(page) - reinterpret_cast<intptr_t>(call + 5) : 0;
+  DWORD old = 0;
+  if (!page || rel < INT32_MIN || rel > INT32_MAX || !VirtualProtect(page, 4096, PAGE_READWRITE, &old)) return false;
+  g_type_appearance = reinterpret_cast<TypeAppearance_t>(const_cast<uint8_t*>(Rel32Target(call)));
+  const uint8_t jmp[6] = {0xFF, 0x25, 0, 0, 0, 0};
+  memcpy(page, jmp, sizeof jmp);
+  void* filter = reinterpret_cast<void*>(&AppearanceFilter);
+  memcpy(page + 6, &filter, 8);
+  VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+  FlushInstructionCache(GetCurrentProcess(), page, 16);
+  const int32_t rel32 = (int32_t)rel;
+  if (!VirtualProtect(call + 1, 4, PAGE_EXECUTE_READWRITE, &old)) return false;
+  memcpy(call + 1, &rel32, 4);
+  VirtualProtect(call + 1, 4, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), call, 5);
+  g_appearance_call = call;
+  SowLog(L"sim: appearance lookup at rva:%llX goes through the spawn override", (unsigned long long)(call - Base()));
+  return true;
+}
+
+volatile LONG g_spawn_pending = 0, g_spawn_done = 0;
+char g_spawn_record[64] = {};
+char g_spawn_look[64] = {};
+bool g_spawn_watch = false;  // arm a write watch on the new character's +0x19A8
+uint8_t* g_spawn_look_site = nullptr;
+AppearanceLookup_t g_appearance_lookup = nullptr;
+Xform g_spawn_at{};
+SpawnFns g_spawn_fns{};
+uintptr_t g_spawned = 0;
+std::string g_spawn_report;
+
+void RunSpawn();
+bool SpawnPending() { return g_spawn_pending != 0; }
+void RunSpawnNow() { RunSpawn(); }
+
+void RunSpawn() {
+  EnterCriticalSection(&g_lock);
+  const bool run = InterlockedExchange(&g_spawn_pending, 0) != 0;
+  char name[64], look[64];
+  memcpy(name, g_spawn_record, sizeof name);
+  memcpy(look, g_spawn_look, sizeof look);
+  const Xform at = g_spawn_at;
+  const SpawnFns f = g_spawn_fns;
+  LeaveCriticalSection(&g_lock);
+  if (!run) return;
+  char b[320];
+  uintptr_t world = 0, ctx = 0, obj = 0;
+  void* record = FindSpawnType(f.hash, name, f.type_table_global);
+  void* appearance = !look[0]                             ? nullptr
+                     : strncmp(look, "abs:", 4) == 0 ? reinterpret_cast<void*>(strtoull(look + 4, nullptr, 16))
+                                                     : g_appearance_lookup(look);
+  const LONG used0 = g_appearance_used;
+  if (look[0] && !appearance) {
+    snprintf(b, sizeof b, "no appearance named %s", look);
+  } else if (look[0] && !InstallAppearanceNow(g_spawn_look_site)) {
+    snprintf(b, sizeof b, "cannot hook the appearance lookup");
+  } else if (!record) {
+    snprintf(b, sizeof b, "no spawnable character type named %s (or no AI character to find the table from)", name);
+  } else if (!ReadQ(f.world_global, &world) || !world || !ReadQ(world + 0xF58, &ctx) || !ctx) {
+    snprintf(b, sizeof b, "no spawn context (world not ready)");
+  } else {
+    g_override_appearance = appearance;
+    g_override_type = appearance ? record : nullptr;
+    obj = reinterpret_cast<uintptr_t>(f.spawn(reinterpret_cast<void*>(ctx), "CoopPuppet", at.pos, record, 1, 1,
+                                              nullptr, nullptr, nullptr));
+    g_override_type = nullptr;
+    g_override_appearance = nullptr;
+    uintptr_t active_q = 0;
+    const int active_after_spawn = obj && ReadQ(obj + 0x19A8, &active_q) ? (int)(active_q & 0xFF) : -1;
+    if (!obj) {
+      snprintf(b, sizeof b, "the game created nothing for %s", name);
+    } else if (!f.is_character(reinterpret_cast<void*>(obj))) {
+      snprintf(b, sizeof b, "created abs:%llX for %s, not a character", (unsigned long long)obj, name);
+    } else {
+      void* region = f.region(reinterpret_cast<void*>(obj), nullptr, nullptr);
+      *reinterpret_cast<void**>(obj + 0x26F0) = region;
+      void* area = f.area(reinterpret_cast<void*>(obj), nullptr, nullptr);
+      if (area) f.set_area(reinterpret_cast<void*>(obj), area, 0);
+      f.setup(reinterpret_cast<void*>(obj));
+      uintptr_t active_q2 = 0;
+      const int active_after_setup = ReadQ(obj + 0x19A8, &active_q2) ? (int)(active_q2 & 0xFF) : -1;
+      if (g_spawn_watch) ArmWatch(obj + 0x19A8);
+      uintptr_t worn = 0, worn_name = 0;
+      char worn_text[64] = "?";
+      if (ReadQ(obj + 0x2B30, &worn) && worn && ReadQ(worn + 0x20, &worn_name) && worn_name) {
+        __try {
+          strncpy_s(worn_text, reinterpret_cast<const char*>(worn_name), _TRUNCATE);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+      }
+      snprintf(b, sizeof b,
+               "spawned %s as abs:%llX at %.1f,%.1f,%.1f wearing %s (appearance overrides %ld; active +0x19A8 after "
+               "spawn %d, after set-up %d; region %p, area %p)",
+               name, (unsigned long long)obj, at.pos[0], at.pos[1], at.pos[2], worn_text, g_appearance_used - used0,
+               active_after_spawn, active_after_setup, region, area);
+    }
+  }
+  SowLog(L"sim: %S", b);
+  EnterCriticalSection(&g_lock);
+  g_spawned = obj;
+  g_spawn_report = b;
+  LeaveCriticalSection(&g_lock);
+  InterlockedExchange(&g_spawn_done, 1);
+}
+
+}  // namespace
+
+bool SimSpawn(const SimSpawnRvas& r, const char* record, const float* pos, const char* look, std::string* report,
+              uintptr_t* spawned) {
+  if (!g_installed) {
+    *report = "simulation-thread hook not installed (sim_hook)";
+    return false;
+  }
+  if (!InputGameThread()) {
+    *report = "world not started yet (no GameModeSet seen)";
+    return false;
+  }
+  const uint8_t* base = Base();
+  const uint8_t *hash = base + r.hash_rva, *spawn = base + r.spawn_rva, *is_char = base + r.is_character_rva,
+                *region = base + r.region_rva, *area = base + r.area_rva, *set_area = base + r.set_area_rva,
+                *setup = base + r.setup_rva;
+  // 168DA8 and 607610 share their first 33 bytes; their call targets tell them apart.
+  if (!Head(hash, "0FB60184C074274C8D0D") || !Head(spawn, "488BC448895808488970104889781855") ||
+      !Head(is_char, "33C04885C9742D488B49784885C97405") || !Head(region, "4883EC38F20F1081AC0000008B81B400") ||
+      !Head(area, "4883EC38F20F1081AC0000008B81B400") || region[0x21] != 0xE8 || area[0x21] != 0xE8 ||
+      Rel32Target(region + 0x21) != base + r.region_rva + 0x11C || Rel32Target(area + 0x21) != base + r.area_rva + 0x2C ||
+      !Head(set_area, "40534883EC204C8BCA488BD94584C074") || !Head(setup, "48894C2408555356574154415541564157")) {
+    *report = "spawn function bytes differ from the known build; refused";
+    return false;
+  }
+  const uint8_t* look_site = base + r.appearance_site_rva;
+  const uint8_t* look_up = base + r.appearance_lookup_rva;
+  // Before our patch the call goes to the type-appearance function; after it, to our page.
+  if (look && (!Head(look_site, "488B0E4885C97414488B1FE8") || !Head(look_site + 16, "488BD0488BCFFF9340040000") ||
+               !Head(look_up, "4883EC284533C0E8") ||
+               (!g_appearance_call && !Head(Rel32Target(look_site + 11), "4883EC284C8BD1E8")))) {
+    *report = "spawn function bytes differ from the known build; refused";
+    return false;
+  }
+  if (strlen(record) >= sizeof g_spawn_record) {
+    *report = "record name too long";
+    return false;
+  }
+  uintptr_t gc = 0, player = 0;
+  Xform at{};
+  if (!ReadQ(reinterpret_cast<uintptr_t>(base) + r.gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &player) ||
+      !player || !ReadFloats(player + 0xB8, at.rot, 4)) {
+    *report = "no player";
+    return false;
+  }
+  if (pos) {
+    memcpy(at.pos, pos, sizeof at.pos);
+  } else if (!ReadFloats(player + 0xAC, at.pos, 3)) {
+    *report = "no player position";
+    return false;
+  }
+  EnterCriticalSection(&g_lock);
+  g_spawn_fns = SpawnFns{reinterpret_cast<Hash_t>(const_cast<uint8_t*>(hash)),
+                         reinterpret_cast<Spawn_t>(const_cast<uint8_t*>(spawn)),
+                         reinterpret_cast<IsCharacter_t>(const_cast<uint8_t*>(is_char)),
+                         reinterpret_cast<AtPosition_t>(const_cast<uint8_t*>(region)),
+                         reinterpret_cast<AtPosition_t>(const_cast<uint8_t*>(area)),
+                         reinterpret_cast<SetArea_t>(const_cast<uint8_t*>(set_area)),
+                         reinterpret_cast<Setup_t>(const_cast<uint8_t*>(setup)),
+                         reinterpret_cast<uintptr_t>(base) + r.world_rva,
+                         r.spawn_table_rva && reinterpret_cast<uintptr_t>(base) + r.spawn_table_rva + 8 <= ImageEnd()
+                             ? reinterpret_cast<uintptr_t>(base) + r.spawn_table_rva
+                             : 0};
+  strcpy_s(g_spawn_record, record);
+  g_spawn_look[0] = 0;
+  g_spawn_watch = false;
+  if (look && strcmp(look, "watch") == 0) {
+    g_spawn_watch = true;
+    look = nullptr;
+  }
+  if (look) strncpy_s(g_spawn_look, look, _TRUNCATE);
+  g_spawn_look_site = const_cast<uint8_t*>(look_site + 11);
+  g_appearance_lookup = reinterpret_cast<AppearanceLookup_t>(const_cast<uint8_t*>(look_up));
+  g_spawn_at = at;
+  InterlockedExchange(&g_spawn_done, 0);
+  InterlockedExchange(&g_spawn_pending, 1);
+  LeaveCriticalSection(&g_lock);
+  for (int i = 0; i < 100 && !g_spawn_done; ++i) Sleep(20);
+  EnterCriticalSection(&g_lock);
+  *report = g_spawn_done ? g_spawn_report : std::string("queued; the simulation thread has not run it yet");
+  const bool ok = g_spawn_done && g_spawned != 0;
+  if (spawned) *spawned = ok ? g_spawned : 0;
+  LeaveCriticalSection(&g_lock);
+  return ok;
+}
+
+// ---------------------------------------------------------------- hybrid appearance (probe "look")
+
+// An appearance record (type 0xA66) is a 40-byte entry whose +0x10 points at a fixed-layout
+// field block (the same offset holds the same field in every record of the type; +0x148 is
+// the model, type 0xA19). A hybrid is a private copy of one record's entry and block with
+// some fields taken from another record. Never freed: a character built from it keeps
+// pointing at it.
+bool SimMakeLook(uintptr_t lookup_rva, const char* base_name, const std::vector<unsigned>& offsets,
+                 const char* donor_name, std::string* report) {
+  const uint8_t* lookup = Base() + lookup_rva;
+  if (!Head(lookup, "4883EC284533C0E8")) {
+    *report = "appearance lookup bytes differ from the known build; refused";
+    return false;
+  }
+  auto find = reinterpret_cast<AppearanceLookup_t>(const_cast<uint8_t*>(lookup));
+  const uintptr_t base = reinterpret_cast<uintptr_t>(find(base_name));
+  const uintptr_t donor = reinterpret_cast<uintptr_t>(find(donor_name));
+  uintptr_t base_data = 0, donor_data = 0;
+  if (!base || !donor || !ReadQ(base + 0x10, &base_data) || !base_data || !ReadQ(donor + 0x10, &donor_data) ||
+      !donor_data) {
+    *report = std::string("no appearance named ") + (base ? donor_name : base_name);
+    return false;
+  }
+  constexpr size_t kBlock = 0x600;
+  auto* mem = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+  if (!mem) {
+    *report = "no memory";
+    return false;
+  }
+  uint8_t* data = mem + 0x100;
+  for (size_t i = 0; i < 40; i += 8) {
+    uintptr_t q = 0;
+    if (!ReadQ(base + i, &q)) {
+      *report = "cannot read the base record";
+      return false;
+    }
+    memcpy(mem + i, &q, 8);
+  }
+  for (size_t i = 0; i < kBlock; i += 8) {
+    uintptr_t q = 0;
+    if (!ReadQ(base_data + i, &q)) break;  // the rest stays zero
+    memcpy(data + i, &q, 8);
+  }
+  std::string taken;
+  for (unsigned off : offsets) {
+    uintptr_t q = 0;
+    if (off + 8 > kBlock || !ReadQ(donor_data + off, &q)) {
+      *report = "bad field offset";
+      return false;
+    }
+    memcpy(data + off, &q, 8);
+    char t[24];
+    snprintf(t, sizeof t, " +0x%X", off);
+    taken += t;
+  }
+  const void* dp = data;
+  memcpy(mem + 0x10, &dp, 8);
+  char b[256];
+  snprintf(b, sizeof b, "look abs:%llX = %s with%s from %s", (unsigned long long)reinterpret_cast<uintptr_t>(mem),
+           base_name, taken.c_str(), donor_name);
+  *report = b;
+  SowLog(L"sim: %S", b);
+  return true;
+}
+
+// ---------------------------------------------------------------- behavior resource (probe "animres")
+
+namespace {
+
+// A character's animation object (character+0x120) only switches the character on
+// (+0x1990 block, flag +0x18; 3F0D88 from E7D070) once both its animation resource (+0x1870)
+// and its behavior resource (+0x1878) are set. 459474 is the animation object's virtual
+// "set behavior resource": anim+0x4B0 = res, vfunc +0x30, anim+0x1878 = res.
+using SetBehavior_t = void(__fastcall*)(void* anim, void* res);
+SetBehavior_t g_set_behavior = nullptr;
+volatile LONG g_animres_pending = 0;
+uintptr_t g_animres_char = 0, g_animres_res = 0;
+
+}  // namespace
+
+bool AnimResPending() { return g_animres_pending != 0; }
+
+void RunAnimRes() {
+  if (!InterlockedExchange(&g_animres_pending, 0)) return;
+  g_set_behavior(reinterpret_cast<void*>(g_animres_char + 0x120), reinterpret_cast<void*>(g_animres_res));
+  SowLog(L"sim: behavior resource of abs:%llX set to abs:%llX", (unsigned long long)g_animres_char,
+         (unsigned long long)g_animres_res);
+}
+
+bool SimSetBehaviorResource(uintptr_t fn_rva, uintptr_t character, uintptr_t res, std::string* err) {
+  const uint8_t* f = Base() + fn_rva;
+  if (!Head(f, "48895C2408574883EC20488991B0040000")) {
+    *err = "behavior-resource setter bytes differ from the known build; refused";
+    return false;
+  }
+  uintptr_t vt = 0;
+  if (!ReadQ(character, &vt) || !InImage(vt) || !res) {
+    *err = "not a character, or no resource";
+    return false;
+  }
+  g_set_behavior = reinterpret_cast<SetBehavior_t>(const_cast<uint8_t*>(f));
+  g_animres_char = character;
+  g_animres_res = res;
+  InterlockedExchange(&g_animres_pending, 1);
+  return true;
+}
+
+// coop_puppet_spawn: a character of type made at pos, given this copy's own player's
+// behavior resource (anim+0x1878 = player+0x1998), so a cutscene "Talion" (no AI behavior of
+// its own) is switched on and animates with the player's graph; then used as the puppet.
+bool SimSpawnPuppet(const SimSpawnRvas& r, const char* type, const float pos[3], std::string* report) {
+  const uintptr_t base = reinterpret_cast<uintptr_t>(Base());
+  uintptr_t gc = 0, player = 0, res = 0, obj = 0;
+  if (!ReadQ(base + r.gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &player) || !player ||
+      !ReadQ(player + 0x1998, &res) || !res) {
+    *report = "no player behavior resource yet";
+    return false;
+  }
+  // Without the table's global, the spawn type is found through an AI character.
+  if (!r.spawn_table_rva && !g_puppet && !g_spawn_table_src && !SimPickNearestPuppet(r.gameclient_rva, report, false))
+    return false;
+  if (!SimSpawn(r, type, pos, nullptr, report, &obj)) return false;
+  std::string err;
+  if (!SimSetBehaviorResource(r.behavior_rva, obj, res, &err) || !SimSetPuppet(obj, &err)) {
+    *report += "; " + err;
+    return false;
+  }
+  *report += "; given the player's behavior resource; now the puppet";
+  return true;
+}
+
+// ---------------------------------------------------------------- animation inputs (coop, probe "puppet mirror")
+
+namespace {
+
+// The player's animation graph is driven by named float variables that the player's
+// per-frame update (30BA10, and 514484 for turning and the camera) sets on its animation
+// object (player+0x120) through 176D78: the stick, speed, turning, camera. An AI character
+// gets none of them, so a puppet with the player's graph (the Talion stand-in) only holds a
+// pose. An entry hook on 176D78 records this copy's player's values as they are set (the
+// handler gets the setter's own rcx, rdx and xmm2); a puppet is given values once per frame
+// through 176D78 itself.
+using SetFloatVar_t = void(__fastcall*)(void* anim, const char* name, float value);
+SetFloatVar_t g_set_float_var = nullptr;
+const char* const kInputNames[kAnimInputs] = {
+    "RawMoveMag",           "RawMoveYaw",          "Game_MovementAxisX",        "Game_MovementAxisY",
+    "PlayerVelocity",       "PlayerSmoothVelocity", "DeltaYaw",                 "YawVelocityInDegsPerSec",
+    "CameraDeltaYaw",       "DeltaPitch",          "PitchVelocityInDegsPerSec", "PitchVelocityAbs",
+    "CharToCamDeltaYawInDegs", "CharToCamDeltaPitchInDegs", "CameraYawMinusPlayerYaw", "PlayerCameraDeltaYaw",
+    "Game_CameraAxisX",     "Game_CameraAxisY",    "Game_CameraPitch",          "RawCameraMag",
+    "RawLeftTrigger",       "RawRightTrigger",     "Game_SimTimer_TimeScale",   "Player_Focus",
+    "MountWarg_Yaw"};
+
+uintptr_t g_input_gc = 0;                  // the GameClient global
+volatile uintptr_t g_input_owner = 0;      // this copy's player's animation object, every frame
+const char* g_input_ptr[kAnimInputs] = {};  // the game's own name pointers, learned when first seen
+float g_inputs[kAnimInputs] = {};
+volatile LONG g_input_mask = 0;
+volatile LONG g_input_hits = 0;
+volatile LONG g_input_state = 0;  // 0 none, 1 installed
+volatile LONG g_mirror = 0;       // probe "puppet mirror on": the puppet gets this copy's own inputs
+volatile LONG g_inputs_applied = 0;
+constexpr int kOtherInputs = 64;
+const char* g_other_ptr[kOtherInputs] = {};  // other float names set on the player (diagnostics)
+float g_other[kOtherInputs] = {};
+
+void __fastcall AnimInputHit(void* anim, const char* name, float value) {
+  if (!anim || reinterpret_cast<uintptr_t>(anim) != g_input_owner || !name) return;
+  for (int i = 0; i < kAnimInputs; ++i) {
+    if (g_input_ptr[i] == name || (!g_input_ptr[i] && strcmp(name, kInputNames[i]) == 0)) {
+      g_input_ptr[i] = name;
+      g_inputs[i] = value;
+      InterlockedOr(&g_input_mask, 1L << i);
+      InterlockedIncrement(&g_input_hits);
+      return;
+    }
+  }
+  // Any other name the player gets: kept for probe "inputs" (finding inputs worth sending).
+  for (int i = 0; i < kOtherInputs; ++i) {
+    if (g_other_ptr[i] == name || !g_other_ptr[i]) {
+      g_other_ptr[i] = name;
+      g_other[i] = value;
+      return;
+    }
+  }
+}
+
+}  // namespace
+
+void RefreshInputOwner() {
+  uintptr_t gc = 0, player = 0;
+  g_input_owner = g_input_gc && ReadQ(g_input_gc, &gc) && gc && ReadQ(gc + 0x888, &player) && player ? player + 0x120 : 0;
+}
+
+bool InputsOn() { return g_input_state == 1; }
+
+void ApplyMirror() {
+  std::string err;
+  if (g_mirror && g_input_state == 1) SimApplyPuppetInputs(0, g_inputs, (uint32_t)g_input_mask, &err);
+}
+
+bool SimAnimInputsInstall(uintptr_t setter_rva, uintptr_t gameclient_rva, std::string* err) {
+  if (g_input_state == 1) return true;
+  uint8_t* const f = const_cast<uint8_t*>(Base()) + setter_rva;
+  if (!Head(f, "48895C241055488BEC4883EC3080B98818000000")) {
+    *err = "animation-variable setter bytes differ from the known build; refused";
+    return false;
+  }
+  const uintptr_t target = reinterpret_cast<uintptr_t>(f), aligned = target & ~uintptr_t(7);
+  const size_t o = target - aligned;
+  uint8_t* page = SimNearPage(3);
+  const int64_t rel = page ? reinterpret_cast<intptr_t>(page) - (intptr_t)(target + 5) : 0;
+  if (!page || o > 3 || rel < INT32_MIN || rel > INT32_MAX) {
+    *err = "no code page near the setter";
+    return false;
+  }
+  // The stub: flags and volatile registers saved, AnimInputHit(rcx, rdx, xmm2) called, all
+  // restored; then the setter's first instruction (mov [rsp+10h],rbx, 5 bytes) and a jump back.
+  std::vector<uint8_t> s = {0x9C, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52,
+                            0x41, 0x53, 0x48, 0x81, 0xEC, 0x88, 0x00, 0x00, 0x00};
+  for (uint8_t i = 0; i < 6; ++i) s.insert(s.end(), {0xF3, 0x0F, 0x7F, (uint8_t)(0x44 | i << 3), 0x24, (uint8_t)(0x20 + 16 * i)});
+  s.insert(s.end(), {0x48, 0xB8});
+  void* hit = reinterpret_cast<void*>(&AnimInputHit);
+  const auto* h = reinterpret_cast<const uint8_t*>(&hit);
+  s.insert(s.end(), h, h + 8);
+  s.insert(s.end(), {0xFF, 0xD0});
+  for (uint8_t i = 0; i < 6; ++i) s.insert(s.end(), {0xF3, 0x0F, 0x6F, (uint8_t)(0x44 | i << 3), 0x24, (uint8_t)(0x20 + 16 * i)});
+  s.insert(s.end(), {0x48, 0x81, 0xC4, 0x88, 0x00, 0x00, 0x00, 0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58,
+                     0x5A, 0x59, 0x58, 0x9D});
+  if (s.size() != 122) {
+    *err = "stub size mismatch";
+    return false;
+  }
+  s.insert(s.end(), f, f + 5);
+  s.insert(s.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+  const uint64_t back = target + 5;
+  const auto* bb = reinterpret_cast<const uint8_t*>(&back);
+  s.insert(s.end(), bb, bb + 8);
+  DWORD old = 0;
+  if (!VirtualProtect(page, 4096, PAGE_READWRITE, &old)) {
+    *err = "cannot write the stub page";
+    return false;
+  }
+  memcpy(page, s.data(), s.size());
+  memcpy(page + 160, kPreStubUnwind, sizeof kPreStubUnwind);
+  auto* fn = reinterpret_cast<RUNTIME_FUNCTION*>(page + 192);
+  fn->BeginAddress = 0;
+  fn->EndAddress = 160;
+  fn->UnwindData = 160;
+  VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+  FlushInstructionCache(GetCurrentProcess(), page, 4096);
+  RtlAddFunctionTable(fn, 1, reinterpret_cast<DWORD64>(page));
+  g_input_gc = reinterpret_cast<uintptr_t>(Base()) + gameclient_rva;
+  g_set_float_var = reinterpret_cast<SetFloatVar_t>(f);
+  RefreshInputOwner();
+  // The 5-byte jmp goes in with one aligned 8-byte write (the bytes after it are left as they
+  // were; the stub runs the first instruction instead).
+  uint64_t old_q = 0, new_q = 0;
+  memcpy(&old_q, reinterpret_cast<const void*>(aligned), 8);
+  new_q = old_q;
+  auto* nb = reinterpret_cast<uint8_t*>(&new_q);
+  nb[o] = 0xE9;
+  const int32_t rel32 = (int32_t)rel;
+  memcpy(nb + o + 1, &rel32, 4);
+  DWORD prot = 0;
+  if (!VirtualProtect(reinterpret_cast<void*>(aligned), 8, PAGE_EXECUTE_READWRITE, &prot)) {
+    *err = "cannot make the setter's entry writable";
+    return false;
+  }
+#ifndef SOWGUARD_MUTANT  // negative control: the setter is never hooked
+  InterlockedExchange64(reinterpret_cast<volatile LONG64*>(aligned), (LONG64)new_q);
+#endif
+  FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(aligned), 8);
+  VirtualProtect(reinterpret_cast<void*>(aligned), 8, prot, &old);
+  InterlockedExchange(&g_input_state, 1);
+  SowLog(L"sim: animation inputs of the player recorded at rva:%llX (%d names)", (unsigned long long)setter_rva,
+         kAnimInputs);
+  return true;
+}
+
+bool SimAnimInputs(float out[kAnimInputs], uint32_t* mask) {
+  if (g_input_state != 1) return false;
+  memcpy(out, g_inputs, sizeof g_inputs);
+  *mask = (uint32_t)g_input_mask;
+  return true;
+}
+
+bool SimApplyPuppetInputs(uintptr_t setter_rva, const float in[kAnimInputs], uint32_t mask, std::string* err) {
+  if (!g_set_float_var) {  // a receiver that does not record (only the sender installs the hook)
+    uint8_t* const f = const_cast<uint8_t*>(Base()) + setter_rva;
+    if (!Head(f, "48895C241055488BEC4883EC3080B98818000000")) {
+      *err = "animation-variable setter bytes differ from the known build; refused";
+      return false;
+    }
+    g_set_float_var = reinterpret_cast<SetFloatVar_t>(f);
+  }
+  if (!mask || GetCurrentThreadId() != InputGameThread()) return false;
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!owner || !PuppetAlive(owner, vt, health)) return false;
+  void* anim = reinterpret_cast<void*>(owner + 0x120);
+  for (int i = 0; i < kAnimInputs; ++i)
+    if (mask & (1u << i)) g_set_float_var(anim, kInputNames[i], in[i]);
+  InterlockedIncrement(&g_inputs_applied);
+  return true;
+}
+
+void SimSetMirror(bool on) { InterlockedExchange(&g_mirror, on ? 1 : 0); }
+
+std::string SimInputsReport() {
+  std::ostringstream out;
+  out << "ok inputs=" << (g_input_state == 1 ? "recorded" : "off") << " hits=" << g_input_hits
+      << " applied=" << g_inputs_applied << " mirror=" << (g_mirror ? "on" : "off") << "\n";
+  const LONG mask = g_input_mask;
+  for (int i = 0; i < kAnimInputs; ++i) {
+    char b[96];
+    snprintf(b, sizeof b, "%s=%s%.3f\n", kInputNames[i], (mask & (1L << i)) ? "" : "(never) ", g_inputs[i]);
+    out << b;
+  }
+  for (int i = 0; i < kOtherInputs && g_other_ptr[i]; ++i) {
+    char b[128];
+    snprintf(b, sizeof b, "other %.64s=%.3f\n", g_other_ptr[i], g_other[i]);
+    out << b;
+  }
+  return out.str();
+}
+
+// ---------------------------------------------------------------- root-motion speed (coop_anim_speed)
+
+namespace {
+
+// A character moves by its animation's root motion: each frame the motion its graph produced
+// is copied to [character+0x11D8] (local space) and, for an AI character, on to its movement
+// controller ([character+0x2C78]+0x9C, 2FDF68); the movement component's per-frame step
+// (vtable slot 0x80, 191868 for an AI character, called from 3012C9) reads it there (119BAC
+// through 11AE84, unless [controller+0x12C] is set). A Talion stand-in's graph, given the
+// sender's inputs, runs no faster than ~230 units/s while the sender free-runs at 600-750
+// (seen 2026-10-22: the sender's own graph gets the free-run elsewhere). So the stand-in's
+// movement component gets a copy of its vtable with slot 0x80 wrapped: before the step, the
+// motion is scaled by the sender's root-motion speed (smoothed over a tenth of a second, so
+// it follows a free-run's quick start, and faster when it drops, so the stand-in does not run
+// on past a sudden stop) plus a catch-up, over the stand-in's own (smoothed over a quarter
+// second, so its stride keeps its own rhythm). It engages only while the sender is faster
+// than the stand-in's own run can be (a free-run: over 300 units/s, and 1.2 times the
+// stand-in's) and for half a second after: walks and runs are left to the stand-in's own
+// motion, which matches the sender's there (scaling them too, at every start and corner,
+// made steered walks drift more). Only that one object uses the copy; other characters keep
+// the class's vtable.
+constexpr unsigned kMoverSlots = 80;          // copied (the class uses at least 0x130 / 8)
+constexpr float kRootWantTau = 0.1f, kRootWantDropTau = 0.04f, kRootOwnTau = 0.25f;  // seconds
+constexpr float kRootMinOwn = 30.0f;          // slower than this its direction is unknown
+constexpr float kRootMinRatio = 0.5f, kRootMaxRatio = 4.0f;
+constexpr float kRootEngage = 1.2f, kRootEngageSpeed = 300.0f, kRootHold = 0.5f;  // ratio; units/s; seconds
+using MoverStep_t = void(__fastcall*)(uintptr_t mover, void* target);
+MoverStep_t g_mover_step = nullptr;   // the class's slot 0x80
+volatile uintptr_t g_speed_mover = 0;  // the puppet's movement component, with the copied vtable
+uintptr_t g_speed_owner = 0;          // the puppet it belongs to
+volatile float g_root_target = -1.0f;  // the sender's root-motion speed (units/s); < 0: off
+volatile float g_root_extra = 0.0f;    // added after smoothing (catch-up)
+float g_root_want = 0, g_root_own = 0;  // smoothed
+float g_root_clock = 0, g_root_engaged_until = -1;  // seconds of the stand-in's frames
+volatile float g_root_ratio = 1.0f;
+volatile LONG g_root_frames = 0;       // frames scaled
+std::string g_root_err;
+
+void ScaleRootMotion(uintptr_t mover) {
+  const float target = g_root_target;
+  if (target < 0) return;
+  __try {
+    const uintptr_t ch = *reinterpret_cast<const uintptr_t*>(mover + 0x520);
+    const uintptr_t c = *reinterpret_cast<const uintptr_t*>(ch + 0x2C78);
+    if (!c || *reinterpret_cast<const uint8_t*>(c + 0x12C)) return;  // no root motion this frame
+    float* d = reinterpret_cast<float*>(c + 0x9C);
+    const float dt = *reinterpret_cast<const float*>(ch + 0x1118);
+    if (!(dt > 0.0f && dt < 0.5f)) return;
+    const float own = std::sqrt(d[0] * d[0] + d[2] * d[2]) / dt;
+    const float tau = target < g_root_want ? kRootWantDropTau : kRootWantTau;
+    g_root_want += (target - g_root_want) * (1.0f - std::exp(-dt / tau));
+    g_root_own += (own - g_root_own) * (1.0f - std::exp(-dt / kRootOwnTau));
+    g_root_clock += dt;
+    if (g_root_want > kRootEngageSpeed && g_root_want > kRootEngage * g_root_own)
+      g_root_engaged_until = g_root_clock + kRootHold;
+    if (g_root_clock > g_root_engaged_until) return;  // not a free-run: its own motion
+    if (own < kRootMinOwn || g_root_own < kRootMinOwn) return;
+    const float want = std::max(0.0f, g_root_want + g_root_extra);
+    const float r = std::min(std::max(want / g_root_own, kRootMinRatio), kRootMaxRatio);
+    d[0] *= r;
+    d[2] *= r;
+    g_root_ratio = r;
+    InterlockedIncrement(&g_root_frames);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+volatile LONG g_skip_step = 0;     // the puppet's movement step and update are skipped (sender in the air)
+volatile LONG g_skipped_steps = 0;
+// Slot 0x100 (2FFC1C, the same in the player's movement class): the frame update, which writes
+// the character's transform from the movement's own state (250C1C -> 14554C); with only the
+// step skipped, it pulled a stand-in held in the air back to the ground (session an).
+using MoverUpdate_t = void(__fastcall*)(uintptr_t mover, void* state);
+MoverUpdate_t g_mover_update = nullptr;
+
+void __fastcall PuppetMoverUpdate(uintptr_t mover, void* state) {
+  if (mover == g_speed_mover && g_skip_step) return;
+  g_mover_update(mover, state);
+}
+
+void __fastcall PuppetMoverStep(uintptr_t mover, void* target) {
+  if (mover == g_speed_mover && g_skip_step) {
+    InterlockedIncrement(&g_skipped_steps);
+    return;
+  }
+  if (mover == g_speed_mover) ScaleRootMotion(mover);
+  g_mover_step(mover, target);
+}
+
+// On the simulation thread: give the current puppet's movement component the copied vtable.
+bool WrapPuppetMover(uintptr_t step_rva, std::string* err) {
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!owner || !PuppetAlive(owner, vt, health)) {
+    *err = "no puppet";
+    return false;
+  }
+  uintptr_t mover = 0, back = 0, mvt = 0, slot = 0, c = 0, c_back = 0;
+  if (!ReadQ(owner + 0x24A0, &mover) || !mover || !ReadQ(mover + 0x520, &back) || back != owner ||
+      !ReadQ(mover, &mvt)) {
+    *err = "the puppet has no movement component of the known shape";
+    return false;
+  }
+  if (owner == g_speed_owner && mover == g_speed_mover) return true;
+  if (!InImage(mvt) || !ReadQ(mvt + 0x80, &slot) || !ReadQ(owner + 0x2C78, &c) || !c || !ReadQ(c, &c_back) ||
+      c_back != owner) {
+    *err = "the puppet has no movement component and controller of the known shape";
+    return false;
+  }
+  const uint8_t* f = Base() + step_rva;
+  if (slot != reinterpret_cast<uintptr_t>(f) || !Head(f, "488BC448895808488970104889781855488BEC4883EC70")) {
+    *err = "the movement component's step (slot 0x80) differs from the known build; refused";
+    return false;
+  }
+  // The copy keeps the type information before the table (vt[-1]).
+  auto* copy = static_cast<uintptr_t*>(VirtualAlloc(nullptr, (kMoverSlots + 1) * 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+  if (!copy) {
+    *err = "no memory for the vtable copy";
+    return false;
+  }
+  for (unsigned i = 0; i <= kMoverSlots; ++i) {
+    if (!ReadQ(mvt - 8 + 8 * i, &copy[i])) {
+      VirtualFree(copy, 0, MEM_RELEASE);
+      *err = "the movement component's vtable is not readable";
+      return false;
+    }
+  }
+  g_mover_step = reinterpret_cast<MoverStep_t>(slot);
+  copy[1 + 0x80 / 8] = reinterpret_cast<uintptr_t>(&PuppetMoverStep);
+  const auto* update = reinterpret_cast<const uint8_t*>(copy[1 + 0x100 / 8]);
+  if (InImage(reinterpret_cast<uintptr_t>(update)) && Head(update, "48895C24084889742410" "48897C241855488BEC4883EC70")) {
+    g_mover_update = reinterpret_cast<MoverUpdate_t>(const_cast<uint8_t*>(update));
+    copy[1 + 0x100 / 8] = reinterpret_cast<uintptr_t>(&PuppetMoverUpdate);
+  } else {
+    SowLog(L"sim: the movement component's update (slot 0x100) differs from the known build; not skipped "
+           L"in the air");
+  }
+  DWORD old = 0;
+  VirtualProtect(copy, (kMoverSlots + 1) * 8, PAGE_READONLY, &old);
+  g_root_want = g_root_own = 0;
+  g_root_engaged_until = -1;
+  g_speed_mover = mover;
+  g_speed_owner = owner;
+#ifndef SOWGUARD_MUTANT  // negative control: the stand-in keeps its own speed
+  InterlockedExchange64(reinterpret_cast<volatile LONG64*>(mover), (LONG64)(copy + 1));
+#endif
+  SowLog(L"sim: puppet movement component abs:%llX: step wrapped (root-motion speed of the sender)",
+         (unsigned long long)mover);
+  return true;
+}
+
+}  // namespace
+
+void SimSetPuppetRootSpeed(uintptr_t step_rva, float speed, float extra) {
+  if (speed >= 0) {
+    std::string err;
+    if (!WrapPuppetMover(step_rva, &err)) {
+      if (err != g_root_err && err != "no puppet") SowLog(L"sim: the puppet keeps its own speed: %S", err.c_str());
+      g_root_err = err;
+      speed = -1;
+    }
+  }
+  g_root_extra = extra;
+  g_root_target = speed;
+}
+
+bool SimSkipPuppetStep(uintptr_t step_rva, bool skip) {
+  if (skip) {
+    std::string err;
+    if (!WrapPuppetMover(step_rva, &err)) {
+      if (err != g_root_err && err != "no puppet") SowLog(L"sim: the puppet's step is not skipped: %S", err.c_str());
+      g_root_err = err;
+      skip = false;
+    }
+  }
+  InterlockedExchange(&g_skip_step, skip ? 1 : 0);
+  return skip;
+}
+
+long SimSkippedSteps() { return g_skipped_steps; }
+
+std::string SimRootSpeedReport() {
+  char b[128];
+  snprintf(b, sizeof b, "root_speed=%s/%ld ratio=%.2f want=%.0f extra=%.0f own=%.0f", g_root_target < 0 ? "off" : "on",
+           g_root_frames, g_root_ratio, g_root_want, g_root_extra, g_root_own);
+  return b;
+}
+
+// ---------------------------------------------------------------- game actions (buttons for the graph)
+
+namespace {
+
+// The player's update (30C276) fills, every frame, three lists of the 377 game actions on its
+// character: +0x5F8 (a count, then a byte per action: held), +0x778 (a count, then a byte per
+// action: pressed) and +0x8F8 (a count, then a float per action); 1B1840 copies them into the
+// character's animation job. The graph's input nodes (644AD8) read its buttons there (states
+// A_Button_JustPressed -> A_Button_WaitingForUnpress -> Sprint), but only while the job's copy
+// of character+0x113A is set and the graph counts as player-driven (character+0x1129, both set
+// to 1 by the player's update every frame); then the lists must be full (count 377), or the
+// game's bounds check (FA9C20) writes to address 0. An AI character's lists stay empty and its
+// flags 0, so a Talion stand-in walks where the player free-runs (its stick states come from
+// the float inputs). So the stand-in gets the sender's lists every frame, full, with both
+// flags; switched off, flags and lists go back together (one simulation-thread write before
+// the job copies them).
+constexpr unsigned kActions = 377;
+constexpr uintptr_t kHeld = 0x5F8, kPressed = 0x778, kValue = 0x8F8, kFlagInput = 0x113A, kFlagPlayer = 0x1129;
+volatile LONG g_actions_applied = 0;
+uintptr_t g_actions_owner = 0;  // the puppet that has them
+
+void WriteActions(uintptr_t ch, const SimAction* a, int n, bool on) {
+  __try {
+    auto* held = reinterpret_cast<uint8_t*>(ch + kHeld + 4);
+    auto* pressed = reinterpret_cast<uint8_t*>(ch + kPressed + 4);
+    auto* value = reinterpret_cast<float*>(ch + kValue + 4);
+    if (!on) {
+      *reinterpret_cast<uint8_t*>(ch + kFlagInput) = 0;
+      *reinterpret_cast<uint8_t*>(ch + kFlagPlayer) = 0;
+    }
+    *reinterpret_cast<uint32_t*>(ch + kHeld) = on ? kActions : 0;
+    *reinterpret_cast<uint32_t*>(ch + kPressed) = on ? kActions : 0;
+    *reinterpret_cast<uint32_t*>(ch + kValue) = on ? kActions : 0;
+    memset(held, 0, kActions);
+    memset(pressed, 0, kActions);
+    memset(value, 0, kActions * sizeof(float));
+    for (int i = 0; on && i < n; ++i) {
+      if (a[i].index >= kActions) continue;
+      held[a[i].index] = a[i].held;
+      pressed[a[i].index] = a[i].pressed;
+      value[a[i].index] = a[i].value;
+    }
+    if (on) {
+      *reinterpret_cast<uint8_t*>(ch + kFlagInput) = 1;
+      *reinterpret_cast<uint8_t*>(ch + kFlagPlayer) = 1;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+// Probe "puppet hold": experiment, the listed actions held for a while (pressed on the first
+// frame), without the flags.
+constexpr int kMaxHeld = 16;
+SimAction g_hold[kMaxHeld] = {};
+int g_hold_count = 0;
+volatile ULONGLONG g_hold_until = 0;  // GetTickCount64 deadline; 0: off
+bool g_hold_first = false;
+
+}  // namespace
+
+int SimPlayerActions(uintptr_t gameclient_rva, SimAction* out, int max) {
+  uintptr_t gc = 0, player = 0;
+  if (!ReadQ(reinterpret_cast<uintptr_t>(Base()) + gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &player) ||
+      !player)
+    return 0;
+  int n = 0;
+  __try {
+    const uint32_t count = std::min(*reinterpret_cast<const uint32_t*>(player + kHeld), kActions);
+    const auto* held = reinterpret_cast<const uint8_t*>(player + kHeld + 4);
+    const auto* pressed = reinterpret_cast<const uint8_t*>(player + kPressed + 4);
+    const auto* value = reinterpret_cast<const float*>(player + kValue + 4);
+    for (uint32_t i = 0; i < count && n < max; ++i) {
+      if (!held[i] && !pressed[i] && value[i] == 0.0f) continue;
+      out[n].index = (uint16_t)i;
+      out[n].held = held[i];
+      out[n].pressed = pressed[i];
+      out[n].value = value[i];
+      ++n;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+  return n;
+}
+
+bool SimApplyPuppetActions(const SimAction* a, int n, std::string* err) {
+  if (GetCurrentThreadId() != InputGameThread()) {
+    *err = "not on the simulation thread";
+    return false;
+  }
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!owner || !PuppetAlive(owner, vt, health)) {
+    g_actions_owner = 0;
+    *err = "no puppet";
+    return false;
+  }
+  WriteActions(owner, a, n, true);
+  g_actions_owner = owner;
+  InterlockedIncrement(&g_actions_applied);
+  return true;
+}
+
+void SimReleasePuppetActions() {
+  const uintptr_t had = g_actions_owner;
+  g_actions_owner = 0;
+  if (!had || GetCurrentThreadId() != InputGameThread()) return;
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (owner == had && PuppetAlive(owner, vt, health)) WriteActions(owner, nullptr, 0, false);
+}
+
+long SimPuppetActionFrames() { return g_actions_applied; }
+
+bool HoldPending() { return g_hold_until != 0; }
+
+void RunHold() {
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!owner || !PuppetAlive(owner, vt, health)) {
+    g_hold_until = 0;
+    return;
+  }
+  const bool on = GetTickCount64() < g_hold_until;
+  for (int i = 0; i < g_hold_count; ++i) g_hold[i].pressed = g_hold_first ? 1 : 0;
+  g_hold_first = false;
+  // The flags stay as they are (a probe "write" sets them for experiments).
+  __try {
+    const uint8_t input = *reinterpret_cast<const uint8_t*>(owner + kFlagInput);
+    const uint8_t player = *reinterpret_cast<const uint8_t*>(owner + kFlagPlayer);
+    WriteActions(owner, g_hold, g_hold_count, on);
+    *reinterpret_cast<uint8_t*>(owner + kFlagInput) = input;
+    *reinterpret_cast<uint8_t*>(owner + kFlagPlayer) = player;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  if (!on) g_hold_until = 0;
+}
+
+std::string SimPuppetHold(unsigned ms, const int* index, const float* values, int n) {
+  if (!g_installed) return "err simulation-thread hook not installed (sim_hook)\n";
+  if (!g_puppet) return "err no puppet\n";
+  if (n < 1 || n > kMaxHeld || !ms || ms > 30000)
+    return "err usage: puppet hold <1..30000 ms> <index 0..376>[=value] (at most 16)\n";
+  for (int i = 0; i < n; ++i)
+    if (index[i] < 0 || index[i] >= (int)kActions) return "err action index out of range (0..376)\n";
+  g_hold_until = 0;
+  Sleep(50);
+  for (int i = 0; i < n; ++i) g_hold[i] = {(uint16_t)index[i], 1, 0, values[i]};
+  g_hold_count = n;
+  g_hold_first = true;
+  g_hold_until = GetTickCount64() + ms;
+  return "ok holding on the puppet\n";
+}
+
+// ---------------------------------------------------------------- the puppet as the player's follower
+
+namespace {
+
+// A stand-in within ~300 units puts the local player in combat: the game's combat log says
+// InCombat TRUE and Sheathed FALSE, and the player's graph walks in Hand_Holding (session ak).
+// The character's player-follower byte (+0x23B8: getter 1156AF0, script SetIsPlayerFollower,
+// setter 102F0C, which also tells the faction, UI and squad systems) set to 1 on the stand-in
+// kept InCombat FALSE and Sheathed TRUE beside it, with no Hand_Holding, and the game counts
+// it as a player ally (IsPlayerAlly, 366B88, reads this byte). Only the byte is written: the
+// setter's notifications changed nothing more. The player can still strike it (two hits kill
+// it, setter or not; session al).
+constexpr uintptr_t kFollower = 0x23B8;
+uintptr_t g_follower_owner = 0;  // the puppet last marked
+int g_follower_build = 0;        // the getter's bytes: 0 unchecked, 1 known, -1 differ
+volatile LONG g_follower_marks = 0;
+
+// Follower or not, the player's attacks still picked the stand-in as their target and one
+// strike killed it (session al): the game lets the player kill allies. Every attack node
+// checks each candidate target with 18626C (rcx the node, rdx the attacker's context, r8 the
+// candidate, [r8+0x20] the candidate's health object; a read watch on the stand-in's health
+// object during a strike went through it). The game's own "targetable" flag
+// (character+0x2C16, script SetTargetable) at 0 did not stop the strikes. A stub at the
+// check's second instruction (186271: the first ends 4 bytes into an aligned qword, so a
+// 5-byte jump there would need two writes) returns false (rejected) for the puppet's health
+// object; both callers then go on to the next candidate. That stopped the strikes aiming at
+// it, but a swing without a target still hit it (the sword's shape cast) and killed it. Write
+// watches on the stand-in's health showed two ways in, a targeted hit (2C642C -> 2C658C, which
+// logs APPLYDAMAGE) and an untargeted one (1F6FE0 -> 2C966C -> ... -> 2C8150), both through
+// 2C70C0, which applies a hit: rcx a component of the attacker, rdx one of the target
+// ([rdx+0x28] the target character; then 2EE394 -> EAA190 -> 2E4B34 write its health). A
+// second stub returns from 2C70C0 at once for the puppet.
+volatile uintptr_t g_untargeted = 0;  // the health object the check stub rejects (0: none)
+volatile uintptr_t g_unhit = 0;       // the character the hit stub skips (0: none)
+volatile LONG g_target_rejects = 0;   // candidates the check stub rejected
+volatile LONG g_hit_drops = 0;        // hits the hit stub dropped
+// Area attacks (fire, explosions, auras) do not go through either: a large enemy's fire took a
+// stand-in from 298 to 3 with both stubs in (session as). Each area tick asks 2E5718 about every
+// character near it (rcx the tick, rdx the character; it logs "AOETick = %s; %s Evaluating
+// Object." and every reason to skip one, MustBeAlive, MustBeAlly, ...) and adds the ones it
+// accepts to the tick's hit list; it returns nothing. A third stub returns from it at once for the
+// puppet.
+volatile LONG g_aoe_skips = 0;        // area ticks the stub kept off the puppet
+volatile LONG g_target_hook = 0;      // 1 once both stubs are in
+
+}  // namespace
+
+namespace {
+
+// A 5-byte jump to stub at `at`, written with one aligned 8-byte write (the other bytes of that
+// qword stay as they are).
+bool PatchJump(uintptr_t at, const uint8_t* stub, std::string* err) {
+  const uintptr_t aligned = at & ~uintptr_t(7);
+  const size_t o = at - aligned;
+  const int64_t rel = reinterpret_cast<intptr_t>(stub) - (intptr_t)(at + 5);
+  if (o > 3 || rel < INT32_MIN || rel > INT32_MAX) {
+    *err = "the jump does not fit (alignment or reach)";
+    return false;
+  }
+  uint64_t q = 0;
+  memcpy(&q, reinterpret_cast<const void*>(aligned), 8);
+  auto* nb = reinterpret_cast<uint8_t*>(&q);
+  nb[o] = 0xE9;
+  const int32_t rel32 = (int32_t)rel;
+  memcpy(nb + o + 1, &rel32, 4);
+  DWORD prot = 0, old = 0;
+  if (!VirtualProtect(reinterpret_cast<void*>(aligned), 8, PAGE_EXECUTE_READWRITE, &prot)) {
+    *err = "cannot make the game's code writable";
+    return false;
+  }
+#ifndef SOWGUARD_MUTANT  // negative control: the player's attacks still pick and hit the puppet
+  InterlockedExchange64(reinterpret_cast<volatile LONG64*>(aligned), (LONG64)q);
+#endif
+  FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(aligned), 8);
+  VirtualProtect(reinterpret_cast<void*>(aligned), 8, prot, &old);
+  return true;
+}
+
+void PutQ(std::vector<uint8_t>* s, uintptr_t v) {
+  const auto* b = reinterpret_cast<const uint8_t*>(&v);
+  s->insert(s->end(), b, b + 8);
+}
+
+}  // namespace
+
+bool SimAttackHooksInstall(uintptr_t check_rva, uintptr_t hit_rva, uintptr_t aoe_rva, std::string* err) {
+  if (g_target_hook == 1) return true;
+  uint8_t* const check = const_cast<uint8_t*>(Base()) + check_rva;
+  uint8_t* const hit = const_cast<uint8_t*>(Base()) + hit_rva;
+  uint8_t* const aoe = const_cast<uint8_t*>(Base()) + aoe_rva;
+  if (!Head(check, "48895C240844884C24204889542410555657415441554156415748" "8BEC4883EC704D8B7020")) {
+    *err = "the attack target check's bytes differ from the known build; refused";
+    return false;
+  }
+  if (!Head(hit, "48895C240848896C24184889742420574156" "4157")) {
+    *err = "the hit's bytes differ from the known build; refused";
+    return false;
+  }
+  if (!Head(aoe, "488BC448895810555657415441554156" "4157")) {
+    *err = "the area-attack filter's bytes differ from the known build; refused";
+    return false;
+  }
+  uint8_t* page = SimNearPage(4);
+  if (!page) {
+    *err = "no code page near the game image";
+    return false;
+  }
+  // At the check's second instruction (check+5; the first ends 4 bytes into an aligned qword):
+  // mov rax,[r8+20h]; mov r10,&g_untargeted; cmp rax,[r10]; jne +17;
+  // mov r11,&g_target_rejects; lock inc dword [r11]; xor eax,eax; ret (rejected);
+  // then that instruction (mov [rsp+20h],r9b) and a jump back after it.
+  std::vector<uint8_t> s = {0x49, 0x8B, 0x40, 0x20, 0x49, 0xBA};
+  PutQ(&s, reinterpret_cast<uintptr_t>(&g_untargeted));
+  s.insert(s.end(), {0x49, 0x3B, 0x02, 0x75, 0x11, 0x49, 0xBB});
+  PutQ(&s, reinterpret_cast<uintptr_t>(&g_target_rejects));
+  s.insert(s.end(), {0xF0, 0x41, 0xFF, 0x03, 0x31, 0xC0, 0xC3});
+  s.insert(s.end(), check + 5, check + 10);
+  s.insert(s.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+  PutQ(&s, reinterpret_cast<uintptr_t>(check + 10));
+  // At the hit's entry (on an aligned qword): test rdx,rdx; je +36; mov r10,[rdx+28h];
+  // mov r11,&g_unhit; cmp r10,[r11]; jne +17; mov r11,&g_hit_drops; lock inc dword [r11];
+  // xor eax,eax; ret (no hit; the callers ignore rax); then its first instruction
+  // (mov [rsp+8],rbx) and a jump back after it.
+  std::vector<uint8_t> t = {0x48, 0x85, 0xD2, 0x74, 0x24, 0x4C, 0x8B, 0x52, 0x28, 0x49, 0xBB};
+  PutQ(&t, reinterpret_cast<uintptr_t>(&g_unhit));
+  t.insert(t.end(), {0x4D, 0x3B, 0x13, 0x75, 0x11, 0x49, 0xBB});
+  PutQ(&t, reinterpret_cast<uintptr_t>(&g_hit_drops));
+  t.insert(t.end(), {0xF0, 0x41, 0xFF, 0x03, 0x31, 0xC0, 0xC3});
+  t.insert(t.end(), hit, hit + 5);
+  t.insert(t.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+  PutQ(&t, reinterpret_cast<uintptr_t>(hit + 5));
+  // At the area filter's entry (on an aligned qword): test rdx,rdx; je +30; mov r11,&g_unhit;
+  // cmp rdx,[r11]; jne +15; mov r11,&g_aoe_skips; lock inc dword [r11]; ret (not in the tick);
+  // then its first two instructions (mov rax,rsp; mov [rax+10h],rbx) and a jump back after them.
+  std::vector<uint8_t> u = {0x48, 0x85, 0xD2, 0x74, 0x1E, 0x49, 0xBB};
+  PutQ(&u, reinterpret_cast<uintptr_t>(&g_unhit));
+  u.insert(u.end(), {0x49, 0x3B, 0x13, 0x75, 0x0F, 0x49, 0xBB});
+  PutQ(&u, reinterpret_cast<uintptr_t>(&g_aoe_skips));
+  u.insert(u.end(), {0xF0, 0x41, 0xFF, 0x03, 0xC3});
+  u.insert(u.end(), aoe, aoe + 7);
+  u.insert(u.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+  PutQ(&u, reinterpret_cast<uintptr_t>(aoe + 7));
+  if (s.size() > 128 || t.size() > 128 || u.size() > 128) {
+    *err = "stub size mismatch";
+    return false;
+  }
+  DWORD old = 0;
+  if (!VirtualProtect(page, 4096, PAGE_READWRITE, &old)) {
+    *err = "cannot write the stub page";
+    return false;
+  }
+  memcpy(page, s.data(), s.size());
+  memcpy(page + 128, t.data(), t.size());
+  memcpy(page + 256, u.data(), u.size());
+  VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+  FlushInstructionCache(GetCurrentProcess(), page, 4096);
+  if (!PatchJump(reinterpret_cast<uintptr_t>(check) + 5, page, err) ||
+      !PatchJump(reinterpret_cast<uintptr_t>(hit), page + 128, err) ||
+      !PatchJump(reinterpret_cast<uintptr_t>(aoe), page + 256, err))
+    return false;
+  InterlockedExchange(&g_target_hook, 1);
+  SowLog(L"sim: attack target check rva:%llX, hit rva:%llX and area filter rva:%llX skip the puppet",
+         (unsigned long long)check_rva, (unsigned long long)hit_rva, (unsigned long long)aoe_rva);
+  return true;
+}
+
+void SimKeepPuppetUntargeted(bool on) {
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  const bool skip = on && owner && PuppetAlive(owner, vt, health);
+  g_untargeted = skip ? health : 0;
+  g_unhit = skip ? owner : 0;
+}
+
+long SimTargetRejects() { return g_target_rejects; }
+
+long SimHitDrops() { return g_hit_drops; }
+
+long SimAoeSkips() { return g_aoe_skips; }
+
+// ---------------------------------------------------------------- put-backs keep the puppet's animation
+
+namespace {
+
+// Put-backs are the game's queued teleport. Its handler (41B6B4, called at 4C4C45 with the
+// message's flag as its last argument) on a full teleport tells the AI ("AI teleported.") and
+// resets the character's animation controller: 41BB78 calls FA7E10 on [character+1970h], which
+// queues a blend to the graph's start action, IdleL. With the weapon out the restarted graph
+// then sheathes it (IdleL.To_WeaponSheatheLow); the sheathe's step took the puppet over 15 units
+// off again and the next put-back restarted it: the sheathe loop, which also cut the puppet's
+// swings short (session bd). Without the full flag the AI is not told and the puppet stayed where
+// it was. A stub at FA7E10's entry returns at once for the puppet's controller: a full teleport
+// without the restart.
+volatile uintptr_t g_keep_anim_ctrl = 0;  // the controller the stub skips (0: none)
+volatile LONG g_anim_resets_skipped = 0;
+volatile LONG g_keep_anim_hook = 0;
+
+}  // namespace
+
+bool SimAnimResetHookInstall(uintptr_t reset_rva, std::string* err) {
+  if (g_keep_anim_hook == 1) return true;
+  uint8_t* const fn = const_cast<uint8_t*>(Base()) + reset_rva;
+  if (!Head(fn, "48895C2408574883EC30" "33FF488BD9")) {
+    *err = "the animation reset's bytes differ from the known build; refused";
+    return false;
+  }
+  uint8_t* page = SimNearPage(4);
+  if (!page) {
+    *err = "no code page near the game image";
+    return false;
+  }
+  // At its entry (on an aligned qword): test rcx,rcx; je +30; mov r11,&g_keep_anim_ctrl;
+  // cmp rcx,[r11]; jne +15; mov r11,&g_anim_resets_skipped; lock inc dword [r11]; ret;
+  // then its first instruction (mov [rsp+8],rbx) and a jump back after it.
+  std::vector<uint8_t> s = {0x48, 0x85, 0xC9, 0x74, 0x1E, 0x49, 0xBB};
+  PutQ(&s, reinterpret_cast<uintptr_t>(&g_keep_anim_ctrl));
+  s.insert(s.end(), {0x49, 0x3B, 0x0B, 0x75, 0x0F, 0x49, 0xBB});
+  PutQ(&s, reinterpret_cast<uintptr_t>(&g_anim_resets_skipped));
+  s.insert(s.end(), {0xF0, 0x41, 0xFF, 0x03, 0xC3});
+  s.insert(s.end(), fn, fn + 5);
+  s.insert(s.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+  PutQ(&s, reinterpret_cast<uintptr_t>(fn + 5));
+  DWORD old = 0;
+  // Execute stays on: the attack stubs on the same page may be running on other threads.
+  if (s.size() > 128 || !VirtualProtect(page, 4096, PAGE_EXECUTE_READWRITE, &old)) {
+    *err = "cannot write the stub";
+    return false;
+  }
+  memcpy(page + 384, s.data(), s.size());
+  VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+  FlushInstructionCache(GetCurrentProcess(), page, 4096);
+  if (!PatchJump(reinterpret_cast<uintptr_t>(fn), page + 384, err)) return false;
+  InterlockedExchange(&g_keep_anim_hook, 1);
+  SowLog(L"sim: the animation reset rva:%llX skips the puppet (put-backs keep its animation)",
+         (unsigned long long)reset_rva);
+  return true;
+}
+
+void SimKeepPuppetAnimOnTeleport(bool on) {
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  uintptr_t ctrl = 0;
+  if (!on || !owner || !PuppetAlive(owner, vt, health) || !ReadQ(owner + 0x1970, &ctrl)) ctrl = 0;
+  g_keep_anim_ctrl = ctrl;
+}
+
+long SimAnimResetsSkipped() { return g_anim_resets_skipped; }
+
+// The character's health object holds the max at +0x428 and the current health at +0x42C (0
+// once dead: the local player's strikes kill a stand-in, follower or not, session al).
+bool SimForgetGonePuppet() {
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!owner) return false;
+  const bool there = PuppetAlive(owner, vt, health);
+  float now = 1;
+  if (there && !(ReadFloats(health + 0x42C, &now, 1) && now <= 0)) return false;
+  EnterCriticalSection(&g_lock);
+  const bool forgot = g_puppet == owner;
+  if (forgot) g_puppet = 0;
+  LeaveCriticalSection(&g_lock);
+  if (forgot) g_untargeted = g_unhit = 0;
+  if (forgot)
+    SowLog(there ? L"sim: puppet abs:%llX is dead (health 0); no puppet now"
+                 : L"sim: puppet abs:%llX is gone (unloaded or freed); no puppet now",
+           (unsigned long long)owner);
+  return forgot;
+}
+
+bool SimKeepPuppetFollower(uintptr_t getter_rva, bool on, std::string* err) {
+  if (GetCurrentThreadId() != InputGameThread()) {
+    *err = "not on the simulation thread";
+    return false;
+  }
+  if (!on) {
+    const uintptr_t had = g_follower_owner;
+    g_follower_owner = 0;
+    EnterCriticalSection(&g_lock);
+    const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+    LeaveCriticalSection(&g_lock);
+    if (had && owner == had && PuppetAlive(owner, vt, health)) {
+      *reinterpret_cast<volatile uint8_t*>(owner + kFollower) = 0;
+      SowLog(L"sim: puppet abs:%llX no longer marked as the player's follower", (unsigned long long)owner);
+    }
+    *err = "off";
+    return false;
+  }
+  if (!g_follower_build)
+    g_follower_build = Head(Base() + getter_rva, "33C03881B82300000F95C0C3") ? 1 : -1;
+  if (g_follower_build < 0) {
+    *err = "the player-follower getter differs from the known build; refused";
+    return false;
+  }
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!owner || !PuppetAlive(owner, vt, health)) {
+    *err = "no puppet";
+    return false;
+  }
+  __try {
+#ifndef SOWGUARD_MUTANT  // negative control: the stand-in stays a stranger
+    volatile uint8_t* flag = reinterpret_cast<volatile uint8_t*>(owner + kFollower);
+    if (*flag != 1) {
+      *flag = 1;
+      InterlockedIncrement(&g_follower_marks);
+    }
+#endif
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    *err = "the puppet's follower byte is not writable";
+    return false;
+  }
+  if (owner != g_follower_owner) {
+    g_follower_owner = owner;
+    SowLog(L"sim: puppet abs:%llX marked as the player's follower (+0x23B8), out of the player's combat",
+           (unsigned long long)owner);
+  }
+  return true;
+}
+
+long SimFollowerMarks() { return g_follower_marks; }
+
+// ---------------------------------------------------------------- call trace (probe "trace")
+
+namespace {
+
+// Who calls a function, at any address (no patch: an execute breakpoint in debug register 1
+// of the simulation thread). Each hit with the wanted rcx counts its return address; the
+// breakpoint resumes with the resume flag. Armed and cleared from the simulation thread.
+// Write mode (probe "wtrace"): a data breakpoint in debug register 2 counts the instructions
+// that write the address (the hit's rip is the instruction after the write) and keeps the
+// call stack of each one's first hit. Names mode (an execute trace of a variable setter such
+// as 176D78): counts by the second argument (the name) instead, with the last value (xmm2)
+// and the return address of the first call. Args mode: counts by the qword at r9+0x28 (0
+// when r9 is 0 or unreadable; for a function whose fourth argument is a component of a
+// character), with the first call's caller, rcx, [rcx+0x28] and r9.
+constexpr int kTraceSites = 64, kTraceDepth = 10;
+struct TraceSite {
+  uintptr_t ret;
+  LONG count;
+  uintptr_t stack[kTraceDepth];
+  int depth;
+  float value;
+  uintptr_t first_ret;
+  uintptr_t rcx, rcx28, r9;
+};
+TraceSite g_trace_sites[kTraceSites];
+volatile LONG g_trace_sites_used = 0, g_trace_hits = 0, g_trace_matched = 0, g_trace_dropped = 0;
+uintptr_t g_trace_fn = 0, g_trace_rcx = 0;
+unsigned g_trace_len = 0;  // 0: execute (DR1); 1, 2, 4 or 8: write of that many bytes (DR2)
+bool g_trace_names = false;
+bool g_trace_args = false;
+bool g_trace_r8 = false;  // with args: counted by r8 instead (an object whose name is at +0x20)
+bool g_trace_reads = false;  // with g_trace_len: reads too
+volatile LONG g_trace_state = 0;  // 0 idle, 1 arm wanted, 2 armed, 3 clear wanted
+PVOID g_trace_handler = nullptr;
+
+void TraceStack(CONTEXT c, TraceSite* s) {
+  s->depth = 0;
+  __try {
+    for (int k = 0; k < 40 && s->depth < kTraceDepth; ++k) {
+      DWORD64 image = 0;
+      PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &image, nullptr);
+      if (f) {
+        void* hd = nullptr;
+        DWORD64 fr = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, f, &c, &hd, &fr, nullptr);
+      } else {
+        c.Rip = *reinterpret_cast<const DWORD64*>(c.Rsp);
+        c.Rsp += 8;
+      }
+      if (c.Rip < 0x10000) break;
+      s->stack[s->depth++] = c.Rip;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+LONG CALLBACK TraceHandler(EXCEPTION_POINTERS* e) {
+  CONTEXT* c = e->ContextRecord;
+  const bool write = g_trace_len != 0;
+  if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(c->Dr6 & (write ? 4 : 2)) ||
+      (!write && c->Rip != g_trace_fn))
+    return EXCEPTION_CONTINUE_SEARCH;
+  InterlockedIncrement(&g_trace_hits);
+  if (write || !g_trace_rcx || c->Rcx == g_trace_rcx) {
+    InterlockedIncrement(&g_trace_matched);
+    const uintptr_t caller = *reinterpret_cast<const uintptr_t*>(c->Rsp);
+    uintptr_t r9_28 = 0, rcx_28 = 0;
+    if (g_trace_args) {
+      __try {
+        if (c->R9) r9_28 = *reinterpret_cast<const uintptr_t*>(c->R9 + 0x28);
+        if (c->Rcx) rcx_28 = *reinterpret_cast<const uintptr_t*>(c->Rcx + 0x28);
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+      }
+    }
+    const uintptr_t ret = write ? c->Rip : g_trace_names ? c->Rdx : g_trace_r8 ? c->R8 : g_trace_args ? r9_28 : caller;
+    float value = 0;
+    memcpy(&value, &c->Xmm2, sizeof value);
+    LONG i = 0;
+    const LONG used = g_trace_sites_used;
+    while (i < used && g_trace_sites[i].ret != ret) ++i;
+    if (i < used) {
+      ++g_trace_sites[i].count;
+      g_trace_sites[i].value = value;
+    } else if (used < kTraceSites) {
+      g_trace_sites[used].ret = ret;
+      g_trace_sites[used].count = 1;
+      g_trace_sites[used].depth = 0;
+      g_trace_sites[used].value = value;
+      g_trace_sites[used].first_ret = caller;
+      g_trace_sites[used].rcx = c->Rcx;
+      g_trace_sites[used].rcx28 = rcx_28;
+      g_trace_sites[used].r9 = c->R9;
+      if (write) TraceStack(*c, &g_trace_sites[used]);
+      g_trace_sites_used = used + 1;
+    } else {
+      InterlockedIncrement(&g_trace_dropped);
+    }
+  }
+  c->Dr6 = 0;
+  if (!write) c->EFlags |= 0x10000;  // resume flag: run the instruction once without breaking again
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+}  // namespace
+
+bool TracePending() { return g_trace_state == 1 || g_trace_state == 3; }
+
+void RunTrace() {
+  CONTEXT c{};
+  c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+  if (!GetThreadContext(GetCurrentThread(), &c)) return;
+  if (g_trace_state == 1) {
+    if (!g_trace_handler) g_trace_handler = AddVectoredExceptionHandler(1, TraceHandler);
+    if (g_trace_len) {
+      // length bits: 00 one byte, 01 two, 11 four, 10 eight
+      const DWORD64 len = g_trace_len == 1 ? 0 : g_trace_len == 2 ? 1 : g_trace_len == 4 ? 3 : 2;
+      c.Dr2 = g_trace_fn;
+      const DWORD64 rw = g_trace_reads ? 3 : 1;  // 01 write, 11 read or write
+      c.Dr7 = (c.Dr7 & ~((DWORD64)0xF << 24)) | (1 << 4) | (rw << 24) | (len << 26);  // local enable 2
+    } else {
+      c.Dr1 = g_trace_fn;
+      c.Dr7 = (c.Dr7 & ~((DWORD64)0xF << 20)) | (1 << 2);  // local enable 1; execute, length 1
+    }
+    SetThreadContext(GetCurrentThread(), &c);
+    InterlockedExchange(&g_trace_state, 2);
+  } else if (g_trace_state == 3) {
+    if (g_trace_len) {
+      c.Dr2 = 0;
+      c.Dr7 &= ~(DWORD64)(3 << 4);
+    } else {
+      c.Dr1 = 0;
+      c.Dr7 &= ~(DWORD64)(3 << 2);
+    }
+    SetThreadContext(GetCurrentThread(), &c);
+    InterlockedExchange(&g_trace_state, 0);
+  }
+}
+
+// A name for probe "trace ... names": the C string at p (at most 64 characters), or "?" if
+// unreadable.
+void TraceName(uintptr_t p, char out[65]) {
+  memset(out, 0, 65);
+  __try {
+    for (int i = 0; i < 64; ++i) {
+      out[i] = reinterpret_cast<const char*>(p)[i];
+      if (!out[i]) break;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    out[0] = '?';
+    out[1] = 0;
+  }
+}
+
+// An object's name by the generic name header (bit 2 of the byte at +1, then the name pointer
+// at +0x20); empty if it has none.
+void TraceObjectName(uintptr_t obj, char out[65]) {
+  uintptr_t np = 0;
+  __try {
+    if (obj && (reinterpret_cast<const uint8_t*>(obj)[1] & 2)) np = *reinterpret_cast<const uintptr_t*>(obj + 0x20);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  memset(out, 0, 65);
+  if (np) TraceName(np, out);
+}
+
+std::string SimTraceCalls(uintptr_t fn, uintptr_t rcx, unsigned ms, unsigned write_len, bool names, bool reads,
+                          bool args, bool by_r8) {
+  if (!g_installed) return "err simulation-thread hook not installed (sim_hook)\n";
+  if (!write_len && (fn < reinterpret_cast<uintptr_t>(Base()) || fn >= ImageEnd())) return "err not in the game's image\n";
+  if (write_len && (fn & (write_len - 1))) return "err the address is not aligned to the length\n";
+  if (g_trace_state != 0) return "err a trace is running\n";
+  g_trace_fn = fn;
+  g_trace_rcx = rcx;
+  g_trace_len = write_len;
+  g_trace_names = names && !write_len;
+  g_trace_args = args && !write_len && !names;
+  g_trace_r8 = g_trace_args && by_r8;
+  g_trace_reads = reads && write_len;
+  g_trace_sites_used = g_trace_hits = g_trace_matched = g_trace_dropped = 0;
+  InterlockedExchange(&g_trace_state, 1);
+  for (int i = 0; i < 200 && g_trace_state == 1; ++i) Sleep(10);
+  if (g_trace_state != 2) {
+    InterlockedExchange(&g_trace_state, 0);
+    return "err the simulation thread did not arm the trace\n";
+  }
+  Sleep(ms);
+  InterlockedExchange(&g_trace_state, 3);
+  for (int i = 0; i < 200 && g_trace_state == 3; ++i) Sleep(10);
+  const uintptr_t base = reinterpret_cast<uintptr_t>(Base()), end = ImageEnd();
+  std::ostringstream out;
+  out << "ok trace hits=" << g_trace_hits << " matched=" << g_trace_matched << " sites=" << g_trace_sites_used
+      << " dropped=" << g_trace_dropped << (g_trace_state ? " (not cleared yet)" : "") << "\n";
+  for (LONG i = 0; i < g_trace_sites_used; ++i) {
+    const uintptr_t r = g_trace_sites[i].ret;
+    char b[64];
+    if (g_trace_names) {
+      const uintptr_t f = g_trace_sites[i].first_ret;
+      char v[96];
+      if (f >= base && f < end) snprintf(v, sizeof v, " x%ld last=%.3f from rva:%llX\n", g_trace_sites[i].count,
+                                         g_trace_sites[i].value, (unsigned long long)(f - base));
+      else snprintf(v, sizeof v, " x%ld last=%.3f from abs:%llX\n", g_trace_sites[i].count, g_trace_sites[i].value,
+                    (unsigned long long)f);
+      char name[65];
+      TraceName(r, name);
+      out << "name " << name << v;
+      continue;
+    }
+    if (g_trace_r8) {
+      char name[65];
+      TraceObjectName(r, name);
+      const uintptr_t f = g_trace_sites[i].first_ret;
+      char v[260];
+      snprintf(v, sizeof v, "r8 abs:%llX '%s' x%ld (first: rcx abs:%llX rcx+28 abs:%llX r9 abs:%llX from %s:%llX)\n",
+               (unsigned long long)r, name, g_trace_sites[i].count, (unsigned long long)g_trace_sites[i].rcx,
+               (unsigned long long)g_trace_sites[i].rcx28, (unsigned long long)g_trace_sites[i].r9,
+               f >= base && f < end ? "rva" : "abs", (unsigned long long)(f >= base && f < end ? f - base : f));
+      out << v;
+      continue;
+    }
+    if (g_trace_args) {
+      const uintptr_t f = g_trace_sites[i].first_ret;
+      char v[200];
+      snprintf(v, sizeof v, "r9+28 abs:%llX x%ld (first: rcx abs:%llX rcx+28 abs:%llX r9 abs:%llX from %s:%llX)\n",
+               (unsigned long long)r, g_trace_sites[i].count, (unsigned long long)g_trace_sites[i].rcx,
+               (unsigned long long)g_trace_sites[i].rcx28, (unsigned long long)g_trace_sites[i].r9,
+               f >= base && f < end ? "rva" : "abs", (unsigned long long)(f >= base && f < end ? f - base : f));
+      out << v;
+      continue;
+    }
+    if (r >= base && r < end) snprintf(b, sizeof b, "site rva:%llX x%ld\n", (unsigned long long)(r - base), g_trace_sites[i].count);
+    else snprintf(b, sizeof b, "site abs:%llX x%ld\n", (unsigned long long)r, g_trace_sites[i].count);
+    out << b;
+    if (g_trace_sites[i].depth) {
+      out << " ";
+      for (int k = 0; k < g_trace_sites[i].depth; ++k) {
+        const uintptr_t f = g_trace_sites[i].stack[k];
+        if (f >= base && f < end) snprintf(b, sizeof b, " rva:%llX", (unsigned long long)(f - base));
+        else snprintf(b, sizeof b, " abs:%llX", (unsigned long long)f);
+        out << b;
+      }
+      out << "\n";
+    }
+  }
+  return out.str();
+}
+
+// ---------------------------------------------------------------- the sender's attacks (probe "puppet attack")
+
+namespace {
+
+// An attack starts in 2E297C (it logs "%s Start Attack: %s, Node: '%s', Target: '%s', Anim:
+// '%s'"): rcx the attacker's health object ([character+0x26A8]), rdx a node or null, r8 the
+// attack record, r9 the target or null, then on the stack a float (1.0 in the calls seen), two
+// bytes and a pointer (0). The player's strikes call it through 2D6B3C (from 2C4161), which
+// zeroes the health object's +F0, +F8, +108 and +110 and jumps there. The stand-in gets no
+// attack input of its own: its combat log stays empty while the sender strikes (session aq).
+// Attack records (type 0xA15) are the 40-byte entries of one table, [27008F8] (count +0x28,
+// array +0x38, sorted by the name hash at +4, name at +0x20; the game's find-by-name 1B078DC
+// hashes with 423E70 and searches with 278540). Each copy has the table at its own address,
+// but the hashes are the same, so a hash names an attack across copies.
+// The game's own callers stop an attack with 2EA790(health, next attack or 0), and only while
+// it is still the one at health+0xE0 and nothing holds the character (+0xD8, a recoil, is 0).
+// Without that the stand-in's attack never ends (its combat object has no player link at
+// +0x40/+0x50 to end it; the next start logs "Duplicate attack").
+using StartAttack_t = void(__fastcall*)(uintptr_t health, uintptr_t node, uintptr_t record, uintptr_t target,
+                                        float scale, uint8_t a6, uint8_t a7, uintptr_t a8);
+using StopAttack_t = void(__fastcall*)(uintptr_t health, uintptr_t next);
+StartAttack_t g_start_attack = nullptr;
+StopAttack_t g_stop_attack = nullptr;
+volatile LONG64 g_attack_record = 0;  // queued for the puppet (0: none)
+volatile LONG g_attacks_started = 0;
+volatile LONG g_attacks_stopped = 0;
+volatile LONG g_attack_faults = 0;
+// SimFollowAttack: the sender's attack last seen, and what was started on which puppet.
+uint32_t g_follow_id = 0, g_follow_stamp = 0;
+uintptr_t g_follow_record = 0, g_follow_health = 0;
+
+const char kThunkHead[] = "33C0488981F00000008981F8000000488981080100008981100100" "00E9";
+const char kStartHead[] = "488BC448895818488950105556574154415541564157";
+const char kStopHead[] = "48895C24105556574154415541564157" "4881ECC0000000";
+
+bool StartAttackKnown(uintptr_t thunk_rva) {
+  const uint8_t* f = Base() + thunk_rva;
+  if (!Head(f, kThunkHead) || !Head(Rel32Target(f + 0x1C), kStartHead)) return false;
+  g_start_attack = reinterpret_cast<StartAttack_t>(const_cast<uint8_t*>(f));
+  return true;
+}
+
+bool CallStartAttack(uintptr_t health, uintptr_t rec) {
+  __try {
+    g_start_attack(health, 0, rec, 0, 1.0f, 0, 1, 0);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    InterlockedIncrement(&g_attack_faults);
+    return false;
+  }
+  InterlockedIncrement(&g_attacks_started);
+  return true;
+}
+
+// Stops the puppet's attack if it is still rec and nothing holds it.
+void CallStopAttack(uintptr_t health, uintptr_t rec) {
+  __try {
+    if (*reinterpret_cast<const uintptr_t*>(health + 0xE0) != rec || *reinterpret_cast<const uintptr_t*>(health + 0xD8))
+      return;
+    g_stop_attack(health, 0);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    InterlockedIncrement(&g_attack_faults);
+    return;
+  }
+  InterlockedIncrement(&g_attacks_stopped);
+}
+
+}  // namespace
+
+uintptr_t SimAttackRecord(uintptr_t table_rva, uint32_t id) {
+  uintptr_t table = 0, array = 0;
+  if (!ReadQ(reinterpret_cast<uintptr_t>(Base()) + table_rva, &table) || !table || !ReadQ(table + 0x38, &array) ||
+      !array)
+    return 0;
+  __try {
+    int lo = 0, hi = (int)*reinterpret_cast<const uint32_t*>(table + 0x28) - 1;
+    while (lo <= hi) {
+      const int mid = lo + (hi - lo) / 2;
+      const uintptr_t rec = array + 40ull * mid;
+      const uint32_t h = *reinterpret_cast<const uint32_t*>(rec + 4);
+      if (h == id) return *reinterpret_cast<const uint32_t*>(rec) == 0xA15 ? rec : 0;
+      if (h < id) lo = mid + 1;
+      else hi = mid - 1;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return 0;
+}
+
+bool AttackPending() { return g_attack_record != 0; }
+
+namespace {
+uintptr_t g_attack_player_global = 0;  // the GameClient global when the queued attack is for the player
+}  // namespace
+
+void RunAttack() {
+  const uintptr_t rec = static_cast<uintptr_t>(InterlockedExchange64(&g_attack_record, 0));
+  if (!rec) return;
+  if (g_attack_player_global) {
+    uintptr_t gc = 0, player = 0, health = 0;
+    if (ReadQ(g_attack_player_global, &gc) && gc && ReadQ(gc + 0x888, &player) && player &&
+        ReadQ(player + 0x26A8, &health) && health)
+      CallStartAttack(health, rec);
+    return;
+  }
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!owner || !PuppetAlive(owner, vt, health)) return;
+  CallStartAttack(health, rec);
+}
+
+std::string SimPuppetAttack(uintptr_t thunk_rva, uintptr_t table_rva, uint32_t id, uintptr_t gameclient_rva) {
+  if (!g_installed) return "err simulation-thread hook not installed (sim_hook)\n";
+  if (!g_puppet && !gameclient_rva) return "err no puppet\n";
+  if (!g_start_attack && !StartAttackKnown(thunk_rva))
+    return "err attack functions differ from the known build; refused\n";
+  const uintptr_t rec = SimAttackRecord(table_rva, id);
+  if (!rec) return "err no attack with that id\n";
+  char name[65];
+  TraceObjectName(rec, name);
+  const LONG before = g_attacks_started, faults = g_attack_faults;
+  g_attack_player_global = gameclient_rva ? reinterpret_cast<uintptr_t>(Base()) + gameclient_rva : 0;
+  InterlockedExchange64(&g_attack_record, static_cast<LONG64>(rec));
+  for (int i = 0; i < 100 && g_attack_record; ++i) Sleep(10);
+  char b[200];
+  snprintf(b, sizeof b, "ok attack '%s' (abs:%llX) %s\n", name, (unsigned long long)rec,
+           g_attack_faults != faults        ? "faulted"
+           : g_attacks_started == before    ? "not run"
+           : gameclient_rva                 ? "started on this copy's player"
+                                            : "started on the puppet");
+  return b;
+}
+
+// With an attack started on the puppet, also play its move on the puppet's animation controller
+// (below; an AI character's attack start does not), probe "puppet moves on|off". The move leaves the
+// graph holding the sword out; once the attack has ended, ~1.2 s later the graph is sent to IdleL,
+// whose transitions sheathe it (session bd).
+volatile LONG g_attack_moves_on = 1;
+volatile LONG g_attack_moves_played = 0;
+ULONGLONG g_sheathe_at = 0;
+bool PlayAttackMoveOn(uintptr_t character, uintptr_t record);
+void PlaySheatheNow(uintptr_t character);
+
+bool SimFollowAttack(uintptr_t thunk_rva, uintptr_t stop_rva, uintptr_t table_rva, uint32_t id, uint32_t stamp,
+                     std::string* err) {
+  if (g_sheathe_at && GetTickCount64() >= g_sheathe_at) {
+    g_sheathe_at = 0;
+    EnterCriticalSection(&g_lock);
+    const uintptr_t o = g_puppet, v = g_puppet_vt, h = g_puppet_health;
+    LeaveCriticalSection(&g_lock);
+    if (o && PuppetAlive(o, v, h)) PlaySheatheNow(o);
+  }
+  if (id == g_follow_id && stamp == g_follow_stamp) return true;
+  g_follow_id = id;
+  g_follow_stamp = stamp;
+  if (!g_stop_attack) {
+    if (!StartAttackKnown(thunk_rva) || !Head(Base() + stop_rva, kStopHead)) {
+      g_follow_id = g_follow_stamp = 0;  // so the next call says so again (once per error is logged)
+      *err = "attack functions differ from the known build; refused";
+      return false;
+    }
+    g_stop_attack = reinterpret_cast<StopAttack_t>(const_cast<uint8_t*>(Base() + stop_rva));
+  }
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!owner || !PuppetAlive(owner, vt, health)) {
+    g_follow_record = 0;
+    *err = "no puppet";
+    return false;
+  }
+  if (!id) {
+    if (g_follow_record && g_follow_health == health) CallStopAttack(health, g_follow_record);
+    if (g_follow_record && g_attack_moves_on) g_sheathe_at = GetTickCount64() + 1200;
+    g_follow_record = 0;
+    return true;
+  }
+  g_sheathe_at = 0;
+  const uintptr_t rec = SimAttackRecord(table_rva, id);
+  if (!rec) {
+    *err = "no attack with the sender's id";
+    return false;
+  }
+#ifndef SOWGUARD_MUTANT  // negative control: the stand-in never attacks
+  if (CallStartAttack(health, rec)) {
+    g_follow_record = rec;
+    g_follow_health = health;
+  }
+  if (g_attack_moves_on && PlayAttackMoveOn(owner, rec)) InterlockedIncrement(&g_attack_moves_played);
+#endif
+  return true;
+}
+
+long SimAttacksStarted() { return g_attacks_started; }
+
+long SimAttacksStopped() { return g_attacks_stopped; }
+
+// ---------------------------------------------------------------- graph actions by name (probe "puppet play")
+
+namespace {
+
+// 664CA4(graph, action name, flag) plays a named action on an animation graph: 665018 builds the
+// action from the name, 66538C finds it if it already runs (then it is only marked), else 195988
+// starts it (195988 also records the name at graph+0x48). Its only caller, 664C6C(?, graph id,
+// name, flag), is reached through a function table (no direct calls), likely a script binding.
+// A character's graph is the entry of the animation manager's list ([[26FFAA8]+0x6CB0]: count
+// +0x6720, pointers +0x6728) whose owner (+0x28) points back to the character at +0x40.
+using PlayAction_t = void(__fastcall*)(uintptr_t graph, const char* name, uint8_t flag);
+PlayAction_t g_play_action = nullptr;
+char g_play_name[96] = {};
+volatile LONG g_play_pending = 0;
+volatile LONG g_play_flag = 0;
+volatile LONG g_play_result = 0;  // 1 played, -1 no graph, -2 faulted
+
+uintptr_t GraphOf(uintptr_t character) {
+  uintptr_t mgr = 0, holder = 0;
+  if (!ReadQ(reinterpret_cast<uintptr_t>(Base()) + 0x26FFAA8, &holder) || !holder || !ReadQ(holder + 0x6CB0, &mgr) ||
+      !mgr)
+    return 0;
+  uint32_t n = 0;
+  if (!ReadFloats(mgr + 0x6720, reinterpret_cast<float*>(&n), 1)) return 0;
+  for (uint32_t i = 0; i < n && i < 1024; ++i) {
+    uintptr_t g = 0, owner = 0, ch = 0;
+    if (ReadQ(mgr + 0x6728 + 8ull * i, &g) && g && ReadQ(g + 0x28, &owner) && owner && ReadQ(owner + 0x40, &ch) &&
+        ch == character)
+      return g;
+  }
+  return 0;
+}
+
+bool CallPlayAction(uintptr_t graph, const char* name, uint8_t flag) {
+  __try {
+    g_play_action(graph, name, flag);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool PlayPending() { return g_play_pending != 0; }
+
+void RunPlay() {
+  if (!InterlockedExchange(&g_play_pending, 0)) return;
+  EnterCriticalSection(&g_lock);
+  const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  const uintptr_t graph = owner && PuppetAlive(owner, vt, health) ? GraphOf(owner) : 0;
+  if (!graph) {
+    g_play_result = -1;
+    return;
+  }
+  g_play_result = CallPlayAction(graph, g_play_name, (uint8_t)g_play_flag) ? 1 : -2;
+}
+
+std::string SimPuppetPlay(uintptr_t fn_rva, const char* name, int flag) {
+  if (!g_installed) return "err simulation-thread hook not installed (sim_hook)\n";
+  if (!g_puppet) return "err no puppet\n";
+  const uint8_t* f = Base() + fn_rva;
+  if (!Head(f, "4885D20F84CF000000488" "95C2408488974241857")) return "err play-action function differs from the known build; refused\n";
+  if (strlen(name) >= sizeof g_play_name) return "err name too long\n";
+  g_play_action = reinterpret_cast<PlayAction_t>(const_cast<uint8_t*>(f));
+  strcpy_s(g_play_name, name);
+  g_play_flag = flag;
+  g_play_result = 0;
+  InterlockedExchange(&g_play_pending, 1);
+  for (int i = 0; i < 100 && g_play_pending; ++i) Sleep(10);
+  const LONG r = g_play_result;
+  return r == 1 ? "ok played on the puppet's graph\n" : r == -1 ? "err the puppet has no graph\n" : r == -2 ? "err faulted\n" : "err not run\n";
+}
+
+// ---------------------------------------------------------------- an attack's move on the controller (probe "puppet move")
+
+namespace {
+
+// A player's strike plays its move on the animation controller, not as a graph action: the
+// combat code (2C545C, on the player's combat-move object [character+2FA0h]+1A0h, which an AI
+// character such as the puppet does not have) takes the name 4CA9A0(attack record, 0, 1) and
+// the animation object 2E17D8(record), and calls 2C614C(controller, -, name, animation object,
+// 0, game time, flag, speed), which registers the request (41A1E0) and queues it for the
+// animation threads (session bd). Experiment: the same call for the puppet's controller.
+using RecordAnim_t = uintptr_t(__fastcall*)(uintptr_t record);
+using AnimName_t = const char*(__fastcall*)(uintptr_t record, uintptr_t override_name, uint8_t flag);
+using PlayMove_t = int(__fastcall*)(uintptr_t ctrl, uintptr_t unused, const char* name, uintptr_t anim, int start,
+                                    int now, uint8_t flag, float speed);
+volatile LONG g_mv_pending = 0;
+uintptr_t g_mv_record = 0, g_mv_character = 0;
+float g_mv_speed = 1.0f;
+LONG g_mv_result = 0;  // 1 played, -1 no controller, -2 faulted, -3 no name
+int g_mv_id = 0;
+char g_mv_name[96] = {};
+
+bool CallPlayMove(uintptr_t ctrl, uintptr_t record, float speed, int* id, char name_out[96]) {
+  const uint8_t* b = Base();
+  __try {
+    const uintptr_t anim = reinterpret_cast<RecordAnim_t>(const_cast<uint8_t*>(b + 0x2E17D8))(record);
+    const char* name = reinterpret_cast<AnimName_t>(const_cast<uint8_t*>(b + 0x4CA9A0))(record, 0, 1);
+    if (!name || !name[0]) return false;
+    strncpy_s(name_out, 96, name, _TRUNCATE);
+    uintptr_t clock = 0, t = 0;
+    int now = 0;
+    if (ReadQ(reinterpret_cast<uintptr_t>(b) + 0x2702598, &clock) && clock && ReadQ(clock + 8, &t) && t)
+      now = *reinterpret_cast<const int*>(t + 0x18);
+    *id = reinterpret_cast<PlayMove_t>(const_cast<uint8_t*>(b + 0x2C614C))(ctrl, 0, name, anim, 0, now, 1, speed);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+// The sender's running jump is a chain of graph states, Sprint through RunningJump_AutoPicker_3m,
+// and there its graph takes To_JumpAssisted_55v_35d into RunningJump_Assisted_Wraith, which lasts
+// through the fall to the landing. The puppet's graph follows the chain to 3m (it gets the
+// sender's inputs) but takes FreeJmp, loops the chain and ends in WallStop_To_Idle (its own
+// movement is blocked at the ledge): no jump showed (session be). While the sender is in the air
+// and the puppet's graph sits in those states, the assisted jump is played on it by name.
+ULONGLONG g_assist_at = 0;
+volatile LONG g_assist_plays = 0, g_assist_ended = 0;
+// The action played on the puppet is the sender's own jump, RunningJump_Assisted_Wraith. Playing it made the
+// puppet vanish from sight (frames of B's window, session be): while it plays, three floats at
+// puppet+0x10AC (1.0 otherwise) are 0, a scale most likely. They are put back to 1.0 every frame.
+char g_assist_name[64] = "RunningJump_Assisted_Wraith";  // probe "puppet assist <action>|off"
+// Off by default: the Wraith jump makes the puppet vanish and no field forced so far brings it back.
+volatile LONG g_assist_on = 0;
+volatile LONG g_vis_mask = 0;  // probe "puppet vis <hex>": experiment, which fields are forced (below)
+
+// The play function (664CA4) first looks the action up in the graph's list of running ones (a ring at
+// graph+0x260: nodes with the action at +0x10 and its instance at +0x38, whose state at +0x74 is 2 when
+// it has ended) and, if it finds one, only marks it. The first fall's assisted jump stayed in that list
+// (the stand-in is teleported back before it ends), so on every later jump the play did nothing and the
+// chain ended in WallStop. Such an instance is marked ended before the play.
+void EndStaleAssist(uintptr_t graph) {
+  __try {
+    const uintptr_t head = graph + 0x260;
+    uintptr_t node = *reinterpret_cast<const uintptr_t*>(graph + 0x268);
+    for (int i = 0; i < 64 && node && node != head; ++i) {
+      const uintptr_t def = *reinterpret_cast<const uintptr_t*>(node + 0x10);
+      const uintptr_t inst = *reinterpret_cast<const uintptr_t*>(node + 0x38);
+      char nm[65];
+      TraceObjectName(def, nm);
+      if (inst && !strcmp(nm, g_assist_name) && *reinterpret_cast<const int*>(inst + 0x74) != 2) {
+        *reinterpret_cast<int*>(inst + 0x74) = 2;
+        InterlockedIncrement(&g_assist_ended);
+      }
+      node = *reinterpret_cast<const uintptr_t*>(node + 8);
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+// The three floats at puppet+0x10AC go to 0 while RunningJump_Assisted_Wraith plays and the puppet
+// is not drawn; they are 1.0 otherwise.
+void SimKeepPuppetVisible() {
+  EnterCriticalSection(&g_lock);
+  const uintptr_t o = g_puppet, v = g_puppet_vt, h = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!o || !PuppetAlive(o, v, h)) return;
+  const LONG m = g_vis_mask;
+  __try {
+    float* f = reinterpret_cast<float*>(o + 0x10AC);
+    if ((m & 1) && (f[0] == 0.0f || f[1] == 0.0f || f[2] == 0.0f)) f[0] = f[1] = f[2] = 1.0f;
+    if (m & 2) *reinterpret_cast<uint8_t*>(o + 0x225A) = 1;
+    if (m & 4) *reinterpret_cast<uint8_t*>(o + 0x1133) = 1;
+    if (m & 8) *reinterpret_cast<uint32_t*>(o + 0x2440) = 1;
+    if (m & 16) *reinterpret_cast<uint32_t*>(o + 0x2C30) = 1;
+    if (m & 32) *reinterpret_cast<uint32_t*>(o + 0x2D5C) = 1;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+void SimSetVisMask(unsigned mask) { InterlockedExchange(&g_vis_mask, (LONG)mask); }
+
+void SimSetAssistJump(const char* action) {
+  if (!strcmp(action, "off")) {
+    InterlockedExchange(&g_assist_on, 0);
+    return;
+  }
+  strncpy_s(g_assist_name, action, _TRUNCATE);
+  InterlockedExchange(&g_assist_on, 1);
+}
+
+void SimAssistJump(bool sender_in_air) {
+  if (!g_assist_on) return;
+  SimKeepPuppetVisible();
+  EnterCriticalSection(&g_lock);
+  const uintptr_t o = g_puppet, v = g_puppet_vt, h = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!o || !PuppetAlive(o, v, h)) return;
+  const ULONGLONG now = GetTickCount64();
+  const uintptr_t graph = GraphOf(o);
+  if (!graph) return;
+  char name[48] = {};
+  __try {
+    memcpy(name, reinterpret_cast<const void*>(graph + 0x48), 40);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return;
+  }
+  // The whole approach chain (it loops every few ms, and a read once per frame saw only some of its
+  // states: with four of the nine listed, one jump in five was caught).
+  static const char* const kApproach[] = {
+      "Runningjump_Autopicker_2M_POS", "Runningjump_Autopicker_1M_POS", "RunningJump_AutoPicker_0M",
+      "RunningJump_AutoPicker_1M", "RunningJump_AutoPicker_2m", "RunningJump_AutoPicker_3m",
+      "RunningJump_AutoPicker_FreeJmp", "RunningJump_Autopicker_CloseTap", "RunningJump_Autopicker_Hold"};
+  bool in = false;
+  for (const char* k : kApproach) in = in || !strcmp(name, k);
+  (void)sender_in_air;
+  if (!in) return;
+  const uint8_t* f = Base() + 0x664CA4;
+  if (!Head(f, "4885D20F84CF000000488" "95C2408488974241857")) return;
+  g_play_action = reinterpret_cast<PlayAction_t>(const_cast<uint8_t*>(f));
+  EndStaleAssist(graph);
+  // Every frame it is seen there: Sprint re-enters the chain several times, overriding one play.
+  if (CallPlayAction(graph, g_assist_name, 0)) {
+    g_assist_at = now;
+    if (InterlockedIncrement(&g_assist_plays) <= 8)
+      SowLog(L"sim: the puppet's graph was in '%S': assisted jump played (%ld stale ones ended so far)", name, g_assist_ended);
+  }
+}
+
+void PlaySheatheNow(uintptr_t character) {
+  const uint8_t* f = Base() + 0x664CA4;
+  if (!Head(f, "4885D20F84CF000000488" "95C2408488974241857")) return;
+  const uintptr_t graph = GraphOf(character);
+  if (!graph) return;
+  g_play_action = reinterpret_cast<PlayAction_t>(const_cast<uint8_t*>(f));
+  CallPlayAction(graph, "IdleL", 0);
+}
+
+bool PlayAttackMoveOn(uintptr_t character, uintptr_t record) {
+  const uint8_t* b = Base();
+  if (!Head(b + 0x2C614C, "488BC4488958084889701048897818554154415541564157") ||
+      !Head(b + 0x2E17D8, "4883EC284C8BD1E840000000") || !Head(b + 0x4CA9A0, "40534883EC20488BD94885D27516"))
+    return false;
+  uintptr_t ctrl = 0;
+  int id = 0;
+  char name[96];
+  return ReadQ(character + 0x1970, &ctrl) && ctrl && CallPlayMove(ctrl, record, 1.0f, &id, name);
+}
+
+void SimSetAttackMoves(bool on) { InterlockedExchange(&g_attack_moves_on, on ? 1 : 0); }
+
+long SimAttackMovesPlayed() { return g_attack_moves_played; }
+
+bool MovePending() { return g_mv_pending != 0; }
+
+void RunMove() {
+  if (!InterlockedExchange(&g_mv_pending, 0)) return;
+  uintptr_t ctrl = 0;
+  if (!g_mv_character || !ReadQ(g_mv_character + 0x1970, &ctrl) || !ctrl) {
+    g_mv_result = -1;
+    return;
+  }
+  g_mv_name[0] = 0;
+  g_mv_result = CallPlayMove(ctrl, g_mv_record, g_mv_speed, &g_mv_id, g_mv_name) ? 1 : g_mv_name[0] ? -2 : -3;
+}
+
+std::string SimPuppetMove(uintptr_t table_rva, uint32_t id, float speed, uintptr_t gameclient_rva) {
+  if (!g_installed) return "err simulation-thread hook not installed (sim_hook)\n";
+  const uint8_t* b = Base();
+  if (!Head(b + 0x2C614C, "488BC4488958084889701048897818554154415541564157") ||
+      !Head(b + 0x2E17D8, "4883EC284C8BD1E840000000") || !Head(b + 0x4CA9A0, "40534883EC20488BD94885D27516"))
+    return "err move functions differ from the known build; refused\n";
+  const uintptr_t rec = SimAttackRecord(table_rva, id);
+  if (!rec) return "err no attack record with that id\n";
+  uintptr_t ch = 0;
+  if (gameclient_rva) {
+    uintptr_t gc = 0;
+    if (!ReadQ(reinterpret_cast<uintptr_t>(b) + gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &ch)) ch = 0;
+  } else {
+    EnterCriticalSection(&g_lock);
+    ch = g_puppet && PuppetAlive(g_puppet, g_puppet_vt, g_puppet_health) ? g_puppet : 0;
+    LeaveCriticalSection(&g_lock);
+  }
+  if (!ch) return "err no character\n";
+  g_mv_record = rec;
+  g_mv_character = ch;
+  g_mv_speed = speed;
+  g_mv_result = 0;
+  InterlockedExchange(&g_mv_pending, 1);
+  for (int i = 0; i < 100 && g_mv_pending; ++i) Sleep(10);
+  Sleep(20);
+  char out[200];
+  const LONG r = g_mv_result;
+  if (r == 1)
+    snprintf(out, sizeof out, "ok move '%s' requested (id %X) on %s's controller\n", g_mv_name, g_mv_id,
+             gameclient_rva ? "this copy's player" : "the puppet");
+  else
+    snprintf(out, sizeof out, "err %s\n", r == -1 ? "no controller" : r == -2 ? "faulted" : r == -3 ? "no name" : "not run");
+  return out;
+}
+
+// ---------------------------------------------------------------- graph action starts on any thread (probe "graphwatch")
+
+namespace {
+
+// The game starts graph actions in 195988 (rcx the graph, rdx the action) on its animation worker
+// threads, which the probe's trace (an execute breakpoint on the simulation thread) does not see.
+// A stub at its entry (an aligned qword, `mov rax,rsp; mov [rax+10h],rbx` first) records, for one
+// chosen graph, each call's return address and action in a 256-entry ring, without calling out.
+// It also keeps the action's target ([rdx+60h], read at entry: the state machine builds the action
+// on its stack) and the caller's r12 and r15, which in the state machine 192524 are the state it
+// leaves and the transition that fired.
+volatile uintptr_t g_gw_graph = 0;
+volatile LONG g_gw_idx = 0;
+uintptr_t g_gw_ret[256] = {}, g_gw_rdx[256] = {}, g_gw_def[256] = {}, g_gw_r12[256] = {}, g_gw_r15[256] = {};
+volatile LONG g_gw_hook = 0;
+
+}  // namespace
+
+std::string SimGraphWatch(uintptr_t fn_rva, bool player, uintptr_t gameclient_rva, unsigned ms,
+                          const std::function<void()>& armed) {
+  if (!g_installed) return "err simulation-thread hook not installed (sim_hook)\n";
+  if (!ms || ms > 20000) return "err usage: graphwatch <1..20000 ms> [player]\n";
+  uint8_t* const fn = const_cast<uint8_t*>(Base()) + fn_rva;
+  if (!g_gw_hook) {
+    if (!Head(fn, "488BC4488958104889701848897820" "55")) return "err start-action bytes differ from the known build; refused\n";
+    uint8_t* page = SimNearPage(4);
+    if (!page) return "err no code page near the game image\n";
+    std::vector<uint8_t> s = {0x50, 0x41, 0x52, 0x41, 0x53, 0x49, 0xBB};
+    PutQ(&s, reinterpret_cast<uintptr_t>(&g_gw_graph));
+    s.insert(s.end(), {0x49, 0x3B, 0x0B, 0x75, 0x68, 0x49, 0xBB});
+    PutQ(&s, reinterpret_cast<uintptr_t>(&g_gw_idx));
+    s.insert(s.end(), {0xB8, 0x01, 0x00, 0x00, 0x00, 0xF0, 0x41, 0x0F, 0xC1, 0x03, 0x25, 0xFF, 0x00, 0x00, 0x00,
+                       0x4C, 0x8B, 0x54, 0x24, 0x18, 0x49, 0xBB});
+    PutQ(&s, reinterpret_cast<uintptr_t>(g_gw_ret));
+    s.insert(s.end(), {0x4D, 0x89, 0x14, 0xC3, 0x49, 0xBB});
+    PutQ(&s, reinterpret_cast<uintptr_t>(g_gw_rdx));
+    s.insert(s.end(), {0x49, 0x89, 0x14, 0xC3, 0x4C, 0x8B, 0x52, 0x60, 0x49, 0xBB});
+    PutQ(&s, reinterpret_cast<uintptr_t>(g_gw_def));
+    s.insert(s.end(), {0x4D, 0x89, 0x14, 0xC3, 0x49, 0xBB});
+    PutQ(&s, reinterpret_cast<uintptr_t>(g_gw_r12));
+    s.insert(s.end(), {0x4D, 0x89, 0x24, 0xC3, 0x49, 0xBB});
+    PutQ(&s, reinterpret_cast<uintptr_t>(g_gw_r15));
+    s.insert(s.end(), {0x4D, 0x89, 0x3C, 0xC3, 0x41, 0x5B, 0x41, 0x5A, 0x58});
+    s.insert(s.end(), fn, fn + 7);
+    s.insert(s.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+    PutQ(&s, reinterpret_cast<uintptr_t>(fn + 7));
+    DWORD old = 0;
+    if (s.size() > 256 || !VirtualProtect(page, 4096, PAGE_EXECUTE_READWRITE, &old)) return "err cannot write the stub\n";
+    memcpy(page + 1536, s.data(), s.size());
+    VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), page, 4096);
+    std::string err;
+    if (!PatchJump(reinterpret_cast<uintptr_t>(fn), page + 1536, &err)) return "err " + err + "\n";
+    InterlockedExchange(&g_gw_hook, 1);
+  }
+  uintptr_t ch = 0;
+  if (player) {
+    uintptr_t gc = 0;
+    if (!ReadQ(reinterpret_cast<uintptr_t>(Base()) + gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &ch)) ch = 0;
+  } else {
+    ch = g_puppet;
+  }
+  const uintptr_t graph = ch ? GraphOf(ch) : 0;
+  if (!graph) return "err no graph\n";
+  memset(g_gw_ret, 0, sizeof g_gw_ret);
+  memset(g_gw_rdx, 0, sizeof g_gw_rdx);
+  memset(g_gw_def, 0, sizeof g_gw_def);
+  memset(g_gw_r12, 0, sizeof g_gw_r12);
+  memset(g_gw_r15, 0, sizeof g_gw_r15);
+  InterlockedExchange(&g_gw_idx, 0);
+  g_gw_graph = graph;
+  if (armed) armed();
+  Sleep(ms);
+  g_gw_graph = 0;
+  const LONG n = std::min<LONG>((LONG)g_gw_idx, 256L);
+  std::ostringstream out;
+  out << "ok " << g_gw_idx << " starts on " << (player ? "this copy's player's" : "the puppet's") << " graph\n";
+  const uintptr_t base = reinterpret_cast<uintptr_t>(Base());
+  for (LONG i = 0; i < n; ++i) {
+    char def[65], st[65], tr[65];
+    TraceObjectName(g_gw_def[i], def);
+    TraceObjectName(g_gw_r12[i], st);
+    TraceObjectName(g_gw_r15[i], tr);
+    char b[400];
+    snprintf(b, sizeof b, "  %3ld from rva:%llX def abs:%llX '%s' r12 abs:%llX '%s' r15 abs:%llX '%s'\n", i,
+             (unsigned long long)(g_gw_ret[i] - base), (unsigned long long)g_gw_def[i], def,
+             (unsigned long long)g_gw_r12[i], st, (unsigned long long)g_gw_r15[i], tr);
+    out << b;
+  }
+  return out.str();
+}
+
+// ---------------------------------------------------------------- controller move requests on any thread (probe "ctrlwatch")
+
+namespace {
+
+// A player's strike does not start graph actions: its moves are requests on the character's
+// animation controller ([character+1970h]), registered in 41A1E0 (rcx the controller, rdx the
+// request; 7 callers, among them 2C614C from the combat code and 41A038) and played later on the
+// animation threads (session bd). A stub at its entry records, for one chosen controller, each
+// call's return address, the request's first 8 qwords and the caller's rsi and rbx, in a
+// 256-entry ring, and the first 48 stack qwords at entry (registers the callers saved) in a
+// 64-entry one, without calling out.
+volatile uintptr_t g_cw_ctrl = 0;
+volatile LONG g_cw_idx = 0;
+uintptr_t g_cw_ret[256] = {}, g_cw_rsi[256] = {}, g_cw_rbx[256] = {}, g_cw_req[256 * 8] = {};
+uintptr_t g_cw_stack[64 * 48] = {};
+volatile LONG g_cw_hook = 0;
+
+std::string NamedQ(uintptr_t v) {
+  char n[65];
+  TraceObjectName(v, n);
+  if (!n[0]) return "";
+  return std::string(" '") + n + "'";
+}
+
+}  // namespace
+
+std::string SimCtrlWatch(uintptr_t fn_rva, bool player, uintptr_t gameclient_rva, unsigned ms,
+                         const std::function<void()>& armed) {
+  if (!g_installed) return "err simulation-thread hook not installed (sim_hook)\n";
+  if (!ms || ms > 20000) return "err usage: ctrlwatch <1..20000 ms> [player]\n";
+  uint8_t* const fn = const_cast<uint8_t*>(Base()) + fn_rva;
+  if (!g_cw_hook) {
+    if (!Head(fn, "48895C240848896C2410488974241857" "415441564883EC30")) return "err move-request bytes differ from the known build; refused\n";
+    uint8_t* page = SimNearPage(4);
+    if (!page) return "err no code page near the game image\n";
+    // push rax; push r10; push r11; mov r11,&g_cw_ctrl; cmp rcx,[r11]; jne (rel32) skip;
+    // eax = slot (lock xadd on g_cw_idx, and 0xFF); ret, rsi, rbx into their rings;
+    // eax <<= 6; r11 = &g_cw_req + rax; 8 qwords from [rdx]; skip: pop r11; pop r10; pop rax;
+    // the first instruction (mov [rsp+8],rbx) and a jump back after it.
+    std::vector<uint8_t> s = {0x50, 0x41, 0x52, 0x41, 0x53, 0x49, 0xBB};
+    PutQ(&s, reinterpret_cast<uintptr_t>(&g_cw_ctrl));
+    s.insert(s.end(), {0x49, 0x3B, 0x0B, 0x0F, 0x85, 0, 0, 0, 0});
+    const size_t jne_end = s.size();
+    s.insert(s.end(), {0x49, 0xBB});
+    PutQ(&s, reinterpret_cast<uintptr_t>(&g_cw_idx));
+    s.insert(s.end(), {0xB8, 0x01, 0x00, 0x00, 0x00, 0xF0, 0x41, 0x0F, 0xC1, 0x03, 0x25, 0xFF, 0x00, 0x00, 0x00,
+                       0x4C, 0x8B, 0x54, 0x24, 0x18, 0x49, 0xBB});
+    PutQ(&s, reinterpret_cast<uintptr_t>(g_cw_ret));
+    s.insert(s.end(), {0x4D, 0x89, 0x14, 0xC3, 0x49, 0xBB});
+    PutQ(&s, reinterpret_cast<uintptr_t>(g_cw_rsi));
+    s.insert(s.end(), {0x49, 0x89, 0x34, 0xC3, 0x49, 0xBB});
+    PutQ(&s, reinterpret_cast<uintptr_t>(g_cw_rbx));
+    s.insert(s.end(), {0x49, 0x89, 0x1C, 0xC3, 0xC1, 0xE0, 0x06, 0x49, 0xBB});
+    PutQ(&s, reinterpret_cast<uintptr_t>(g_cw_req));
+    s.insert(s.end(), {0x49, 0x01, 0xC3});
+    for (uint8_t k = 0; k < 8; ++k) s.insert(s.end(), {0x4C, 0x8B, 0x52, uint8_t(8 * k), 0x4D, 0x89, 0x53, uint8_t(8 * k)});
+    // shr eax,6; and eax,3Fh; imul eax,eax,384; push rcx; push rsi; push rdi;
+    // mov rdi,&g_cw_stack; add rdi,rax; lea rsi,[rsp+30h] (the stack at entry); mov ecx,48;
+    // rep movsq; pop rdi; pop rsi; pop rcx.
+    s.insert(s.end(), {0xC1, 0xE8, 0x06, 0x83, 0xE0, 0x3F, 0x69, 0xC0, 0x80, 0x01, 0x00, 0x00, 0x51, 0x56, 0x57,
+                       0x48, 0xBF});
+    PutQ(&s, reinterpret_cast<uintptr_t>(g_cw_stack));
+    s.insert(s.end(), {0x48, 0x01, 0xC7, 0x48, 0x8D, 0x74, 0x24, 0x30, 0xB9, 0x30, 0x00, 0x00, 0x00, 0xF3, 0x48,
+                       0xA5, 0x5F, 0x5E, 0x59});
+    const int32_t skip = (int32_t)(s.size() - jne_end);
+    memcpy(&s[jne_end - 4], &skip, 4);
+    s.insert(s.end(), {0x41, 0x5B, 0x41, 0x5A, 0x58});
+    s.insert(s.end(), fn, fn + 5);
+    s.insert(s.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+    PutQ(&s, reinterpret_cast<uintptr_t>(fn + 5));
+    DWORD old = 0;
+    if (s.size() > 512 || !VirtualProtect(page, 4096, PAGE_EXECUTE_READWRITE, &old)) return "err cannot write the stub\n";
+    memcpy(page + 1792, s.data(), s.size());
+    VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+    FlushInstructionCache(GetCurrentProcess(), page, 4096);
+    std::string err;
+    if (!PatchJump(reinterpret_cast<uintptr_t>(fn), page + 1792, &err)) return "err " + err + "\n";
+    InterlockedExchange(&g_cw_hook, 1);
+  }
+  uintptr_t ch = 0;
+  if (player) {
+    uintptr_t gc = 0;
+    if (!ReadQ(reinterpret_cast<uintptr_t>(Base()) + gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &ch)) ch = 0;
+  } else {
+    ch = g_puppet;
+  }
+  uintptr_t ctrl = 0;
+  if (!ch || !ReadQ(ch + 0x1970, &ctrl) || !ctrl) return "err no animation controller\n";
+  memset(g_cw_ret, 0, sizeof g_cw_ret);
+  memset(g_cw_req, 0, sizeof g_cw_req);
+  InterlockedExchange(&g_cw_idx, 0);
+  g_cw_ctrl = ctrl;
+  if (armed) armed();
+  Sleep(ms);
+  g_cw_ctrl = 0;
+  const LONG n = std::min<LONG>((LONG)g_cw_idx, 256L);
+  std::ostringstream out;
+  out << "ok " << g_cw_idx << " move requests on " << (player ? "this copy's player's" : "the puppet's")
+      << " controller abs:" << std::hex << std::uppercase << ctrl << std::dec << "\n";
+  const uintptr_t base = reinterpret_cast<uintptr_t>(Base());
+  for (LONG i = 0; i < n; ++i) {
+    char b[160];
+    snprintf(b, sizeof b, "  %3ld from rva:%llX rsi abs:%llX%s rbx abs:%llX\n    req", i,
+             (unsigned long long)(g_cw_ret[i] - base), (unsigned long long)g_cw_rsi[i], NamedQ(g_cw_rsi[i]).c_str(),
+             (unsigned long long)g_cw_rbx[i]);
+    out << b;
+    for (int k = 0; k < 8; ++k) {
+      const uintptr_t v = g_cw_req[i * 8 + k];
+      snprintf(b, sizeof b, " %llX", (unsigned long long)v);
+      out << b << NamedQ(v);
+    }
+    out << "\n    stack";
+    for (int k = 0; i < 64 && k < 48; ++k) {
+      const uintptr_t v = g_cw_stack[i * 48 + k];
+      if (v >= base && v < ImageEnd()) snprintf(b, sizeof b, " +%X:rva:%llX", k * 8, (unsigned long long)(v - base));
+      else snprintf(b, sizeof b, " +%X:%llX", k * 8, (unsigned long long)v);
+      out << b;
+    }
+    out << "\n";
+  }
+  return out.str();
+}
