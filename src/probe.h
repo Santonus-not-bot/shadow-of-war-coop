@@ -9,6 +9,8 @@ struct ProbeConfig {
   unsigned wait_sec = 300;    // give up waiting for it after this long
   bool write = false;         // probe_write=1: allows the write command and hooks
   bool hook_debug_print = false;
+  bool coop = false;          // coop_role is set: the debug-print hook (the co-op's view of the player) is allowed
+                              // even though the probe's write commands stay off
   std::string debug_print_pattern;  // a call site of the debug print; target = rip(1, 5)
   std::string debug_channels;       // channel flag RVAs (hex) set to 1 once the hook is in
   uintptr_t gameclient_rva = 0x26FFA98;    // the GameClient pointer (Steam build 3095001)
@@ -28,3 +30,8 @@ void StartProbe(const ProbeConfig& cfg);
 
 // sowguard's log, shared with the probe.
 void SowLog(const wchar_t* fmt, ...);
+
+// network=coop_peer: the one socket allowed to send to a non-loopback address. A client names the host's address
+// (ipv4 in network byte order, port in host order); a host (any) answers whatever address its valid packets came
+// from. Everything else in the game stays offline. Without network=coop_peer this changes nothing.
+void SowAllowPeerSocket(uintptr_t sock, uint32_t ipv4_net_order, uint16_t port, bool any);

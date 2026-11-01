@@ -4,6 +4,34 @@
 #include <string>
 
 struct CoopConfig {
+  // The internet transport (src/net_proto.h, NETWORK-DESIGN.md): coop_role=host|client replaces the
+  // loopback pair below. The host listens on net_bind:net_port; the client connects to net_peer.
+  std::string net_role;                // "host", "client" or empty (loopback pair)
+  std::string net_bind = "127.0.0.1";  // coop_bind: the host's address to listen on (loopback until the guard
+                                       // learns a peer rule, step 4)
+  unsigned net_port = 0;               // coop_port (host)
+  std::string net_peer;                // coop_host=<ipv4>:<port> (client)
+  std::string net_password;            // coop_password
+  std::string exe_sha_hex;             // the game exe's SHA-256, both sides must match (set by sowguard)
+  unsigned state_hz = 30;              // coop_state_hz: player states sent per second over the transport
+  // The host's save goes to a joining client, which plays in it (NETWORK-DESIGN.md, "Joining"). Both need the
+  // sandbox cloud folder (steam_cloud=sandbox); without it the client does not join and the host offers nothing.
+  std::wstring save_dir;               // the sandbox cloud folder: the host offers its newest main save, the client
+                                       // is given the host's under the name its game asks for
+  std::wstring save_local_dir;         // client: the local copy of the same save is replaced too
+  bool join = true;                    // coop_join=off: the client plays its own save (tests, tools)
+  unsigned join_timeout_sec = 20;      // coop_join_timeout_sec: no host save by then, the client stops
+  bool join_message = true;            // a failed join says so in a message box (off in tests)
+  // Stage 2 (STAGE2-DESIGN.md): the host's enemies shown on the client as proxies. coop_enemies=on|off.
+  bool enemies = false;
+  float enemy_radius = 3500.0f;        // coop_enemy_radius: enemies within this of either player are shared
+  bool follow_travel = true;           // coop_follow_travel=off: a client does not follow the host's long jumps (fast travel)
+  bool decoy = false;                  // coop_decoy=on: enemies attack an invisible-ish ally where the stand-in stands
+  float decoy_dy = 0.0f;               // coop_decoy_dy: its height above the stand-in
+  bool enemy_direct = true;            // proxies are placed by writing their transform (not the game's teleport)
+  uintptr_t play_rva = 0x664CA4;       // starts a named graph action
+  uintptr_t despawn_rva = 0x1A8BB74;   // "AI told to despawn offscreen"
+  uintptr_t ambient_rva = 0x166DF8;    // the ambient spawn test
   unsigned send_port = 0;    // coop_send=127.0.0.1:<port>: send this copy's player (loopback only)
   unsigned listen_port = 0;  // coop_listen=<port>: receive the other copy's player
   unsigned rate_hz = 60;     // coop_rate_hz: until (or without) sim_hook; then once per frame
@@ -59,6 +87,14 @@ struct CoopConfig {
 
 // Starts the sender and/or receiver threads (called from sowguard's Init).
 void StartCoop(const CoopConfig& cfg);
+
+// Probe "enemies": what the enemy sharing is doing (host: how many it announces; client: proxies and spawns).
+std::string CoopEnemyStatus();
+
+// Probe "damage abs:<proxy> <attack id hex>": a swing of that proxy hits this copy's player (the client's damage path).
+std::string CoopTestDamage(uintptr_t proxy, uint32_t attack_id);
+// Probe "standinhit abs:<enemy> <attack id hex>" (host): that enemy swings at the stand-in of the client.
+std::string CoopTestStandinHit(uintptr_t enemy, uint32_t attack_id);
 
 // Probe "remote": what the receiver has, and how far it is from this copy's player.
 std::string CoopStatus();

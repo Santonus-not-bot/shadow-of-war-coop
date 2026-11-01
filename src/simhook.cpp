@@ -684,12 +684,26 @@ volatile LONG g_brain_state = kBrainNone;
 volatile LONG g_puppet_ai_off = 0;
 volatile LONG g_brain_skips = 0;
 
+// The enemy registry and the proxy set (end of this file): every AI character's tree passes through here once
+// a tick, which is how the host learns which characters exist and how the client keeps its proxies' AI off.
+void EnemyNote(uintptr_t owner);
+bool ProxyHas(uintptr_t owner);
+volatile LONG g_registry_on = 0;
+
 void __fastcall BrainFilter(void* tree, uint8_t arg) {
   const uintptr_t puppet = g_puppet;
   uintptr_t owner = 0;
-  if (g_puppet_ai_off && puppet && ReadQ(reinterpret_cast<uintptr_t>(tree) + 8, &owner) && owner == puppet) {
+  const bool have = (g_puppet_ai_off || g_registry_on) && ReadQ(reinterpret_cast<uintptr_t>(tree) + 8, &owner) && owner;
+  if (g_puppet_ai_off && puppet && have && owner == puppet) {
     InterlockedIncrement(&g_brain_skips);
     return;
+  }
+  if (have && g_registry_on) {
+    if (ProxyHas(owner)) {
+      InterlockedIncrement(&g_brain_skips);
+      return;
+    }
+    EnemyNote(owner);
   }
   g_tree(tree, arg);
 }
@@ -829,13 +843,28 @@ bool MovePending();
 void RunMove();
 namespace {
 
+// "AI told to despawn offscreen" (1A8BB74(character, int, nothing)): sets the character's despawn request
+// (+0x910 of its AI data at +0x2CE8: 1, offscreen 1, the int) and logs; it goes once it is out of sight.
+volatile LONG g_despawn_pending = 0;
+uintptr_t g_despawn_fn = 0, g_despawn_char = 0;
+
+bool DespawnPending() { return g_despawn_pending != 0; }
+
+void RunDespawn() {
+  if (!InterlockedExchange(&g_despawn_pending, 0)) return;
+  using Despawn_t = void(__fastcall*)(void* ai_character, int arg, void* other);
+  reinterpret_cast<Despawn_t>(g_despawn_fn)(reinterpret_cast<void*>(g_despawn_char), 0, nullptr);
+  SowLog(L"sim: abs:%llX told to despawn offscreen", (unsigned long long)g_despawn_char);
+}
+
 bool ExtraPending() {
-  return g_brain_state == kBrainQueued || g_walk_pending || g_player_tp_pending || SpawnPending() ||
+  return DespawnPending() || g_brain_state == kBrainQueued || g_walk_pending || g_player_tp_pending || SpawnPending() ||
          AnimResPending() || TracePending() || HoldPending() || AttackPending() || PlayPending() ||
          MovePending();
 }
 
 void RunExtra() {
+  if (DespawnPending()) RunDespawn();
   if (g_brain_state == kBrainQueued) InstallBrainNow();
   if (g_walk_pending) RunQueuedWalk();
   if (g_player_tp_pending) RunPlayerTeleport();
@@ -1291,7 +1320,7 @@ void RunSpawn() {
 }  // namespace
 
 bool SimSpawn(const SimSpawnRvas& r, const char* record, const float* pos, const char* look, std::string* report,
-              uintptr_t* spawned) {
+              uintptr_t* spawned, bool run_now) {
   if (!g_installed) {
     *report = "simulation-thread hook not installed (sim_hook)";
     return false;
@@ -1365,9 +1394,18 @@ bool SimSpawn(const SimSpawnRvas& r, const char* record, const float* pos, const
   InterlockedExchange(&g_spawn_done, 0);
   InterlockedExchange(&g_spawn_pending, 1);
   LeaveCriticalSection(&g_lock);
-  for (int i = 0; i < 100 && !g_spawn_done; ++i) Sleep(20);
+  if (run_now) RunSpawn();  // the caller is the simulation thread: no one else could run it
+  else for (int i = 0; i < 100 && !g_spawn_done; ++i) Sleep(20);
+  if (!g_spawn_done && InterlockedExchange(&g_spawn_pending, 0) != 0) {
+    // The simulation thread never took it. Withdrawn, so a late run does not spawn a character that nobody
+    // uses (the next attempt would spawn another).
+    *report = "queued; the simulation thread has not run it yet";
+    return false;
+  }
+  // It was taken: wait for it to end, however long the spawn takes.
+  for (int i = 0; i < 500 && !g_spawn_done; ++i) Sleep(20);
   EnterCriticalSection(&g_lock);
-  *report = g_spawn_done ? g_spawn_report : std::string("queued; the simulation thread has not run it yet");
+  *report = g_spawn_done ? g_spawn_report : std::string("the spawn did not finish");
   const bool ok = g_spawn_done && g_spawned != 0;
   if (spawned) *spawned = ok ? g_spawned : 0;
   LeaveCriticalSection(&g_lock);
@@ -1484,7 +1522,7 @@ bool SimSetBehaviorResource(uintptr_t fn_rva, uintptr_t character, uintptr_t res
 // coop_puppet_spawn: a character of type made at pos, given this copy's own player's
 // behavior resource (anim+0x1878 = player+0x1998), so a cutscene "Talion" (no AI behavior of
 // its own) is switched on and animates with the player's graph; then used as the puppet.
-bool SimSpawnPuppet(const SimSpawnRvas& r, const char* type, const float pos[3], std::string* report) {
+bool SimSpawnPuppet(const SimSpawnRvas& r, const char* type, const float pos[3], std::string* report, bool run_now) {
   const uintptr_t base = reinterpret_cast<uintptr_t>(Base());
   uintptr_t gc = 0, player = 0, res = 0, obj = 0;
   if (!ReadQ(base + r.gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &player) || !player ||
@@ -1495,7 +1533,7 @@ bool SimSpawnPuppet(const SimSpawnRvas& r, const char* type, const float pos[3],
   // Without the table's global, the spawn type is found through an AI character.
   if (!r.spawn_table_rva && !g_puppet && !g_spawn_table_src && !SimPickNearestPuppet(r.gameclient_rva, report, false))
     return false;
-  if (!SimSpawn(r, type, pos, nullptr, report, &obj)) return false;
+  if (!SimSpawn(r, type, pos, nullptr, report, &obj, run_now)) return false;
   std::string err;
   if (!SimSetBehaviorResource(r.behavior_rva, obj, res, &err) || !SimSetPuppet(obj, &err)) {
     *report += "; " + err;
@@ -2082,6 +2120,9 @@ volatile LONG g_follower_marks = 0;
 // second stub returns from 2C70C0 at once for the puppet.
 volatile uintptr_t g_untargeted = 0;  // the health object the check stub rejects (0: none)
 volatile uintptr_t g_unhit = 0;       // the character the hit stub skips (0: none)
+volatile uintptr_t g_aoe_skip = 0;    // the character the area filter leaves out of an area attack (0: none)
+volatile uintptr_t g_decoy = 0;       // the decoy ally that enemies attack in the stand-in's place (hits on it are reported like the stand-in's)
+volatile LONG g_standin_hurt = 0;     // swings that reach the stand-in are reported (SimDamageReports) instead of skipped
 volatile LONG g_target_rejects = 0;   // candidates the check stub rejected
 volatile LONG g_hit_drops = 0;        // hits the hit stub dropped
 // Area attacks (fire, explosions, auras) do not go through either: a large enemy's fire took a
@@ -2133,6 +2174,80 @@ void PutQ(std::vector<uint8_t>* s, uintptr_t v) {
 
 }  // namespace
 
+namespace {
+
+// Every hit goes through 2C70C0(attacker's health object, victim's health object, position floats, attack record).
+// A stub at its entry calls HitFilter with those four; true drops the hit (the callers ignore the result).
+//   - a hit on the stand-in is dropped (the stand-in is a picture of the other player);
+//   - a hit on a proxy is dropped too: a proxy is a picture of the host's enemy and takes no damage here. When
+//     the attacker is this copy's own player, it is also reported (SimHitReports), so the host can apply it.
+struct HitReportSlot {
+  uintptr_t owner;
+  uint32_t attack_id;
+  float pos[3];
+};
+constexpr int kHitRing = 32;
+HitReportSlot g_hit_ring[kHitRing];
+volatile LONG g_hit_count = 0;       // reports queued so far
+LONG g_hit_taken = 0;                // reports handed out so far
+volatile LONG g_hit_watch = 0;
+uintptr_t g_hit_gc = 0;
+volatile LONG g_proxy_hits = 0, g_proxy_hits_other = 0;
+HitReportSlot g_dmg_ring[kHitRing];  // swings of enemies that reached the stand-in
+volatile LONG g_dmg_count = 0;
+LONG g_dmg_taken = 0;
+
+bool __fastcall HitFilter(uintptr_t attacker, uintptr_t victim, const float* pos, uintptr_t rec) {
+  uintptr_t owner = 0;
+  if (!victim || !ReadQ(victim + 0x28, &owner) || !owner) return false;
+  if (owner == g_unhit || (g_decoy && owner == g_decoy)) {
+    InterlockedIncrement(&g_hit_drops);
+    if (g_standin_hurt) {
+      // A swing of an enemy that reached the stand-in: not taken here, told to the client, whose player it hits.
+      uintptr_t att_owner = 0, gc0 = 0, pl0 = 0, mine0 = 0;
+      const bool by_player = ReadQ(g_hit_gc, &gc0) && gc0 && ReadQ(gc0 + 0x888, &pl0) && pl0 && ReadQ(pl0 + 0x26A8, &mine0) &&
+                             mine0 && attacker == mine0;
+      if (attacker && !by_player && ReadQ(attacker + 0x28, &att_owner) && att_owner && att_owner != owner) {
+        HitReportSlot s{};
+        s.owner = att_owner;
+        __try {
+          if (rec && *reinterpret_cast<const uint32_t*>(rec) == 0xA15) s.attack_id = *reinterpret_cast<const uint32_t*>(rec + 4);
+          if (pos) memcpy(s.pos, pos, sizeof s.pos);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        EnterCriticalSection(&g_lock);
+        g_dmg_ring[g_dmg_count % kHitRing] = s;
+        InterlockedIncrement(&g_dmg_count);
+        LeaveCriticalSection(&g_lock);
+      }
+    }
+    return true;
+  }
+  if (!g_hit_watch || !ProxyHas(owner)) return false;
+  uintptr_t gc = 0, player = 0, mine = 0;
+  const bool by_me = ReadQ(g_hit_gc, &gc) && gc && ReadQ(gc + 0x888, &player) && player && ReadQ(player + 0x26A8, &mine) &&
+                     mine && attacker == mine;
+  if (!by_me) {
+    InterlockedIncrement(&g_proxy_hits_other);
+    return true;
+  }
+  HitReportSlot s{};
+  s.owner = owner;
+  __try {
+    if (rec && *reinterpret_cast<const uint32_t*>(rec) == 0xA15) s.attack_id = *reinterpret_cast<const uint32_t*>(rec + 4);
+    if (pos) memcpy(s.pos, pos, sizeof s.pos);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  EnterCriticalSection(&g_lock);
+  g_hit_ring[g_hit_count % kHitRing] = s;
+  InterlockedIncrement(&g_hit_count);
+  LeaveCriticalSection(&g_lock);
+  InterlockedIncrement(&g_proxy_hits);
+  return true;
+}
+
+}  // namespace
+
 bool SimAttackHooksInstall(uintptr_t check_rva, uintptr_t hit_rva, uintptr_t aoe_rva, std::string* err) {
   if (g_target_hook == 1) return true;
   uint8_t* const check = const_cast<uint8_t*>(Base()) + check_rva;
@@ -2167,15 +2282,13 @@ bool SimAttackHooksInstall(uintptr_t check_rva, uintptr_t hit_rva, uintptr_t aoe
   s.insert(s.end(), check + 5, check + 10);
   s.insert(s.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
   PutQ(&s, reinterpret_cast<uintptr_t>(check + 10));
-  // At the hit's entry (on an aligned qword): test rdx,rdx; je +36; mov r10,[rdx+28h];
-  // mov r11,&g_unhit; cmp r10,[r11]; jne +17; mov r11,&g_hit_drops; lock inc dword [r11];
-  // xor eax,eax; ret (no hit; the callers ignore rax); then its first instruction
-  // (mov [rsp+8],rbx) and a jump back after it.
-  std::vector<uint8_t> t = {0x48, 0x85, 0xD2, 0x74, 0x24, 0x4C, 0x8B, 0x52, 0x28, 0x49, 0xBB};
-  PutQ(&t, reinterpret_cast<uintptr_t>(&g_unhit));
-  t.insert(t.end(), {0x4D, 0x3B, 0x13, 0x75, 0x11, 0x49, 0xBB});
-  PutQ(&t, reinterpret_cast<uintptr_t>(&g_hit_drops));
-  t.insert(t.end(), {0xF0, 0x41, 0xFF, 0x03, 0x31, 0xC0, 0xC3});
+  // At the hit's entry (on an aligned qword): the argument registers and rflags saved, HitFilter(rcx, rdx, r8, r9)
+  // called (rsp is 16-aligned after the seven pushes and the shadow space); a non-zero result is a dropped hit:
+  // xor eax,eax; ret (the callers ignore rax). Otherwise its first instruction (mov [rsp+8],rbx) and a jump back.
+  std::vector<uint8_t> t = {0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x9C, 0x48, 0x83, 0xEC, 0x20, 0x48, 0xB8};
+  PutQ(&t, reinterpret_cast<uintptr_t>(&HitFilter));
+  t.insert(t.end(), {0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x20, 0x9D, 0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59,
+                     0x84, 0xC0, 0x74, 0x03, 0x31, 0xC0, 0xC3});
   t.insert(t.end(), hit, hit + 5);
   t.insert(t.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
   PutQ(&t, reinterpret_cast<uintptr_t>(hit + 5));
@@ -2183,7 +2296,7 @@ bool SimAttackHooksInstall(uintptr_t check_rva, uintptr_t hit_rva, uintptr_t aoe
   // cmp rdx,[r11]; jne +15; mov r11,&g_aoe_skips; lock inc dword [r11]; ret (not in the tick);
   // then its first two instructions (mov rax,rsp; mov [rax+10h],rbx) and a jump back after them.
   std::vector<uint8_t> u = {0x48, 0x85, 0xD2, 0x74, 0x1E, 0x49, 0xBB};
-  PutQ(&u, reinterpret_cast<uintptr_t>(&g_unhit));
+  PutQ(&u, reinterpret_cast<uintptr_t>(&g_aoe_skip));
   u.insert(u.end(), {0x49, 0x3B, 0x13, 0x75, 0x0F, 0x49, 0xBB});
   PutQ(&u, reinterpret_cast<uintptr_t>(&g_aoe_skips));
   u.insert(u.end(), {0xF0, 0x41, 0xFF, 0x03, 0xC3});
@@ -2221,6 +2334,50 @@ void SimKeepPuppetUntargeted(bool on) {
   const bool skip = on && owner && PuppetAlive(owner, vt, health);
   g_untargeted = skip ? health : 0;
   g_unhit = skip ? owner : 0;
+  g_aoe_skip = skip && !g_standin_hurt ? owner : 0;  // hurt mode: an enemy's area swing may reach the stand-in
+}
+
+void SimHitWatch(uintptr_t gameclient_rva, bool on) {
+  g_hit_gc = reinterpret_cast<uintptr_t>(Base()) + gameclient_rva;
+  InterlockedExchange(&g_hit_watch, on ? 1 : 0);
+}
+
+size_t SimHitReports(SimHitReport* out, size_t max) {
+  size_t n = 0;
+  EnterCriticalSection(&g_lock);
+  if (g_hit_count - g_hit_taken > kHitRing) g_hit_taken = g_hit_count - kHitRing;  // the oldest were overwritten
+  while (g_hit_taken < g_hit_count && n < max) {
+    const HitReportSlot& s = g_hit_ring[g_hit_taken % kHitRing];
+    out[n].owner = s.owner;
+    out[n].attack_id = s.attack_id;
+    memcpy(out[n].pos, s.pos, sizeof out[n].pos);
+    ++g_hit_taken;
+    ++n;
+  }
+  LeaveCriticalSection(&g_lock);
+  return n;
+}
+
+long SimProxyHits() { return g_proxy_hits; }
+
+void SimStandinHurt(bool on) { InterlockedExchange(&g_standin_hurt, on ? 1 : 0); }
+
+void SimSetDecoy(uintptr_t owner) { g_decoy = owner; }
+
+size_t SimDamageReports(SimHitReport* out, size_t max) {
+  size_t n = 0;
+  EnterCriticalSection(&g_lock);
+  if (g_dmg_count - g_dmg_taken > kHitRing) g_dmg_taken = g_dmg_count - kHitRing;
+  while (g_dmg_taken < g_dmg_count && n < max) {
+    const HitReportSlot& s = g_dmg_ring[g_dmg_taken % kHitRing];
+    out[n].owner = s.owner;
+    out[n].attack_id = s.attack_id;
+    memcpy(out[n].pos, s.pos, sizeof out[n].pos);
+    ++g_dmg_taken;
+    ++n;
+  }
+  LeaveCriticalSection(&g_lock);
+  return n;
 }
 
 long SimTargetRejects() { return g_target_rejects; }
@@ -2287,6 +2444,76 @@ bool SimAnimResetHookInstall(uintptr_t reset_rva, std::string* err) {
   return true;
 }
 
+// The ambient spawner's per-candidate test (166DF8, "[AI|SPAWNAMBIENT|REJECT]" in its log) returns al: 1 to
+// spawn, 0 to reject. With the gate on, every candidate is rejected: no new ambient characters appear. (A client
+// that shows the host's enemies as stand-ins keeps its own population away this way; what already stands in the
+// world is not touched.)
+volatile LONG g_ambient_block = 0;
+volatile LONG g_ambient_hook = 0;
+volatile LONG g_ambient_rejected = 0;
+
+bool SimDespawnOffscreen(uintptr_t fn_rva, uintptr_t character, std::string* err) {
+  const uint8_t* f = Base() + fn_rva;
+  if (!Head(f, "48895C240848897424105748" "83EC208BDA488BF9")) {
+    *err = "the despawn request's bytes differ from the known build; refused";
+    return false;
+  }
+  uintptr_t vt = 0, ai = 0;
+  if (!ReadQ(character, &vt) || !InImage(vt) || !ReadQ(character + 0x2CE8, &ai) || !ai) {
+    *err = "not an AI character";
+    return false;
+  }
+  g_despawn_fn = reinterpret_cast<uintptr_t>(f);
+  g_despawn_char = character;
+  InterlockedExchange(&g_despawn_pending, 1);
+  return true;
+}
+
+bool SimAmbientHookInstall(uintptr_t fn_rva, std::string* err) {
+  if (g_ambient_hook == 1) return true;
+  uint8_t* const fn = const_cast<uint8_t*>(Base()) + fn_rva;
+  if (!Head(fn, "488BC448895808488968104889701857")) {
+    *err = "the ambient spawn test's bytes differ from the known build; refused";
+    return false;
+  }
+  uint8_t* page = SimNearPage(4);
+  if (!page) {
+    *err = "no code page near the game image";
+    return false;
+  }
+  // mov r11,&g_ambient_block; cmp byte [r11],0; je +17; mov r11,&g_ambient_rejected; lock inc dword [r11];
+  // xor eax,eax; ret; then the first two instructions (mov rax,rsp; mov [rax+8],rbx = 7 bytes) and a jump back.
+  std::vector<uint8_t> s = {0x49, 0xBB};
+  PutQ(&s, reinterpret_cast<uintptr_t>(&g_ambient_block));
+  s.insert(s.end(), {0x41, 0x80, 0x3B, 0x00, 0x74, 0x11, 0x49, 0xBB});
+  PutQ(&s, reinterpret_cast<uintptr_t>(&g_ambient_rejected));
+  s.insert(s.end(), {0xF0, 0x41, 0xFF, 0x03, 0x31, 0xC0, 0xC3});
+  s.insert(s.end(), fn, fn + 7);
+  s.insert(s.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+  PutQ(&s, reinterpret_cast<uintptr_t>(fn + 7));
+  DWORD old = 0;
+  if (s.size() > 128 || !VirtualProtect(page, 4096, PAGE_EXECUTE_READWRITE, &old)) {
+    *err = "cannot write the stub";
+    return false;
+  }
+  memcpy(page + 640, s.data(), s.size());
+  VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+  FlushInstructionCache(GetCurrentProcess(), page, 4096);
+  if (!PatchJump(reinterpret_cast<uintptr_t>(fn), page + 640, err)) return false;
+  InterlockedExchange(&g_ambient_hook, 1);
+  SowLog(L"sim: the ambient spawn test rva:%llX can reject every candidate", (unsigned long long)fn_rva);
+  return true;
+}
+
+void SimAmbientBlock(bool on) { InterlockedExchange(&g_ambient_block, on ? 1 : 0); }
+
+std::string SimAmbientReport() {
+  std::ostringstream out;
+  out << "ok ambient hook=" << (g_ambient_hook ? "in" : "off") << " block=" << (g_ambient_block ? "on" : "off")
+      << " rejected=" << g_ambient_rejected << "\n";
+  return out.str();
+}
+
 void SimKeepPuppetAnimOnTeleport(bool on) {
   EnterCriticalSection(&g_lock);
   const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
@@ -2312,7 +2539,7 @@ bool SimForgetGonePuppet() {
   const bool forgot = g_puppet == owner;
   if (forgot) g_puppet = 0;
   LeaveCriticalSection(&g_lock);
-  if (forgot) g_untargeted = g_unhit = 0;
+  if (forgot) g_untargeted = g_unhit = g_aoe_skip = 0;
   if (forgot)
     SowLog(there ? L"sim: puppet abs:%llX is dead (health 0); no puppet now"
                  : L"sim: puppet abs:%llX is gone (unloaded or freed); no puppet now",
@@ -2396,6 +2623,10 @@ struct TraceSite {
   float value;
   uintptr_t first_ret;
   uintptr_t rcx, rcx28, r9;
+  uintptr_t rdx;
+  uint8_t rdx_mem[0x80];  // args mode: what rdx points at (0x80 bytes, zeros if unreadable)
+  float r8v[3];           // and three floats at r8
+  uintptr_t arg5, arg6;   // the fifth and sixth arguments (the stack at rsp+0x28 and +0x30 on entry)
 };
 TraceSite g_trace_sites[kTraceSites];
 volatile LONG g_trace_sites_used = 0, g_trace_hits = 0, g_trace_matched = 0, g_trace_dropped = 0;
@@ -2465,6 +2696,18 @@ LONG CALLBACK TraceHandler(EXCEPTION_POINTERS* e) {
       g_trace_sites[used].rcx = c->Rcx;
       g_trace_sites[used].rcx28 = rcx_28;
       g_trace_sites[used].r9 = c->R9;
+      g_trace_sites[used].rdx = c->Rdx;
+      memset(g_trace_sites[used].rdx_mem, 0, sizeof g_trace_sites[used].rdx_mem);
+      memset(g_trace_sites[used].r8v, 0, sizeof g_trace_sites[used].r8v);
+      if (g_trace_args) {
+        __try {
+          if (c->Rdx) memcpy(g_trace_sites[used].rdx_mem, reinterpret_cast<const void*>(c->Rdx), sizeof g_trace_sites[used].rdx_mem);
+          if (c->R8) memcpy(g_trace_sites[used].r8v, reinterpret_cast<const void*>(c->R8), sizeof g_trace_sites[used].r8v);
+          g_trace_sites[used].arg5 = *reinterpret_cast<const uintptr_t*>(c->Rsp + 0x28);
+          g_trace_sites[used].arg6 = *reinterpret_cast<const uintptr_t*>(c->Rsp + 0x30);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+      }
       if (write) TraceStack(*c, &g_trace_sites[used]);
       g_trace_sites_used = used + 1;
     } else {
@@ -2600,6 +2843,16 @@ std::string SimTraceCalls(uintptr_t fn, uintptr_t rcx, unsigned ms, unsigned wri
                (unsigned long long)g_trace_sites[i].rcx28, (unsigned long long)g_trace_sites[i].r9,
                f >= base && f < end ? "rva" : "abs", (unsigned long long)(f >= base && f < end ? f - base : f));
       out << v;
+      char x[400];
+      int n = snprintf(x, sizeof x, "  arg5 %llX arg6 %llX rdx abs:%llX r8 %.2f %.2f %.2f mem:", (unsigned long long)g_trace_sites[i].arg5,
+                       (unsigned long long)g_trace_sites[i].arg6, (unsigned long long)g_trace_sites[i].rdx,
+                       g_trace_sites[i].r8v[0], g_trace_sites[i].r8v[1], g_trace_sites[i].r8v[2]);
+      for (int k = 0; k < 0x80 && n < (int)sizeof x - 4; k += 8) {
+        uint64_t q;
+        memcpy(&q, g_trace_sites[i].rdx_mem + k, 8);
+        n += snprintf(x + n, sizeof x - n, " %llX", (unsigned long long)q);
+      }
+      out << x << "\n";
       continue;
     }
     if (r >= base && r < end) snprintf(b, sizeof b, "site rva:%llX x%ld\n", (unsigned long long)(r - base), g_trace_sites[i].count);
@@ -2661,9 +2914,9 @@ bool StartAttackKnown(uintptr_t thunk_rva) {
   return true;
 }
 
-bool CallStartAttack(uintptr_t health, uintptr_t rec) {
+bool CallStartAttack(uintptr_t health, uintptr_t rec, uintptr_t target = 0) {
   __try {
-    g_start_attack(health, 0, rec, 0, 1.0f, 0, 1, 0);
+    g_start_attack(health, 0, rec, target, 1.0f, 0, 1, 0);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     InterlockedIncrement(&g_attack_faults);
     return false;
@@ -2711,6 +2964,7 @@ bool AttackPending() { return g_attack_record != 0; }
 
 namespace {
 uintptr_t g_attack_player_global = 0;  // the GameClient global when the queued attack is for the player
+volatile LONG g_attack_at_player = 0;  // the queued puppet attack gets the player as its target
 }  // namespace
 
 void RunAttack() {
@@ -2727,10 +2981,17 @@ void RunAttack() {
   const uintptr_t owner = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
   LeaveCriticalSection(&g_lock);
   if (!owner || !PuppetAlive(owner, vt, health)) return;
-  CallStartAttack(health, rec);
+  uintptr_t target = 0;
+  if (g_attack_at_player) {  // probe "puppet attack <id> at": the AI's own start passes its opponent's health object
+    uintptr_t gc = 0, player = 0;
+    if (ReadQ(reinterpret_cast<uintptr_t>(Base()) + 0x26FFA98, &gc) && gc && ReadQ(gc + 0x888, &player) && player)
+      ReadQ(player + 0x26A8, &target);
+  }
+  CallStartAttack(health, rec, target);
 }
 
-std::string SimPuppetAttack(uintptr_t thunk_rva, uintptr_t table_rva, uint32_t id, uintptr_t gameclient_rva) {
+std::string SimPuppetAttack(uintptr_t thunk_rva, uintptr_t table_rva, uint32_t id, uintptr_t gameclient_rva, bool at_player) {
+  g_attack_at_player = at_player ? 1 : 0;
   if (!g_installed) return "err simulation-thread hook not installed (sim_hook)\n";
   if (!g_puppet && !gameclient_rva) return "err no puppet\n";
   if (!g_start_attack && !StartAttackKnown(thunk_rva))
@@ -3326,4 +3587,371 @@ std::string SimCtrlWatch(uintptr_t fn_rva, bool player, uintptr_t gameclient_rva
     out << "\n";
   }
   return out.str();
+}
+
+// ---------------------------------------------------------------- enemies and proxies (STAGE2-DESIGN.md)
+
+namespace {
+
+constexpr int kMaxSeen = 512, kMaxProxy = 64;
+struct SeenEntry {
+  uintptr_t owner;
+  ULONGLONG at;
+};
+SeenEntry g_seen[kMaxSeen];
+uintptr_t g_proxy_owner[kMaxProxy];
+
+void EnemyNote(uintptr_t owner) {
+  const ULONGLONG now = GetTickCount64();
+  int free_i = -1;
+  EnterCriticalSection(&g_lock);
+  for (int i = 0; i < kMaxSeen; ++i) {
+    if (g_seen[i].owner == owner) {
+      g_seen[i].at = now;
+      LeaveCriticalSection(&g_lock);
+      return;
+    }
+    if (free_i < 0 && (!g_seen[i].owner || now - g_seen[i].at > 3000)) free_i = i;
+  }
+  if (free_i >= 0) g_seen[free_i] = {owner, now};
+  LeaveCriticalSection(&g_lock);
+}
+
+bool ProxyHas(uintptr_t owner) {
+  for (int i = 0; i < kMaxProxy; ++i)
+    if (g_proxy_owner[i] == owner) return true;
+  return false;
+}
+
+bool CharacterHealth(uintptr_t owner, uintptr_t* health) {
+  uintptr_t vt = 0, back = 0;
+  return owner && ReadQ(owner, &vt) && InImage(vt) && ReadQ(owner + 0x26A8, health) && *health &&
+         ReadQ(*health + 0x28, &back) && back == owner;
+}
+
+}  // namespace
+
+bool SimSpawnBusy() { return SpawnPending(); }
+
+bool SimEnemyRegistryStart(uintptr_t site_rva, uintptr_t tree_rva, std::string* err) {
+  if (!SimRequestBrainHook(site_rva, tree_rva, err)) return false;
+  InterlockedExchange(&g_registry_on, 1);
+  return true;
+}
+
+size_t SimEnemyList(uintptr_t* out, size_t max) {
+  const ULONGLONG now = GetTickCount64();
+  size_t n = 0;
+  EnterCriticalSection(&g_lock);
+  for (int i = 0; i < kMaxSeen && n < max; ++i)
+    if (g_seen[i].owner && now - g_seen[i].at < 400 && !ProxyHas(g_seen[i].owner)) out[n++] = g_seen[i].owner;
+  LeaveCriticalSection(&g_lock);
+  return n;
+}
+
+bool SimEnemyRead(uintptr_t owner, SimEnemyInfo* out) {
+  uintptr_t health = 0, rec = 0, type_rec = 0;
+  if (!CharacterHealth(owner, &health)) return false;
+  memset(out, 0, sizeof *out);
+  if (!ReadFloats(owner + 0xAC, out->pos, 3) || !ReadFloats(owner + 0xB8, out->rot, 4) ||
+      !ReadFloats(health + 0x428, &out->max_hp, 1) || !ReadFloats(health + 0x42C, &out->hp, 1))
+    return false;
+  __try {
+    rec = *reinterpret_cast<const uintptr_t*>(health + 0xE0);
+    if (rec && *reinterpret_cast<const uint32_t*>(rec) == 0xA15) out->attack_id = *reinterpret_cast<const uint32_t*>(rec + 4);
+    out->attack_stamp = *reinterpret_cast<const uint32_t*>(health + 0x470);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    out->attack_id = 0;
+  }
+  if (ReadQ(owner + 0x2E68, &type_rec) && type_rec) {
+    char name[65];
+    TraceObjectName(type_rec, name);
+    strncpy_s(out->type, name, _TRUNCATE);
+  }
+  return true;
+}
+
+bool SimProxyValid(uintptr_t owner) {
+  uintptr_t health = 0;
+  return CharacterHealth(owner, &health);
+}
+
+bool SimProxyAdopt(uintptr_t owner) {
+  uintptr_t health = 0;
+  if (!CharacterHealth(owner, &health)) return false;
+  EnterCriticalSection(&g_lock);
+  int slot = -1;
+  for (int i = 0; i < kMaxProxy; ++i) {
+    if (g_proxy_owner[i] == owner) slot = i;
+    else if (slot < 0 && !g_proxy_owner[i]) slot = i;
+  }
+  if (slot >= 0) g_proxy_owner[slot] = owner;
+  LeaveCriticalSection(&g_lock);
+  if (slot < 0) return false;
+  __try {
+    *reinterpret_cast<volatile uint8_t*>(owner + kFollower) = 1;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return true;
+}
+
+void SimProxyDrop(uintptr_t owner) {
+  EnterCriticalSection(&g_lock);
+  for (int i = 0; i < kMaxProxy; ++i)
+    if (g_proxy_owner[i] == owner) g_proxy_owner[i] = 0;
+  LeaveCriticalSection(&g_lock);
+}
+
+bool SimProxyMove(uintptr_t teleport_rva, uintptr_t owner, const float pos[3], const float rot[4], bool direct) {
+  Xform x{};
+  memcpy(x.pos, pos, sizeof x.pos);
+  memcpy(x.rot, rot, sizeof x.rot);
+  if (direct) return WriteXform(owner, x);
+  const uint8_t* f = Base() + teleport_rva;
+  if (!TeleportBytesOk(f)) return false;
+  for (float v : x.pos)
+    if (!std::isfinite(v)) return false;
+  __try {
+    reinterpret_cast<Teleport_t>(const_cast<uint8_t*>(f))(reinterpret_cast<void*>(owner), &x);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return true;
+}
+
+bool SimProxyPlay(uintptr_t fn_rva, uintptr_t owner, const char* name) {
+  const uint8_t* f = Base() + fn_rva;
+  if (!Head(f, "4885D20F84CF000000488" "95C2408488974241857")) return false;
+  g_play_action = reinterpret_cast<PlayAction_t>(const_cast<uint8_t*>(f));
+  const uintptr_t graph = GraphOf(owner);
+  return graph && CallPlayAction(graph, name, 0);
+}
+
+uintptr_t SimProxyAttack(uintptr_t thunk_rva, uintptr_t stop_rva, uintptr_t table_rva, uintptr_t owner, uint32_t id) {
+  uintptr_t health = 0;
+  if (!CharacterHealth(owner, &health)) return 0;
+  if (!g_stop_attack) {
+    if (!StartAttackKnown(thunk_rva) || !Head(Base() + stop_rva, kStopHead)) return 0;
+    g_stop_attack = reinterpret_cast<StopAttack_t>(const_cast<uint8_t*>(Base() + stop_rva));
+  }
+  if (!g_start_attack && !StartAttackKnown(thunk_rva)) return 0;
+  const uintptr_t rec = SimAttackRecord(table_rva, id);
+  return rec && CallStartAttack(health, rec) ? rec : 0;
+}
+
+void SimProxyStopAttack(uintptr_t owner, uintptr_t record) {
+  uintptr_t health = 0;
+  if (record && g_stop_attack && CharacterHealth(owner, &health)) CallStopAttack(health, record);
+}
+
+void SimProxyHealth(uintptr_t owner, float frac) {
+  uintptr_t health = 0;
+  if (!CharacterHealth(owner, &health)) return;
+  float max_hp = 0;
+  if (!ReadFloats(health + 0x428, &max_hp, 1) || !(max_hp > 0)) return;
+  __try {
+    *reinterpret_cast<volatile float*>(health + 0x42C) = max_hp * std::max(0.0f, std::min(1.0f, frac));
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+// The host applies a hit of the client's: the game's own hit function, with this copy's stand-in of the client as the
+// attacker (the host's own player when there is none) and the enemy's health object as the victim.
+bool SimApplyHit(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t victim_owner, const float pos[3], uint32_t attack_id,
+                 uintptr_t gameclient_rva) {
+  uintptr_t victim = 0, attacker = 0;
+  if (!CharacterHealth(victim_owner, &victim)) return false;
+  // The stand-in's health object as the attacker faulted inside the hit (a character without the player's links,
+  // session bm): the host's own player is the attacker.
+  {
+    uintptr_t gc = 0, player = 0;
+    if (!ReadQ(reinterpret_cast<uintptr_t>(Base()) + gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &player) || !player ||
+        !ReadQ(player + 0x26A8, &attacker) || !attacker)
+      return false;
+  }
+  const uintptr_t rec = SimAttackRecord(table_rva, attack_id);
+  const uint8_t* f = Base() + hit_rva;
+  if (!Head(f, "48895C240848896C24184889742420574156" "4157") && !(f[0] == 0xE9 || f[0] == 0xFF)) return false;  // known entry, or our stub's jump
+  float p[3];
+  memcpy(p, pos, sizeof p);
+  __try {
+    // Six arguments: the fifth and sixth are on the stack and the hit reads them (the AI's own calls pass 0 and 0;
+    // with them left to chance the call faulted, session bm).
+    reinterpret_cast<void(__fastcall*)(uintptr_t, uintptr_t, const float*, uintptr_t, uintptr_t, uint64_t)>(
+        const_cast<uint8_t*>(f))(attacker, victim, p, rec, 0, 0);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return true;
+}
+
+// Test: a swing of the character `attacker_owner` (an enemy) at the stand-in, through the game's hit function (and so
+// through our stub: it is reported and dropped, and the client takes it).
+bool SimHitStandin(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t attacker_owner, uint32_t attack_id) {
+  uintptr_t attacker = 0;
+  if (!CharacterHealth(attacker_owner, &attacker)) return false;
+  EnterCriticalSection(&g_lock);
+  const uintptr_t puppet = g_puppet, vt = g_puppet_vt, health = g_puppet_health;
+  LeaveCriticalSection(&g_lock);
+  if (!puppet || !PuppetAlive(puppet, vt, health)) return false;
+  float p[3] = {};
+  if (!ReadFloats(puppet + 0xAC, p, 3)) return false;
+  const uintptr_t rec = SimAttackRecord(table_rva, attack_id);
+  const uint8_t* f = Base() + hit_rva;
+  if (!Head(f, "48895C240848896C24184889742420574156" "4157") && !(f[0] == 0xE9 || f[0] == 0xFF)) return false;
+  __try {
+    reinterpret_cast<void(__fastcall*)(uintptr_t, uintptr_t, const float*, uintptr_t, uintptr_t, uint64_t)>(
+        const_cast<uint8_t*>(f))(attacker, health, p, rec, 0, 0);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return true;
+}
+
+// The client: an enemy's swing, told by the host, hits this copy's own player (the attacker is that enemy's proxy).
+bool SimApplyDamage(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t attacker_owner, const float pos[3], uint32_t attack_id,
+                    uintptr_t gameclient_rva) {
+  uintptr_t attacker = 0, victim = 0, gc = 0, player = 0;
+  if (!CharacterHealth(attacker_owner, &attacker)) return false;
+  if (!ReadQ(reinterpret_cast<uintptr_t>(Base()) + gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &player) || !player ||
+      !ReadQ(player + 0x26A8, &victim) || !victim)
+    return false;
+  const uintptr_t rec = SimAttackRecord(table_rva, attack_id);
+  const uint8_t* f = Base() + hit_rva;
+  if (!Head(f, "48895C240848896C24184889742420574156" "4157") && !(f[0] == 0xE9 || f[0] == 0xFF)) return false;
+  float p[3];
+  memcpy(p, pos, sizeof p);
+  // A proxy is marked as the player's follower (out of the player's combat) and a follower's swing does not hurt the
+  // player: the mark is off for the length of the call.
+  volatile uint8_t* mark = reinterpret_cast<volatile uint8_t*>(attacker_owner + kFollower);
+  uint8_t was = 1;
+  __try {
+    was = *mark;
+    *mark = 0;
+    reinterpret_cast<void(__fastcall*)(uintptr_t, uintptr_t, const float*, uintptr_t, uintptr_t, uint64_t)>(
+        const_cast<uint8_t*>(f))(attacker, victim, p, rec, 0, 0);
+    *mark = was;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    __try {
+      *mark = was;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return false;
+  }
+  return true;
+}
+
+bool SimDespawnNow(uintptr_t fn_rva, uintptr_t character) {
+  const uint8_t* f = Base() + fn_rva;
+  uintptr_t ai = 0, nav = 0, probe = 0;
+  // 1A8BB74 calls through [character+0x2D10]: some characters hold -1 or 0 there and the call faults (seen on
+  // prisoners and others); only a readable pointer is passed on.
+  if (!Head(f, "48895C240848897424105748" "83EC208BDA488BF9") || !ReadQ(character + 0x2CE8, &ai) || !ai ||
+      !ReadQ(character + 0x2D10, &nav) || !nav || nav == ~uintptr_t(0) || !ReadQ(nav, &probe))
+    return false;
+  __try {
+    reinterpret_cast<void(__fastcall*)(void*, int, void*)>(const_cast<uint8_t*>(f))(reinterpret_cast<void*>(character), 0, nullptr);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------- redirecting an enemy's target (STAGE2-DESIGN.md)
+
+namespace {
+
+// An AI character keeps its goal in one of six slots of its AI data ([character+0x2CE8] + 0x118, 0x170, 0x1C8, 0x220,
+// 0x2D0, 0x328; a non-zero byte at the slot's start marks the active one, 11B60C returns it); the slot's +0x30 holds
+// the target character. The same character and its health object appear at other places of the AI data, the
+// character (+0x2CA8) and the health object (+0xA8) and are copied from the slot by the mode switch (11AEB8,
+// called from the AI tick at 2F7AE4). Redirecting replaces every qword that is the old target (or its health
+// object) in the AI data, the character and the health object by the new one.
+constexpr int kMaxRetarget = 32;
+struct Retarget {
+  uintptr_t enemy, target;
+};
+Retarget g_retarget[kMaxRetarget];
+volatile LONG g_retargeted = 0;
+const uintptr_t kSlots[] = {0x118, 0x170, 0x1C8, 0x220, 0x2D0, 0x328};
+
+uintptr_t SlotTarget(uintptr_t enemy, uintptr_t* slot_out) {
+  uintptr_t ai = 0, t = 0;
+  if (!ReadQ(enemy + 0x2CE8, &ai) || !ai) return 0;
+  for (uintptr_t s : kSlots) {
+    uint8_t on = 0;
+    __try {
+      on = *reinterpret_cast<const uint8_t*>(ai + s);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      return 0;
+    }
+    if (on) {
+      if (slot_out) *slot_out = ai + s;
+      return ReadQ(ai + s + 0x30, &t) ? t : 0;
+    }
+  }
+  return 0;
+}
+
+}  // namespace
+
+uintptr_t SimEnemyTarget(uintptr_t enemy) { return SlotTarget(enemy, nullptr); }
+
+bool SimRetarget(uintptr_t enemy, uintptr_t target) {
+  EnterCriticalSection(&g_lock);
+  int slot = -1;
+  for (int i = 0; i < kMaxRetarget; ++i) {
+    if (g_retarget[i].enemy == enemy) {
+      slot = i;
+      break;
+    }
+    if (slot < 0 && !g_retarget[i].enemy) slot = i;
+  }
+  bool ok = slot >= 0;
+  if (ok) g_retarget[slot] = {target ? enemy : 0, target};
+  LeaveCriticalSection(&g_lock);
+  return ok;
+}
+
+// Each frame, on the simulation thread.
+void SimApplyRetargets() {
+  Retarget list[kMaxRetarget];
+  EnterCriticalSection(&g_lock);
+  memcpy(list, g_retarget, sizeof list);
+  LeaveCriticalSection(&g_lock);
+  for (const Retarget& r : list) {
+    if (!r.enemy || !r.target) continue;
+    uintptr_t eh = 0, th = 0, ai = 0, cur = 0;
+    if (!CharacterHealth(r.enemy, &eh) || !CharacterHealth(r.target, &th) || !ReadQ(r.enemy + 0x2CE8, &ai) || !ai) continue;
+    cur = SlotTarget(r.enemy, nullptr);
+    if (!cur || cur == r.target) continue;
+    uintptr_t cur_h = 0;
+    ReadQ(cur + 0x26A8, &cur_h);
+    auto swap_in = [&](uintptr_t base, size_t size) {
+      __try {
+        for (size_t off = 0; off < size; off += 8) {
+          uintptr_t* q = reinterpret_cast<uintptr_t*>(base + off);
+          if (*q == cur) *q = r.target;
+          else if (cur_h && *q == cur_h) *q = th;
+        }
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+      }
+    };
+    swap_in(ai, 0x1400);
+    swap_in(r.enemy + 0x2C80, 0x80);
+    swap_in(eh, 0x300);
+    InterlockedIncrement(&g_retargeted);
+  }
+}
+
+long SimRetargeted() { return g_retargeted; }
+
+// Hiding a character: its scale (character+0x10AC, three floats) to a hundredth, every frame (the game puts it back,
+// so this is tried, not known to work).
+void SimHideCharacter(uintptr_t owner) {
+  __try {
+    float* f = reinterpret_cast<float*>(owner + 0x10AC);
+    f[0] = f[1] = f[2] = 0.01f;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
 }

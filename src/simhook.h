@@ -142,11 +142,75 @@ bool SimAttackHooksInstall(uintptr_t check_rva, uintptr_t hit_rva, uintptr_t aoe
 // the character's animation controller (it restarts the graph at IdleL), returns at once for the
 // controller SimKeepPuppetAnimOnTeleport(true) last named: the puppet's put-backs move it
 // without restarting its animation (they caused the sheathe loop, session bd).
+// The ambient spawner's per-candidate test: with the gate on every candidate is rejected (probe "ambient").
+// ---- enemies (STAGE2-DESIGN.md). All of these but the lists run on the simulation thread (the frame callback).
+struct SimEnemyInfo {
+  float pos[3], rot[4];
+  float hp, max_hp;
+  uint32_t attack_id, attack_stamp;
+  char type[32];  // the character's spawn type ("Orc_Infantry"), what SimSpawn takes
+};
+// True while a spawn another thread asked for waits for the simulation thread (a proxy spawn must not take its place).
+bool SimSpawnBusy();
+// Starts noting every AI character whose behavior tree runs (installs the behavior-tree filter if need be).
+bool SimEnemyRegistryStart(uintptr_t site_rva, uintptr_t tree_rva, std::string* err);
+size_t SimEnemyList(uintptr_t* out, size_t max);  // the characters whose tree ran in the last 400 ms
+bool SimEnemyRead(uintptr_t owner, SimEnemyInfo* out);
+// Proxies: characters the client spawned to show a host's enemy. Their behavior tree is skipped and they are
+// marked as the player's followers (out of the player's combat).
+bool SimProxyAdopt(uintptr_t owner);
+void SimProxyDrop(uintptr_t owner);
+bool SimProxyValid(uintptr_t owner);
+bool SimProxyMove(uintptr_t teleport_rva, uintptr_t owner, const float pos[3], const float rot[4], bool direct);
+bool SimProxyPlay(uintptr_t fn_rva, uintptr_t owner, const char* name);
+// Starts attack record `id` on the proxy; returns the record (0: none or failed) so it can be stopped later.
+uintptr_t SimProxyAttack(uintptr_t thunk_rva, uintptr_t stop_rva, uintptr_t table_rva, uintptr_t owner, uint32_t id);
+void SimProxyStopAttack(uintptr_t owner, uintptr_t record);
+void SimProxyHealth(uintptr_t owner, float frac);
+// Tells an AI character to despawn once it is offscreen, now (the caller is the simulation thread).
+bool SimDespawnNow(uintptr_t fn_rva, uintptr_t character);
+
+// Asks the game to despawn an AI character once it is offscreen ("AI told to despawn offscreen").
+bool SimDespawnOffscreen(uintptr_t fn_rva, uintptr_t character, std::string* err);
+bool SimAmbientHookInstall(uintptr_t fn_rva, std::string* err);
+void SimAmbientBlock(bool on);
+std::string SimAmbientReport();
+
 bool SimAnimResetHookInstall(uintptr_t reset_rva, std::string* err);
 void SimKeepPuppetAnimOnTeleport(bool on);  // each frame; false: the puppet's resets run
 long SimAnimResetsSkipped();
 long SimAoeSkips();
 void SimKeepPuppetUntargeted(bool on);
+// Hits on proxies (the host's enemies shown here): dropped, and those of this copy's own player reported (the
+// owner is the proxy character), so the host can apply them. SimHitWatch needs SimAttackHooksInstall.
+struct SimHitReport {
+  uintptr_t owner;
+  uint32_t attack_id;
+  float pos[3];
+};
+void SimHitWatch(uintptr_t gameclient_rva, bool on);
+size_t SimHitReports(SimHitReport* out, size_t max);
+long SimProxyHits();
+// Redirecting an enemy's target (the character it attacks) to another character, kept up every frame: STAGE2-DESIGN.md.
+uintptr_t SimEnemyTarget(uintptr_t enemy);              // the character an AI character is after (0: none)
+bool SimRetarget(uintptr_t enemy, uintptr_t target);    // target 0: stop
+void SimApplyRetargets();                               // once a frame, on the simulation thread
+long SimRetargeted();
+// The host: swings of enemies that reach the stand-in are reported (and not taken) instead of skipped, so the client can
+// take them (SimDamageReports; the owner is the attacking enemy). Call before SimKeepPuppetUntargeted runs.
+void SimStandinHurt(bool on);
+// The decoy: an allied character the enemies attack where the stand-in is; hits on it are reported like the stand-in's.
+void SimSetDecoy(uintptr_t owner);
+void SimHideCharacter(uintptr_t owner);
+size_t SimDamageReports(SimHitReport* out, size_t max);
+bool SimHitStandin(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t attacker_owner, uint32_t attack_id);
+// The client: applies such a swing to this copy's own player; the attacker is the enemy's proxy.
+bool SimApplyDamage(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t attacker_owner, const float pos[3], uint32_t attack_id,
+                    uintptr_t gameclient_rva);
+// The host: applies a client's hit to the enemy `victim_owner` (attacker: the stand-in of the client).
+bool SimApplyHit(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t victim_owner, const float pos[3], uint32_t attack_id,
+                 uintptr_t gameclient_rva);
+
 long SimTargetRejects();
 long SimHitDrops();
 // A puppet the game unloaded, freed or killed is dropped (logged), so a new one is picked or
@@ -167,7 +231,8 @@ bool SimForgetGonePuppet();
 // game's own start (thunk_rva, bytes checked) on the simulation thread.
 uintptr_t SimAttackRecord(uintptr_t table_rva, uint32_t id);
 // gameclient_rva non-zero: on this copy's own player instead (experiments: "puppet attack <hash> player").
-std::string SimPuppetAttack(uintptr_t thunk_rva, uintptr_t table_rva, uint32_t id, uintptr_t gameclient_rva = 0);
+std::string SimPuppetAttack(uintptr_t thunk_rva, uintptr_t table_rva, uint32_t id, uintptr_t gameclient_rva = 0,
+                            bool at_player = false);
 // Once per frame (simulation thread): the puppet plays the sender's attacks. id: the attack the
 // sender's player is in (its name hash; 0: none), stamp: when it started. A new id or stamp
 // starts that attack on the puppet; id 0 stops the puppet's attack (stop_rva, bytes checked) if
@@ -228,12 +293,12 @@ struct SimSpawnRvas {
 // look (nullptr: the type's own): an appearance record (type 0xA66, e.g. "PlayerSkin_Talion")
 // the new character is built with instead.
 bool SimSpawn(const SimSpawnRvas& r, const char* record, const float* pos, const char* look, std::string* report,
-              uintptr_t* spawned = nullptr);
+              uintptr_t* spawned = nullptr, bool run_now = false);  // run_now: the caller is the simulation thread
 
 // coop_puppet_spawn: spawn a character of type at pos, give it this copy's player's behavior
 // resource (so a "Talion", a cutscene actor, animates with the player's graph) and make it
 // the puppet. From any thread but the simulation thread (it waits for the spawn).
-bool SimSpawnPuppet(const SimSpawnRvas& r, const char* type, const float pos[3], std::string* report);
+bool SimSpawnPuppet(const SimSpawnRvas& r, const char* type, const float pos[3], std::string* report, bool run_now = false);
 
 // Probe "watch": what the write watch armed by "spawn <type> x y z watch" caught (the
 // writes to the new character's +0x19A8, with their call stacks).

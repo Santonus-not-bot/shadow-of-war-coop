@@ -100,6 +100,21 @@ bool CloudWrite(const char* name, const void* data, int32_t size) {
   NoteCloud("FileWrite", name, v);
   return ok;
 }
+void (*g_before_save_read)(const char*) = nullptr;
+CRITICAL_SECTION g_gate_lock;
+bool g_gate_done = false;
+
+// The first cloud call that names the main save runs the callback; calls from other threads wait for it.
+void SaveReadGate(const char* name) {
+  if (!g_before_save_read || !SowIsSaveName(name)) return;
+  EnterCriticalSection(&g_gate_lock);
+  if (!g_gate_done) {
+    g_gate_done = true;
+    g_before_save_read(name);
+  }
+  LeaveCriticalSection(&g_gate_lock);
+}
+
 volatile LONG g_stats_blocked = 0;
 volatile LONG g_achievements_blocked = 0;
 
@@ -322,6 +337,7 @@ bool __fastcall TraceIsCloudEnabledForApp(void* self) {
 
 // steam_cloud=sandbox: the game's cloud reads answered from this copy's folder.
 int32_t __fastcall CloudFileRead(void*, const char* name, void* data, int32_t size) {
+  SaveReadGate(name);
   std::wstring path = CloudPath(name);
   int32_t got = 0;
   HANDLE f = path.empty() || size <= 0 || !data
@@ -342,16 +358,19 @@ uint64_t __fastcall CloudFileReadAsync(void*, const char* name, uint32_t, uint32
   return 0;  // k_uAPICallInvalid: the game gets no result callback
 }
 bool __fastcall CloudFileExists(void*, const char* name) {
+  SaveReadGate(name);
   WIN32_FILE_ATTRIBUTE_DATA info;
   bool r = CloudFileInfo(CloudPath(name), &info);
   NoteCloud("FileExists", name, r ? "true" : "false");
   return r;
 }
 bool __fastcall CloudFilePersisted(void*, const char* name) {
+  SaveReadGate(name);
   WIN32_FILE_ATTRIBUTE_DATA info;
   return CloudFileInfo(CloudPath(name), &info);
 }
 int32_t __fastcall CloudGetFileSize(void*, const char* name) {
+  SaveReadGate(name);
   WIN32_FILE_ATTRIBUTE_DATA info;
   int32_t r = CloudFileInfo(CloudPath(name), &info) ? (int32_t)info.nFileSizeLow : 0;
   char v[32];
@@ -360,6 +379,7 @@ int32_t __fastcall CloudGetFileSize(void*, const char* name) {
   return r;
 }
 int64_t __fastcall CloudGetFileTimestamp(void*, const char* name) {
+  SaveReadGate(name);
   WIN32_FILE_ATTRIBUTE_DATA info;
   if (!CloudFileInfo(CloudPath(name), &info)) return 0;
   ULARGE_INTEGER t;
@@ -595,10 +615,18 @@ DWORD WINAPI SteamGuardThread(void*) {
 
 }  // namespace
 
+void SteamSetBeforeSaveRead(void (*fn)(const char* name)) { g_before_save_read = fn; }
+
+bool SteamCloudPlace(const char* name, const void* data, size_t size) {
+  if (g_cloud.empty() || size > 0x7FFFFFFF) return false;
+  return CloudWrite(name, data, (int32_t)size);
+}
+
 void StartSteamGuard(const SteamGuardConfig& cfg) {
   g_trace = cfg.trace_reads;
   g_cloud = cfg.cloud_dir;
   InitializeCriticalSection(&g_listing_lock);
+  InitializeCriticalSection(&g_gate_lock);
   if (!g_cloud.empty()) SowLog(L"steam: cloud files come from and go to %s (steam_cloud=sandbox)", g_cloud.c_str());
 #ifdef SOWGUARD_MUTANT  // negative control: no Steam guard
   SowLog(L"steam: Steam guard disabled (mutant build)");

@@ -28,9 +28,12 @@
 #include <cstring>
 
 #include "coop.h"
+#include "enemy_proto.h"
 #include "input.h"
+#include "net_proto.h"
 #include "probe.h"
 #include "simhook.h"
+#include "steamguard.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -116,6 +119,9 @@ bool g_have_offset = false;
 
 // Sender state.
 SOCKET g_send_socket = INVALID_SOCKET;
+sownet::Endpoint* g_net = nullptr;  // the host/client transport (coop_role), below
+volatile LONG g_net_recv_errors = 0;  // recvfrom errors other than "nothing there" (ICMP resets of sends to a gone peer)
+CRITICAL_SECTION g_net_lock;
 volatile LONG g_send_seq = 0;
 volatile LONG g_was_present = -1;
 
@@ -169,6 +175,19 @@ void SendSample() {
   p.time_us = NowUs();
   if (present && !SimAnimInputs(p.inputs, &p.input_mask)) p.input_mask = 0;
   if (present) p.action_count = (uint32_t)SimPlayerActions(g_cfg.gameclient_rva, p.actions, kMaxActions);
+  if (g_net) {
+    // Over the transport: at coop_state_hz; the newest state replaces one not yet sent.
+    static ULONGLONG last_sent_ms = 0;
+    const ULONGLONG now_ms = NowUs() / 1000;
+    if (now_ms - last_sent_ms < 1000u / std::max(1u, g_cfg.state_hz)) return;
+    // The net thread holds this lock while it works on a datagram, and that can include waiting for this very
+    // thread (a spawn it asked for); so this thread never waits for it, it skips the send (the next one replaces it).
+    if (!TryEnterCriticalSection(&g_net_lock)) return;
+    last_sent_ms = now_ms;
+    g_net->sendState(reinterpret_cast<const uint8_t*>(&p), sizeof p);
+    LeaveCriticalSection(&g_net_lock);
+    return;
+  }
   const sockaddr_in to = Loopback(g_cfg.send_port);
   if (sendto(g_send_socket, reinterpret_cast<const char*>(&p), sizeof p, 0, reinterpret_cast<const sockaddr*>(&to),
              sizeof to) != (int)sizeof p &&
@@ -204,6 +223,9 @@ DWORD WINAPI SendThread(void*) {
 }
 
 ULONGLONG g_last_pick = 0;
+bool g_puppet_spawn_due = false;  // the net thread wants a stand-in spawned; the simulation thread does it
+float g_puppet_spawn_at[3] = {};
+unsigned g_puppet_spawn_tries = 0;
 
 // coop_show=puppet: pick the nearest character once the world has started (a heap scan,
 // so on this thread, retried every 10 s). The moves happen in CoopFrame.
@@ -224,11 +246,14 @@ void PickPuppet() {
     LeaveCriticalSection(&g_lock);
     pos[0] += kAround[tries % 5][0];
     pos[2] += kAround[tries % 5][1];
-    SimSpawnRvas rv;
-    rv.gameclient_rva = g_cfg.gameclient_rva;
-    const bool spawned = SimSpawnPuppet(rv, g_cfg.spawn_type.c_str(), pos, &r);
-    if (!spawned) ++tries;
-    SowLog(L"coop: %S%S", spawned ? "" : "no spawned puppet yet: ", r.c_str());
+    // This runs on the net thread, inside the transport's lock; a spawn waits for the simulation thread, which may
+    // be paused (a death screen, a load): the transport would stall with it (the client's save then never arrived,
+    // session bn). The simulation thread makes the spawn (CoopFrame).
+    EnterCriticalSection(&g_lock);
+    memcpy(g_puppet_spawn_at, pos, sizeof g_puppet_spawn_at);
+    g_puppet_spawn_due = true;
+    LeaveCriticalSection(&g_lock);
+    ++tries;
     return;
   }
   const bool ok = SimPickNearestPuppet(g_cfg.gameclient_rva, &r);
@@ -537,15 +562,503 @@ float RootCatchUp(const float pos[3]) {
   return std::min(std::max(2.0f * along, -300.0f), 300.0f);
 }
 
+// ---- enemies (STAGE2-DESIGN.md) -----------------------------------------------------------------------------
+// Host: every 66 ms the enemies within coop_enemy_radius of either player are announced (NEW/GONE events) and
+// streamed (a STATE2 snapshot). Client: each announced enemy is a proxy character of the same type with its AI
+// off, placed, animated and kept in the host's health; its own ambient population is kept away.
+
+sowenemy::HostTracker g_enemy_host;
+sowenemy::ClientTracker g_enemy_client;
+std::vector<std::vector<uint8_t>> g_enemy_events_in;  // from the net thread, taken by the frame
+std::vector<uint8_t> g_enemy_snap_in;
+uint64_t g_enemy_snap_ms = 0;
+uint32_t g_enemy_session = 0;
+volatile LONG64 g_test_dmg_owner = 0;  // probe "damage": a swing of this proxy hits this copy's player, on the next frame
+volatile LONG g_test_dmg_attack = 0;
+volatile LONG64 g_test_standin_owner = 0;  // probe "standinhit": a swing of this enemy at the stand-in (host)
+volatile LONG g_test_standin_result = 0;
+volatile LONG g_test_dmg_result = 0;   // 0 none, 1 applied, -1 failed
+volatile LONG g_enemy_dmg_sent = 0, g_enemy_dmg_applied = 0, g_enemy_dmg_failed = 0, g_enemy_dmg_stale = 0;
+volatile LONG g_enemy_hits_unmatched = 0, g_enemy_hits_sent = 0, g_enemy_hits_applied = 0, g_enemy_hits_failed = 0, g_enemy_hits_stale = 0;
+volatile LONG g_enemy_sent = 0, g_enemy_announced = 0, g_enemy_spawned = 0, g_enemy_spawn_failed = 0,
+              g_enemy_despawn_asked = 0;
+std::string g_enemy_last_error;
+
+void QueueEnemyEvent(const uint8_t* p, size_t n) {
+  if (n < 5 || n > 64) return;
+  EnterCriticalSection(&g_lock);
+  if (g_enemy_events_in.size() < 4096) g_enemy_events_in.emplace_back(p, p + n);
+  LeaveCriticalSection(&g_lock);
+}
+
+void QueueEnemySnapshot(const uint8_t* p, size_t n) {
+  if (n < sowenemy::kSnapshotHead || n > sizeof(sowenemy::Snapshot)) return;
+  EnterCriticalSection(&g_lock);
+  g_enemy_snap_in.assign(p, p + n);
+  g_enemy_snap_ms = NowUs() / 1000;
+  LeaveCriticalSection(&g_lock);
+}
+
+float DistXZ(const float a[3], const float b[3]) {
+  const float dx = a[0] - b[0], dz = a[2] - b[2];
+  return std::sqrt(dx * dx + dz * dz);
+}
+
+float YawOf(const float q[4]) { return 2.0f * std::atan2(q[1], q[3]); }
+
+// The host: the client's strikes on its proxies, applied to the real enemies.
+void EnemyHostHits() {
+  std::vector<std::vector<uint8_t>> events;
+  EnterCriticalSection(&g_lock);
+  events.swap(g_enemy_events_in);
+  LeaveCriticalSection(&g_lock);
+  int applied_now = 0;
+  for (const auto& ev : events) {
+    sowenemy::HitMsg m;
+    if (!sowenemy::ParseHit(ev.data(), ev.size(), &m)) continue;
+    const uintptr_t owner = g_enemy_host.keyOf(m.id);
+    if (!owner) {
+      InterlockedIncrement(&g_enemy_hits_stale);  // the enemy is gone or was never announced in this session
+      continue;
+    }
+    if (++applied_now > 16) break;
+    if (SimApplyHit(g_cfg.hit_rva, g_cfg.attack_table_rva, owner, m.pos, m.attack_id, g_cfg.gameclient_rva)) {
+      if (InterlockedIncrement(&g_enemy_hits_applied) <= 5)
+        SowLog(L"coop: the client hit enemy %u (attack %08X) at %.0f,%.0f,%.0f: applied", m.id, m.attack_id, m.pos[0], m.pos[1], m.pos[2]);
+    } else {
+      InterlockedIncrement(&g_enemy_hits_failed);
+    }
+  }
+}
+
+// The decoy (the host): enemies do not attack the stand-in (a Talion is not an enemy for the AI); an allied soldier with
+// no AI of its own is, so one stands where the stand-in stands, never dies, and what hits it is told to the client like
+// a hit on the stand-in.
+uintptr_t g_decoy_owner = 0;
+ULONGLONG g_decoy_next = 0;
+volatile LONG g_decoy_spawned = 0;
+
+void DecoyFrame() {
+  const ULONGLONG now = GetTickCount64();
+  float at[3], rot[4];
+  if (!SimPuppetXform(at, rot) || !SimHasPuppet()) {
+    if (g_decoy_owner) {
+      SimSetDecoy(0);
+      SimProxyHealth(g_decoy_owner, 0.0f);
+      SimDespawnNow(g_cfg.despawn_rva, g_decoy_owner);
+      SimProxyDrop(g_decoy_owner);
+      g_decoy_owner = 0;
+    }
+    return;
+  }
+  if (g_decoy_owner && !SimProxyValid(g_decoy_owner)) {
+    SimSetDecoy(0);
+    SimProxyDrop(g_decoy_owner);
+    g_decoy_owner = 0;
+    g_decoy_next = now + 2000;
+  }
+  if (!g_decoy_owner) {
+    if (now < g_decoy_next || SimSpawnBusy()) return;
+    SimSpawnRvas rv;
+    rv.gameclient_rva = g_cfg.gameclient_rva;
+    std::string report;
+    uintptr_t obj = 0;
+    if (SimSpawn(rv, "Gondorian_Soldier", at, nullptr, &report, &obj, true) && obj && SimProxyAdopt(obj)) {
+      g_decoy_owner = obj;
+      SimSetDecoy(obj);
+      InterlockedIncrement(&g_decoy_spawned);
+      SowLog(L"coop: a decoy ally stands where the stand-in stands (enemies attack it for the stand-in)");
+    } else {
+      g_decoy_next = now + 3000;
+      SowLog(L"coop: no decoy yet: %S", report.c_str());
+    }
+    return;
+  }
+  float where[3] = {at[0], at[1] + g_cfg.decoy_dy, at[2]};
+  SimProxyMove(g_cfg.teleport_rva, g_decoy_owner, where, rot, true);
+  SimProxyHealth(g_decoy_owner, 1.0f);
+  SimHideCharacter(g_decoy_owner);
+}
+
+// The host: enemy swings that reached the client's stand-in go to the client, whose player takes them.
+void EnemyHostDamage() {
+  static std::vector<std::vector<uint8_t>> pending;
+  SimHitReport rp[16];
+  const size_t n = SimDamageReports(rp, 16);
+  for (size_t i = 0; i < n; ++i) {
+    const uint32_t id = g_enemy_host.idOf(rp[i].owner);
+    if (id) pending.push_back(sowenemy::DamageEvent(id, rp[i].attack_id, rp[i].pos));
+    else InterlockedIncrement(&g_enemy_dmg_stale);  // an attacker that is not an announced enemy (an ally, a stray)
+  }
+  if (!pending.empty() && TryEnterCriticalSection(&g_net_lock)) {
+    for (const auto& ev : pending) g_net->sendEvent(ev.data(), ev.size());
+    InterlockedAdd(&g_enemy_dmg_sent, (LONG)pending.size());
+    pending.clear();
+    LeaveCriticalSection(&g_net_lock);
+  }
+  if (pending.size() > 64) pending.clear();
+}
+
+void EnemyHostFrame() {
+  if (g_test_standin_owner) {
+    const uintptr_t who = (uintptr_t)InterlockedExchange64(&g_test_standin_owner, 0);
+    g_test_standin_result = SimHitStandin(g_cfg.hit_rva, g_cfg.attack_table_rva, who, (uint32_t)g_test_dmg_attack) ? 1 : -1;
+  }
+  static ULONGLONG last_ms = 0;
+  const ULONGLONG now = GetTickCount64();
+  static bool hurt_set = false;
+  if (!hurt_set) {
+    hurt_set = true;
+    SimStandinHurt(true);  // before the puppet code sets what the stubs skip
+    std::string e;
+    if (!SimAttackHooksInstall(g_cfg.target_check_rva, g_cfg.hit_rva, g_cfg.aoe_rva, &e))
+      SowLog(L"coop: enemy swings cannot be carried to the client: %S", e.c_str());
+  }
+  EnemyHostHits();
+  EnemyHostDamage();
+  if (g_cfg.decoy) DecoyFrame();
+  if (now - last_ms < 66) return;
+  last_ms = now;
+  static sownet::Status status = sownet::Status::kIdle;
+  static uint32_t session = 0;
+  if (TryEnterCriticalSection(&g_net_lock)) {  // never wait for it: see SendSample
+    status = g_net->status();
+    session = g_net->session();
+    LeaveCriticalSection(&g_net_lock);
+  }
+  if (status != sownet::Status::kConnected) return;
+  static bool started = false;
+  if (!started) {
+    started = true;
+    std::string e;
+    if (!SimEnemyRegistryStart(g_cfg.brain_site_rva, g_cfg.tree_rva, &e)) SowLog(L"coop: the host cannot list its enemies: %S", e.c_str());
+    else SowLog(L"coop: the host announces the enemies within %.0f units of either player", g_cfg.enemy_radius);
+  }
+  if (session != g_enemy_session) {
+    g_enemy_session = session;
+    g_enemy_host.forgetAll();
+  }
+  Packet me{};
+  float mine[3], theirs[3];
+  bool have_theirs = false;
+  if (!ReadPlayer(&me)) return;
+  memcpy(mine, me.pos, sizeof mine);
+  EnterCriticalSection(&g_lock);
+  if (g_have) {
+    memcpy(theirs, g_last.pos, sizeof theirs);
+    have_theirs = true;
+  }
+  LeaveCriticalSection(&g_lock);
+  uintptr_t list[256];
+  const size_t count = SimEnemyList(list, 256);
+  struct Cand {
+    float d;
+    sowenemy::Seen s;
+  };
+  std::vector<Cand> cand;
+  for (size_t i = 0; i < count; ++i) {
+    SimEnemyInfo info;
+    if (!SimEnemyRead(list[i], &info) || !info.type[0]) continue;
+    float d = DistXZ(info.pos, mine);
+    if (have_theirs) d = std::min(d, DistXZ(info.pos, theirs));
+    if (d > g_cfg.enemy_radius) continue;
+    Cand c;
+    c.d = d;
+    c.s.key = list[i];
+    memcpy(c.s.pos, info.pos, sizeof c.s.pos);
+    c.s.yaw = YawOf(info.rot);
+    c.s.attack_id = info.attack_id;
+    c.s.attack_stamp = info.attack_stamp;
+    c.s.hp_frac = info.max_hp > 0 ? info.hp / info.max_hp : 1.0f;
+    c.s.alive = info.hp > 0;
+    sowenemy::CopyType(c.s.type, info.type);
+    cand.push_back(c);
+  }
+  std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.d < b.d; });
+  std::vector<sowenemy::Seen> chosen;
+  for (size_t i = 0; i < cand.size() && i < sowenemy::kMaxEnemies; ++i) chosen.push_back(cand[i].s);
+  const sowenemy::HostTracker::Out out = g_enemy_host.update(chosen, now);
+  // Events are kept until the transport can take them (the lock may be busy: see SendSample); a snapshot is not.
+  static std::vector<std::vector<uint8_t>> pending;
+  for (const auto& ev : out.events) pending.push_back(ev);
+  if (!TryEnterCriticalSection(&g_net_lock)) return;
+  for (const auto& ev : pending) g_net->sendEvent(ev.data(), ev.size());
+  InterlockedAdd(&g_enemy_announced, (LONG)pending.size());
+  pending.clear();
+  if (!out.snapshot.empty()) g_net->sendState2(out.snapshot.data(), out.snapshot.size());
+  LeaveCriticalSection(&g_net_lock);
+  if (!out.snapshot.empty()) InterlockedIncrement(&g_enemy_sent);
+}
+
+std::vector<uintptr_t> g_limbo;  // freed proxies the game has not removed yet: their AI stays off until they are gone
+
+void FreeProxy(sowenemy::Proxy& p) {
+  if (!p.handle) return;
+  if (p.applied_record) SimProxyStopAttack(p.handle, p.applied_record);
+  // The host's enemy is gone (dead, out of range, or the session ended): the proxy dies and is asked to go once
+  // it is out of sight. Until the game has removed it, it stays a proxy: no AI, so no stray fight.
+  SimProxyHealth(p.handle, 0.0f);
+  SimDespawnNow(g_cfg.despawn_rva, p.handle);
+  if (g_limbo.size() < 48) g_limbo.push_back(p.handle);
+  else SimProxyDrop(p.handle);
+  p.handle = 0;
+}
+
+void EnemyClientFrame() {
+  const ULONGLONG now = GetTickCount64();
+  static bool started = false;
+  if (!started) {
+    started = true;
+    std::string e;
+    if (!SimEnemyRegistryStart(g_cfg.brain_site_rva, g_cfg.tree_rva, &e)) SowLog(L"coop: the client cannot keep its proxies' AI off: %S", e.c_str());
+    if (!SimAmbientHookInstall(g_cfg.ambient_rva, &e)) SowLog(L"coop: the client's own ambient enemies are not stopped: %S", e.c_str());
+    else SimAmbientBlock(true);
+    // A strike of this player on a proxy is dropped here (a proxy is a picture) and told to the host.
+    if (!SimAttackHooksInstall(g_cfg.target_check_rva, g_cfg.hit_rva, g_cfg.aoe_rva, &e))
+      SowLog(L"coop: this client's strikes on proxies are not carried: %S", e.c_str());
+    else SimHitWatch(g_cfg.gameclient_rva, true);
+    SowLog(L"coop: this client shows the host's enemies as proxies and keeps its own ambient enemies away");
+  }
+  static uint32_t session = 0;
+  static sownet::Status status = sownet::Status::kIdle;
+  if (TryEnterCriticalSection(&g_net_lock)) {  // never wait for it: see SendSample
+    session = g_net->session();
+    status = g_net->status();
+    LeaveCriticalSection(&g_net_lock);
+  }
+  auto& proxies = g_enemy_client.proxies();
+  for (size_t i = 0; i < g_limbo.size();) {
+    if (!SimProxyValid(g_limbo[i])) {
+      SimProxyDrop(g_limbo[i]);
+      g_limbo.erase(g_limbo.begin() + i);
+    } else {
+      ++i;
+    }
+  }
+  if (session != g_enemy_session) {  // a new session: the host announces everything again
+    g_enemy_session = session;
+    for (auto& kv : proxies) FreeProxy(kv.second);
+    g_enemy_client.clear();
+  }
+  std::vector<std::vector<uint8_t>> events;
+  std::vector<uint8_t> snap;
+  uint64_t snap_ms = 0;
+  EnterCriticalSection(&g_lock);
+  events.swap(g_enemy_events_in);
+  snap.swap(g_enemy_snap_in);
+  snap_ms = g_enemy_snap_ms;
+  LeaveCriticalSection(&g_lock);
+  std::vector<uint32_t> gone;
+  for (const auto& ev : events) {
+    sowenemy::HitMsg dm;
+    if (sowenemy::ParseDamage(ev.data(), ev.size(), &dm)) {
+      auto it = proxies.find(dm.id);
+      if (it == proxies.end() || !it->second.handle) {
+        InterlockedIncrement(&g_enemy_dmg_stale);
+      } else if (SimApplyDamage(g_cfg.hit_rva, g_cfg.attack_table_rva, it->second.handle, dm.pos, dm.attack_id, g_cfg.gameclient_rva)) {
+        if (InterlockedIncrement(&g_enemy_dmg_applied) <= 5)
+          SowLog(L"coop: enemy %u (%S) hit this player (attack %08X): applied", dm.id, it->second.type, dm.attack_id);
+      } else {
+        InterlockedIncrement(&g_enemy_dmg_failed);
+      }
+      continue;
+    }
+    // GONE: free the character before the tracker forgets it
+    if (ev.size() == 5 && ev[0] == sowenemy::kOpGone) {
+      uint32_t id;
+      memcpy(&id, &ev[1], 4);
+      auto it = proxies.find(id);
+      if (it != proxies.end()) FreeProxy(it->second);
+    }
+    g_enemy_client.onEvent(ev.data(), ev.size(), &gone);
+  }
+  if (!snap.empty()) g_enemy_client.onSnapshot(snap.data(), snap.size(), snap_ms);
+  if (status != sownet::Status::kConnected && status != sownet::Status::kSyncing) return;
+  unsigned spawns_left = 2;
+  for (auto& kv : proxies) {
+    sowenemy::Proxy& p = kv.second;
+    if (!p.have) continue;
+    if (p.handle && !SimProxyValid(p.handle)) {  // freed by the game (unloaded, killed and removed)
+      SimProxyDrop(p.handle);
+      p.handle = 0;
+      p.applied_record = 0;
+      p.applied_attack = p.applied_stamp = 0;
+      p.applied_loco = 255;
+      p.next_spawn_ms = now + 1500;
+    }
+    if (!p.handle) {
+      if (p.spawn_failed || spawns_left == 0 || now < p.next_spawn_ms || !(p.cur.flags & sowenemy::kAlive) || SimSpawnBusy()) continue;
+      --spawns_left;
+      SimSpawnRvas rv;
+      rv.gameclient_rva = g_cfg.gameclient_rva;
+      std::string report;
+      uintptr_t obj = 0;
+      if (SimSpawn(rv, p.type, p.cur.pos, nullptr, &report, &obj, true) && obj && SimProxyAdopt(obj)) {
+        p.handle = obj;
+        p.shown_set = false;
+        InterlockedIncrement(&g_enemy_spawned);
+      } else {
+        p.spawn_failed = true;
+        InterlockedIncrement(&g_enemy_spawn_failed);
+        SowLog(L"coop: no proxy for enemy %u (%S): %S", p.id, p.type, report.c_str());
+      }
+      if (!p.handle) continue;
+    }
+    float target[3];
+    sowenemy::ClientTracker::Predict(p, now, target);
+    if (!p.shown_set || DistXZ(p.shown, target) > 400.0f) {
+      memcpy(p.shown, target, sizeof p.shown);
+      p.shown_set = true;
+    } else {
+      for (int i = 0; i < 3; ++i) p.shown[i] += (target[i] - p.shown[i]) * 0.5f;
+    }
+    const float h = p.cur.yaw * 0.5f, rot[4] = {0.0f, std::sin(h), 0.0f, std::cos(h)};
+    SimProxyMove(g_cfg.teleport_rva, p.handle, p.shown, rot, g_cfg.enemy_direct);
+    SimProxyHealth(p.handle, (p.cur.flags & sowenemy::kAlive) ? p.cur.hp / 65535.0f : 0.0f);
+    if (p.cur.attack_id != p.applied_attack || p.cur.attack_stamp != p.applied_stamp) {
+      if (p.applied_record) SimProxyStopAttack(p.handle, p.applied_record);
+      p.applied_record = 0;
+      if (p.cur.attack_id)
+        p.applied_record = SimProxyAttack(g_cfg.attack_thunk_rva, g_cfg.attack_stop_rva, g_cfg.attack_table_rva, p.handle, p.cur.attack_id);
+      if (!p.cur.attack_id) p.applied_loco = 255;  // the attack ended: show how it moves again
+      p.applied_attack = p.cur.attack_id;
+      p.applied_stamp = p.cur.attack_stamp;
+    }
+    if (!p.cur.attack_id && p.cur.loco != p.applied_loco) {
+      static const char* const kLoco[] = {"Idle", "WalkForward", "Run"};
+      if (p.cur.loco < 3 && SimProxyPlay(g_cfg.play_rva, p.handle, kLoco[p.cur.loco])) p.applied_loco = p.cur.loco;
+      else p.applied_loco = p.cur.loco;  // not played (no such state): do not retry every frame
+    }
+  }
+  if (g_test_dmg_owner) {
+    const uintptr_t who = (uintptr_t)InterlockedExchange64(&g_test_dmg_owner, 0);
+    float at[3] = {};
+    Packet me{};
+    if (ReadPlayer(&me)) memcpy(at, me.pos, sizeof at);
+    g_test_dmg_result = SimApplyDamage(g_cfg.hit_rva, g_cfg.attack_table_rva, who, at, (uint32_t)g_test_dmg_attack, g_cfg.gameclient_rva) ? 1 : -1;
+  }
+  // Strikes of this player on proxies, to the host.
+  {
+    SimHitReport hr[16];
+    const size_t n = SimHitReports(hr, 16);
+    static std::vector<std::vector<uint8_t>> outbox;
+    for (size_t i = 0; i < n; ++i) {
+      bool matched = false;
+      for (const auto& kv : proxies)
+        if (kv.second.handle == hr[i].owner) {
+          outbox.push_back(sowenemy::HitEvent(kv.first, hr[i].attack_id, hr[i].pos));
+          matched = true;
+          break;
+        }
+      if (!matched) InterlockedIncrement(&g_enemy_hits_unmatched);  // a proxy already freed (dead, waiting to go)
+    }
+    if (!outbox.empty() && TryEnterCriticalSection(&g_net_lock)) {
+      for (const auto& ev : outbox) g_net->sendEvent(ev.data(), ev.size());
+      InterlockedAdd(&g_enemy_hits_sent, (LONG)outbox.size());
+      outbox.clear();
+      LeaveCriticalSection(&g_net_lock);
+    }
+    if (outbox.size() > 64) outbox.clear();
+  }
+  // The client's own population: whatever its tree ticks and is not a proxy is asked to go (once it is out of sight).
+  static ULONGLONG last_despawn = 0;
+  if (now - last_despawn >= 1500) {
+    last_despawn = now;
+    uintptr_t list[256];
+    const size_t n = SimEnemyList(list, 256);
+    for (size_t i = 0; i < n; ++i)
+      if (SimDespawnNow(g_cfg.despawn_rva, list[i])) InterlockedIncrement(&g_enemy_despawn_asked);
+  }
+}
+
+void EnemyFrame() {
+  if (g_cfg.net_role == "host") EnemyHostFrame();
+  else if (g_cfg.net_role == "client") EnemyClientFrame();
+}
+
+// Fast travel follow (below, IngestPacket): the pending destination.
+constexpr float kTravelJump = 2500.0f;
+bool g_travel_due = false;
+float g_travel_to[3] = {};
+ULONGLONG g_travel_at = 0;
+volatile LONG g_travels = 0;
+
+// The client: the host jumped (fast travel): this copy's player goes to where the host is, beside it.
+void TravelFrame() {
+  bool due = false;
+  float to[3];
+  // Once, when this player is in the world and the host's position is known: a client that starts where the host's
+  // save left it, far from where the host is now, is taken to the host.
+  static bool join_checked = false;
+  if (!join_checked) {
+    Packet me{};
+    EnterCriticalSection(&g_lock);
+    const bool host_there = g_have && (g_last.flags & 1);
+    float hp[3] = {g_last.pos[0], g_last.pos[1], g_last.pos[2]};
+    LeaveCriticalSection(&g_lock);
+    if (host_there && ReadPlayer(&me) && (me.pos[0] != 0.0f || me.pos[2] != 0.0f)) {
+      join_checked = true;
+      const float dx = me.pos[0] - hp[0], dz = me.pos[2] - hp[2];
+      if (std::sqrt(dx * dx + dz * dz) > 1500.0f) {
+        EnterCriticalSection(&g_lock);
+        memcpy(g_travel_to, hp, sizeof g_travel_to);
+        g_travel_at = GetTickCount64();
+        g_travel_due = true;
+        LeaveCriticalSection(&g_lock);
+      }
+    }
+  }
+  EnterCriticalSection(&g_lock);
+  if (g_travel_due && GetTickCount64() >= g_travel_at) {
+    due = true;
+    memcpy(to, g_travel_to, sizeof to);
+    g_travel_due = false;
+  }
+  LeaveCriticalSection(&g_lock);
+  if (!due) return;
+  to[0] += 100.0f;
+  std::string e;
+  if (SimRequestPlayerTeleport(g_cfg.teleport_rva, g_cfg.gameclient_rva, to, &e)) {
+    InterlockedIncrement(&g_travels);
+    SowLog(L"coop: the host travelled: this player goes to %.0f,%.0f,%.0f", to[0], to[1], to[2]);
+  } else {
+    SowLog(L"coop: cannot follow the host's travel: %S", e.c_str());
+  }
+}
+
+// The stand-in's spawn, on the simulation thread (see PickPuppet).
+void PuppetSpawnFrame() {
+  bool due;
+  float pos[3];
+  EnterCriticalSection(&g_lock);
+  due = g_puppet_spawn_due;
+  memcpy(pos, g_puppet_spawn_at, sizeof pos);
+  LeaveCriticalSection(&g_lock);
+  if (!due || SimHasPuppet() || SimSpawnBusy()) return;
+  EnterCriticalSection(&g_lock);
+  g_puppet_spawn_due = false;
+  LeaveCriticalSection(&g_lock);
+  SimSpawnRvas rv;
+  rv.gameclient_rva = g_cfg.gameclient_rva;
+  std::string r;
+  const bool spawned = SimSpawnPuppet(rv, g_cfg.spawn_type.c_str(), pos, &r, true);
+  if (!spawned) ++g_puppet_spawn_tries;
+  SowLog(L"coop: %S%S", spawned ? "" : "no spawned puppet yet: ", r.c_str());
+}
+
 // The simulation thread, once per frame: send this copy's player, move the puppet.
 void CoopFrame() {
-  if (g_cfg.send_port && !g_inputs_requested) {
+  if ((g_cfg.send_port || !g_cfg.net_role.empty()) && !g_inputs_requested) {
     g_inputs_requested = true;
     std::string e;
     if (!SimAnimInputsInstall(g_cfg.anim_var_rva, g_cfg.gameclient_rva, &e))
       SowLog(L"coop: the player's animation inputs are not sent: %S", e.c_str());
   }
-  if (g_cfg.send_port && g_send_socket != INVALID_SOCKET) SendSample();
+  if ((g_cfg.send_port && g_send_socket != INVALID_SOCKET) || g_net) SendSample();
+  SimApplyRetargets();
+  if (g_cfg.net_role == "client" && g_cfg.follow_travel) TravelFrame();
+  if (g_cfg.puppet && !g_cfg.spawn_type.empty()) PuppetSpawnFrame();
+  if (g_cfg.enemies && g_net) EnemyFrame();
   if (!g_cfg.puppet) return;
   if (!g_cfg.puppet_ai && !g_ai_requested) {
     g_ai_requested = true;
@@ -684,6 +1197,40 @@ void CoopFrame() {
     SowLog(L"coop: puppet moved every frame, %u ms behind the sender, interpolated", g_cfg.delay_ms);
 }
 
+// A received player state, from either transport (the loopback pair or the host/client link).
+// Fast travel (and a respawn) show as a jump of the host's player: no walk, ride or fall covers this much in the time
+// between two of its states. The client follows (it is moved to the host's new place once the host has been there for a
+// moment), so "the host decides, both go". Only a client does, only for packets that carry a player.
+
+void IngestPacket(const Packet& p, uint64_t recv_us, unsigned from_port) {
+  EnterCriticalSection(&g_lock);
+  const ULONGLONG now = GetTickCount64();
+  if (g_cfg.net_role == "client" && g_cfg.follow_travel && g_have && (g_last.flags & 1) && (p.flags & 1)) {
+    const float dx = p.pos[0] - g_last.pos[0], dy = p.pos[1] - g_last.pos[1], dz = p.pos[2] - g_last.pos[2];
+    if (std::sqrt(dx * dx + dy * dy + dz * dz) > kTravelJump) {
+      memcpy(g_travel_to, p.pos, sizeof g_travel_to);
+      g_travel_at = now + 1500;
+      g_travel_due = true;
+    } else if (g_travel_due) {
+      memcpy(g_travel_to, p.pos, sizeof g_travel_to);  // still settling: follow where it stands now
+    }
+  }
+  if (g_have && p.seq > g_last.seq + 1) g_lost += p.seq - g_last.seq - 1;
+  if (!g_have) g_first_at = now;
+  g_last = p;
+  g_last_at = now;
+  g_have = true;
+  ++g_packets;
+  Remember(p, recv_us);
+  LeaveCriticalSection(&g_lock);
+  static bool logged_first = false;
+  if (!logged_first) {
+    SowLog(L"coop: first packet (seq %u) from port %u", p.seq, from_port);
+    logged_first = true;
+  }
+  MaybeShow(p);
+}
+
 DWORD WINAPI ListenThread(void*) {
   SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   sockaddr_in at = Loopback(g_cfg.listen_port);
@@ -714,21 +1261,315 @@ DWORD WINAPI ListenThread(void*) {
       LeaveCriticalSection(&g_lock);
       continue;
     }
-    const ULONGLONG now = GetTickCount64();
-    if (g_have && p.seq > g_last.seq + 1) g_lost += p.seq - g_last.seq - 1;
-    if (!g_have) g_first_at = now;
-    g_last = p;
-    g_last_at = now;
-    g_have = true;
-    ++g_packets;
-    Remember(p, recv_us);
     LeaveCriticalSection(&g_lock);
-    if (!logged_first) {
-      SowLog(L"coop: first packet (seq %u) from 127.0.0.1:%u", p.seq, ntohs(from.sin_port));
-      logged_first = true;
-    }
-    MaybeShow(p);
+    (void)logged_first;
+    IngestPacket(p, recv_us, ntohs(from.sin_port));
   }
+}
+
+// ---- the host/client transport ----------------------------------------------------------------------------
+
+SOCKET g_net_sock = INVALID_SOCKET;
+sockaddr_in g_net_peer{};  // the client's host
+
+uint64_t PackAddr(const sockaddr_in& a) { return ((uint64_t)ntohl(a.sin_addr.s_addr) << 16) | ntohs(a.sin_port); }
+sockaddr_in UnpackAddr(uint64_t k) {
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl((uint32_t)(k >> 16));
+  a.sin_port = htons((u_short)(k & 0xFFFF));
+  return a;
+}
+
+bool ParseHostPort(const std::string& s, sockaddr_in* out) {
+  const size_t colon = s.rfind(':');
+  if (colon == std::string::npos) return false;
+  const unsigned long port = strtoul(s.c_str() + colon + 1, nullptr, 10);
+  if (port == 0 || port > 65535) return false;
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_port = htons((u_short)port);
+  if (inet_pton(AF_INET, s.substr(0, colon).c_str(), &a.sin_addr) != 1) return false;
+  *out = a;
+  return true;
+}
+
+const wchar_t* NetStatusName(sownet::Status s) {
+  switch (s) {
+    case sownet::Status::kIdle: return L"waiting";
+    case sownet::Status::kConnecting: return L"connecting";
+    case sownet::Status::kSyncing: return L"syncing";
+    case sownet::Status::kConnected: return L"connected";
+    case sownet::Status::kLost: return L"lost";
+    case sownet::Status::kRejected: return L"rejected";
+    default: return L"closed";
+  }
+}
+
+// ---- joining: the client plays in the host's save ----------------------------------------------------------
+// The client's mod connects as soon as it starts. The game's first look at its save in the sandbox cloud (a gate
+// in steamguard.cpp) waits until the host's save has arrived and checked out, then puts it there under the name
+// the game asks for, and replaces the local copy too. A join that fails (no host, wrong password or build, no
+// save, a damaged or interrupted transfer) ends the process: a client that went on with its own save would play
+// in a different world from the host's.
+
+bool g_join_active = false;
+HANDLE g_join_event = nullptr;
+volatile LONG g_join_state = 0;  // 0 waiting, 1 the host's save is in hand
+ULONGLONG g_join_deadline = 0;
+std::vector<uint8_t> g_join_save;
+
+[[noreturn]] void JoinFail(const wchar_t* why) {
+  SowLog(L"coop: cannot join: %s", why);
+  if (g_cfg.join_message) {
+    wchar_t text[700];
+    swprintf_s(text, L"Co-op: %s\n\nThe game will close.", why);
+    MessageBoxW(nullptr, text, L"Shadow of War co-op", MB_OK | MB_ICONERROR | MB_TOPMOST);
+  }
+  SowFatal(kExitCoopJoin, L"coop: cannot join: %s", why);
+}
+
+const wchar_t* RejectText(uint8_t reason) {
+  switch (reason) {
+    case sownet::kRejectProto: return L"The host runs a different game build or co-op protocol.";
+    case sownet::kRejectBuild: return L"The host runs a different version of this mod.";
+    case sownet::kRejectPassword: return L"The co-op password is wrong.";
+    case sownet::kRejectBusy: return L"The host already has a player.";
+    case sownet::kRejectSave: return L"The host's save could not be received (too big, or damaged on the way).";
+    default: return L"The host refused the connection.";
+  }
+}
+
+// Called by the net thread: moves the join along, or ends it.
+void JoinTick() {
+  if (!g_join_active || g_join_state != 0) return;
+  EnterCriticalSection(&g_net_lock);
+  const sownet::Status st = g_net->status();
+  const uint8_t reason = g_net->rejectReason();
+  const size_t want = g_net->saveSize();
+  if (st == sownet::Status::kConnected && g_net->receivedSave().size() == want) g_join_save = g_net->receivedSave();
+  LeaveCriticalSection(&g_net_lock);
+  if (st == sownet::Status::kRejected) JoinFail(RejectText(reason));
+  if (st == sownet::Status::kClosed) JoinFail(L"The host closed the connection.");
+  if (st == sownet::Status::kConnected) {
+    if (want == 0)
+      JoinFail(L"The host has no save to share. Start the game once on the host, save, and try again.");
+    if (g_join_save.size() != want) JoinFail(L"The host's save did not arrive complete.");
+    InterlockedExchange(&g_join_state, 1);
+    SetEvent(g_join_event);
+    return;
+  }
+  if (GetTickCount64() > g_join_deadline)
+    JoinFail(st == sownet::Status::kSyncing ? L"The host's save did not arrive in time."
+              : reason == sownet::kRejectBusy ? RejectText(reason)
+                                              : L"The host did not answer (is it running, and is the address and port right?).");
+}
+
+// The steamguard gate: the game is about to look at its save.
+void JoinGate(const char* name) {
+  if (!g_join_active) return;
+  SowLog(L"coop: the game asks for its save (%S); waiting for the host's", name);
+  if (WaitForSingleObject(g_join_event, 10 * 60 * 1000) != WAIT_OBJECT_0) JoinFail(L"The host's save never arrived.");
+  if (!SteamCloudPlace(name, g_join_save.data(), g_join_save.size()))
+    JoinFail(L"The host's save could not be written into this copy's save folder.");
+  if (!g_cfg.save_local_dir.empty()) {
+    const char* base = name;
+    for (const char* p = name; *p; ++p)
+      if (*p == '\\' || *p == '/') base = p + 1;
+    std::wstring path = g_cfg.save_local_dir + L"\\";
+    for (const char* p = base; *p; ++p) path += (wchar_t)*p;  // SowIsSaveName: hex digits and a fixed suffix
+    const std::wstring tmp = path + L".sowtmp";
+    HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    DWORD wrote = 0;
+    bool ok = f != INVALID_HANDLE_VALUE &&
+              WriteFile(f, g_join_save.data(), (DWORD)g_join_save.size(), &wrote, nullptr) && wrote == g_join_save.size();
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    ok = ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    if (!ok) {
+      DeleteFileW(tmp.c_str());
+      JoinFail(L"The host's save could not be written into this copy's save folder.");
+    }
+  }
+  uint8_t sha[32];
+  sownet::Sha256Of(g_join_save.data(), g_join_save.size(), sha);
+  SowLog(L"coop: joined: the host's save (%u bytes, sha256 %02x%02x%02x%02x...) is in place as %S",
+         (unsigned)g_join_save.size(), sha[0], sha[1], sha[2], sha[3], name);
+  std::vector<uint8_t>().swap(g_join_save);
+}
+
+// The host: offers its newest main save to a joining client. Re-read when it changes while nobody is joined.
+FILETIME g_offered_time{};
+unsigned long long g_offered_size = ~0ull;
+ULONGLONG g_offer_checked = 0;
+
+void HostOfferSave() {
+  if (g_cfg.net_role != "host" || g_cfg.save_dir.empty()) return;
+  const ULONGLONG now = GetTickCount64();
+  if (g_offer_checked && now - g_offer_checked < 2000) return;
+  g_offer_checked = now;
+  EnterCriticalSection(&g_net_lock);
+  const sownet::Status st = g_net->status();
+  LeaveCriticalSection(&g_net_lock);
+  if (st == sownet::Status::kSyncing || st == sownet::Status::kConnected) return;
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((g_cfg.save_dir + L"\\*").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  WIN32_FIND_DATAW best{};
+  bool have = false;
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    char narrow[MAX_PATH];
+    size_t n = 0;
+    for (; fd.cFileName[n] && n + 1 < sizeof narrow; ++n) narrow[n] = fd.cFileName[n] < 128 ? (char)fd.cFileName[n] : '?';
+    narrow[n] = 0;
+    if (!SowIsSaveName(narrow)) continue;
+    if (!have || CompareFileTime(&fd.ftLastWriteTime, &best.ftLastWriteTime) > 0) {
+      best = fd;
+      have = true;
+    }
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+  if (!have) {
+    if (g_offered_size != ~0ull - 1) SowLog(L"coop: no save of the host's to offer yet (%s)", g_cfg.save_dir.c_str());
+    g_offered_size = ~0ull - 1;
+    return;
+  }
+  const unsigned long long size = ((unsigned long long)best.nFileSizeHigh << 32) | best.nFileSizeLow;
+  if (size == g_offered_size && CompareFileTime(&best.ftLastWriteTime, &g_offered_time) == 0) return;
+  if (size == 0 || size > sownet::kMaxSave) return;
+  HANDLE f = CreateFileW((g_cfg.save_dir + L"\\" + best.cFileName).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         nullptr, OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return;
+  std::vector<uint8_t> data((size_t)size);
+  DWORD got = 0;
+  const bool ok = ReadFile(f, data.data(), (DWORD)size, &got, nullptr) && got == size;
+  CloseHandle(f);
+  if (!ok) return;
+  EnterCriticalSection(&g_net_lock);
+  g_net->offerSave(std::move(data));
+  LeaveCriticalSection(&g_net_lock);
+  g_offered_time = best.ftLastWriteTime;
+  g_offered_size = size;
+  SowLog(L"coop: offering the host's save %s (%llu bytes) to a joining client", best.cFileName, size);
+}
+
+DWORD WINAPI NetThread(void*) {
+  char buf[sownet::kMaxDatagram + 64];
+  for (;;) {
+    bool any = false;
+    for (int i = 0; i < 64; ++i) {
+      sockaddr_in from{};
+      int from_len = sizeof from;
+      const int n = recvfrom(g_net_sock, buf, sizeof buf, 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+      if (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
+        InterlockedIncrement(&g_net_recv_errors);
+        continue;  // an error of an earlier send, not the end of the queue
+      }
+      if (n <= 0) break;
+      any = true;
+      EnterCriticalSection(&g_net_lock);
+      g_net->receive(reinterpret_cast<const uint8_t*>(buf), (size_t)n, NowUs() / 1000, PackAddr(from));
+      LeaveCriticalSection(&g_net_lock);
+    }
+    EnterCriticalSection(&g_net_lock);
+    g_net->tick(NowUs() / 1000);
+    LeaveCriticalSection(&g_net_lock);
+    JoinTick();
+    HostOfferSave();
+    if (!any) Sleep(1);
+  }
+}
+
+// Starts the transport for coop_role=host|client. False (and logged) when it cannot start.
+bool StartNet(const CoopConfig& cfg) {
+  const bool host = cfg.net_role == "host";
+  sownet::Config nc;
+  nc.role = host ? sownet::Role::kHost : sownet::Role::kClient;
+  for (size_t i = 0; i < 32 && cfg.exe_sha_hex.size() >= 64; ++i)
+    nc.exe_sha[i] = (uint8_t)strtoul(cfg.exe_sha_hex.substr(2 * i, 2).c_str(), nullptr, 16);
+  nc.mod_build = kVersion;
+  nc.password = cfg.net_password;
+  nc.session_seed = (uint32_t)(NowUs() ^ GetCurrentProcessId());
+  sockaddr_in bind_to{};
+  bind_to.sin_family = AF_INET;
+  if (host) {
+    if (inet_pton(AF_INET, cfg.net_bind.c_str(), &bind_to.sin_addr) != 1) {
+      SowLog(L"coop: coop_bind %S is not an IPv4 address; coop off", cfg.net_bind.c_str());
+      return false;
+    }
+    bind_to.sin_port = htons((u_short)cfg.net_port);
+  } else if (!ParseHostPort(cfg.net_peer, &g_net_peer)) {
+    SowLog(L"coop: coop_host %S is not <ipv4>:<port>; coop off", cfg.net_peer.c_str());
+    return false;
+  } else {
+    bind_to.sin_addr.s_addr = htonl(INADDR_ANY);  // the client's own port is chosen by the system
+  }
+  g_net_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  u_long nonblocking = 1;
+  // Windows reports an ICMP "port unreachable" (a datagram sent to a peer that is gone) as an error of the next
+  // recvfrom, one per datagram sent: a host sending a save to a client that died flooded its own socket with them and the
+  // next client's HELLOs waited behind (session bo). Off, as the hub's relay does.
+  if (g_net_sock != INVALID_SOCKET) {
+    DWORD ignored = 0;
+    BOOL no_reset = FALSE;
+    WSAIoctl(g_net_sock, (DWORD)0x9800000C /* SIO_UDP_CONNRESET */, &no_reset, sizeof no_reset, nullptr, 0, &ignored, nullptr, nullptr);
+  }
+  if (g_net_sock == INVALID_SOCKET || ioctlsocket(g_net_sock, FIONBIO, &nonblocking) != 0 ||
+      bind(g_net_sock, reinterpret_cast<const sockaddr*>(&bind_to), sizeof bind_to) != 0) {
+    SowLog(L"coop: cannot open the %S socket (%d); coop off", cfg.net_role.c_str(), WSAGetLastError());
+    return false;
+  }
+  // network=coop_peer: this socket, and only it, may send to the peer (a host: to whoever its valid packets came from).
+  SowAllowPeerSocket((uintptr_t)g_net_sock, host ? 0 : g_net_peer.sin_addr.s_addr, host ? 0 : ntohs(g_net_peer.sin_port), host);
+  InitializeCriticalSection(&g_net_lock);
+  g_net = new sownet::Endpoint(nc, [host](const uint8_t* d, size_t n, uint64_t dst) {
+    const sockaddr_in to = host ? UnpackAddr(dst) : g_net_peer;
+    sendto(g_net_sock, reinterpret_cast<const char*>(d), (int)n, 0, reinterpret_cast<const sockaddr*>(&to), sizeof to);
+  });
+  g_net->onState([](const uint8_t* p, size_t n) {
+    Packet pk{};
+    if (n != sizeof pk) return;
+    memcpy(&pk, p, sizeof pk);
+    if (memcmp(pk.magic, "SOWC", 4) != 0 || pk.version != kVersion) return;
+    IngestPacket(pk, NowUs(), 0);
+  });
+  g_net->onEvent([](const uint8_t* p, size_t n) { QueueEnemyEvent(p, n); });
+  g_net->onState2([](const uint8_t* p, size_t n) { QueueEnemySnapshot(p, n); });
+  g_net->onStatus([](sownet::Status s) { SowLog(L"coop: connection %s", NetStatusName(s)); });
+  if (host) {
+    SowLog(L"coop: hosting on %S:%u", cfg.net_bind.c_str(), cfg.net_port);
+    // The addresses this PC has (a VPN adapter such as Tailscale or ZeroTier shows up here too): the friend's
+    // coop_host is one of them plus the port.
+    char name[256] = {};
+    addrinfo hints{}, *list = nullptr;
+    hints.ai_family = AF_INET;
+    if (gethostname(name, sizeof name) == 0 && getaddrinfo(name, nullptr, &hints, &list) == 0) {
+      for (addrinfo* a = list; a; a = a->ai_next) {
+        char text[32] = {};
+        inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(a->ai_addr)->sin_addr, text, sizeof text);
+        if (strncmp(text, "127.", 4) != 0 && strncmp(text, "169.254.", 8) != 0)
+          SowLog(L"coop: a client on this network or VPN joins with coop_host=%S:%u", text, cfg.net_port);
+      }
+      freeaddrinfo(list);
+    }
+    if (cfg.save_dir.empty()) SowLog(L"coop: no sandbox cloud folder (steam_cloud=sandbox): this host offers no save");
+    HostOfferSave();
+  } else {
+    SowLog(L"coop: joining %S", cfg.net_peer.c_str());
+    if (cfg.join && !cfg.save_dir.empty()) {
+      g_join_active = true;
+      g_join_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+      g_join_deadline = GetTickCount64() + (ULONGLONG)cfg.join_timeout_sec * 1000;
+      SteamSetBeforeSaveRead(&JoinGate);
+      SowLog(L"coop: this client plays in the host's save: it is taken before the game reads its own (%u s allowed)",
+             cfg.join_timeout_sec);
+    } else {
+      SowLog(L"coop: this client keeps its own save (coop_join=off)");
+    }
+  }
+  HANDLE t = CreateThread(nullptr, 0, NetThread, nullptr, 0, nullptr);
+  if (t) CloseHandle(t);
+  return true;
 }
 
 }  // namespace
@@ -742,6 +1583,9 @@ void StartCoop(const CoopConfig& cfg) {
     return;
   }
   g_started = true;
+  if (!cfg.net_role.empty()) {
+    if (!StartNet(cfg)) return;
+  }
   if (cfg.send_port) {
     g_send_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_send_socket == INVALID_SOCKET) {
@@ -766,7 +1610,41 @@ void StartCoop(const CoopConfig& cfg) {
   g_air_on = cfg.air_follow ? 1 : 0;
   g_attacks_on = cfg.puppet_attacks ? 1 : 0;
   g_anim_snap = cfg.anim_snap;
-  if (cfg.send_port || cfg.puppet) SimSetFrameCallback(&CoopFrame);
+  if (cfg.send_port || cfg.puppet || !cfg.net_role.empty()) SimSetFrameCallback(&CoopFrame);
+}
+
+std::string CoopTestStandinHit(uintptr_t enemy, uint32_t attack_id) {
+  g_test_dmg_attack = (LONG)attack_id;
+  g_test_standin_result = 0;
+  InterlockedExchange64(&g_test_standin_owner, (LONG64)enemy);
+  for (int i = 0; i < 100 && !g_test_standin_result; ++i) Sleep(20);
+  return g_test_standin_result == 1 ? "ok the swing was made\n" : "err not made\n";
+}
+
+std::string CoopTestDamage(uintptr_t proxy, uint32_t attack_id) {
+  g_test_dmg_attack = (LONG)attack_id;
+  g_test_dmg_result = 0;
+  InterlockedExchange64(&g_test_dmg_owner, (LONG64)proxy);
+  for (int i = 0; i < 100 && !g_test_dmg_result; ++i) Sleep(20);
+  return g_test_dmg_result == 1 ? "ok applied\n" : g_test_dmg_result == -1 ? "err the hit was not applied\n" : "err not run (no enemy sharing on this client?)\n";
+}
+
+std::string CoopEnemyStatus() {
+  char b[460];
+  size_t spawned_now = 0, with_pos = 0;
+  if (g_cfg.net_role == "client")
+    for (auto& kv : g_enemy_client.proxies()) {
+      if (kv.second.handle) ++spawned_now;
+      if (kv.second.have) ++with_pos;
+    }
+  snprintf(b, sizeof b,
+           "ok enemies=%s role=%s host_known=%zu host_announced=%ld host_snapshots=%ld client_proxies=%zu with_pos=%zu "
+           "standing=%zu spawned=%ld failed=%ld despawn_asked=%ld hits_sent=%ld hits_on_proxies=%ld hits_applied=%ld hits_failed=%ld hits_stale=%ld travels=%ld hits_unmatched=%ld dmg_sent=%ld dmg_applied=%ld dmg_failed=%ld dmg_stale=%ld\n",
+           g_cfg.enemies ? "on" : "off", g_cfg.net_role.c_str(), g_enemy_host.known(), g_enemy_announced, g_enemy_sent,
+           g_cfg.net_role == "client" ? g_enemy_client.proxies().size() : (size_t)0, with_pos, spawned_now, g_enemy_spawned,
+           g_enemy_spawn_failed, g_enemy_despawn_asked, g_enemy_hits_sent, SimProxyHits(), g_enemy_hits_applied, g_enemy_hits_failed,
+           g_enemy_hits_stale, g_travels, g_enemy_hits_unmatched, g_enemy_dmg_sent, g_enemy_dmg_applied, g_enemy_dmg_failed, g_enemy_dmg_stale);
+  return b;
 }
 
 void CoopSetAnimSnap(float units) { g_anim_snap = units; }
@@ -798,14 +1676,27 @@ void CoopSetFollow(int follow) {
 }
 
 std::string CoopStatus() {
-  if (!g_started || !g_cfg.listen_port) return "err coop receiver off (no coop_listen)\n";
+  if (!g_started || (!g_cfg.listen_port && !g_net)) return "err coop receiver off (no coop_listen or coop_role)\n";
+  std::string net;
+  if (g_net) {
+    EnterCriticalSection(&g_net_lock);
+    const sownet::Stats& st = g_net->stats();
+    char nb[420];
+    snprintf(nb, sizeof nb, " net=%s/%S rtt=%.0f jitter=%.0f in=%llu out=%llu bad=%llu resends=%llu hellos=%llu unknown_session=%llu unknown_src=%llu recv_errors=%ld [%s]",
+             g_cfg.net_role.c_str(), NetStatusName(g_net->status()), st.rtt_ms, st.jitter_ms, (unsigned long long)st.datagrams_in,
+             (unsigned long long)st.datagrams_out, (unsigned long long)(st.bad_crc + st.bad_format),
+             (unsigned long long)st.resends, (unsigned long long)st.hellos, (unsigned long long)st.unknown_session,
+             (unsigned long long)st.unknown_src, g_net_recv_errors, g_net->debug().c_str());
+    LeaveCriticalSection(&g_net_lock);
+    net = nb;
+  }
   Packet local{};
   const bool have_local = ReadPlayer(&local);
   char b[640];
   EnterCriticalSection(&g_lock);
   if (!g_have) {
     LeaveCriticalSection(&g_lock);
-    return "ok packets=0 (nothing received yet)\n";
+    return "ok packets=0 (nothing received yet)" + net + "\n";
   }
   const ULONGLONG now = GetTickCount64();
   const double span = (double)(g_last_at - g_first_at) / 1000.0;
@@ -835,7 +1726,7 @@ std::string CoopStatus() {
            SimAttacksStopped(), g_resets_on ? "on" : "off", SimAnimResetsSkipped(),
            g_anim_frames, g_anim_no_xform, g_anim_stuck, g_anim_refused, g_frames_not_ok, g_anim_off, g_anim_turn,
            g_anim_sender_speed, now - g_sender_moving_at);
-  return std::string(b) +
+  return std::string(b) + net +
          (g_cfg.puppet ? " " + SimPuppetStatus() + w + " " + SimRootSpeedReport() + " " + SimPuppetDetail()
                        : std::string()) +
          "\n";

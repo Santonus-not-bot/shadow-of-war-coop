@@ -15,6 +15,11 @@ cl %CF% /DSOWGUARD_MUTANT /LD %SRC% /Fobuild\mutant\ /Fdbuild\mutant\ /Febuild\m
 rem Test-only stand-in for Steam's steam_api64.dll (never copied into a game folder).
 cl %CF% /LD src\fake_steam_api.cpp /Fobuild\fake\ /Fdbuild\fake\ /Febuild\fake\steam_api64.dll || goto :fail
 cl %CF% src\test_guard.cpp /Fobuild\ /Fdbuild\ /Febuild\test_guard.exe || goto :fail
+rem The transport's simulator tests and their negative control (reliable messages unordered: must fail).
+cl %CF% src\net_test.cpp /Fobuild\ /Fdbuild\ /Febuild\net_test.exe || goto :fail
+cl %CF% /DSOWNET_MUTANT src\net_test.cpp /Fobuild\mutant\ /Fdbuild\mutant\ /Febuild\mutant\net_test.exe || goto :fail
+rem The enemy messages (host tracker, client tracker) without any game code.
+cl %CF% src\enemy_test.cpp /Fobuild\ /Fdbuild\ /Febuild\enemy_test.exe || goto :fail
 echo BUILD_OK
 exit /b 0
 :fail

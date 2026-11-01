@@ -52,6 +52,27 @@ forward to the original, renamed `bink2w64_.dll`). Before the game's code runs i
 - `sim_hook=<vtable rva hex>:<slot>` (the test copies use `1F96818:36`, the player's
   per-frame update, ~58 calls a second on the simulation thread): a register-preserving
   pre-hook that runs queued work there. Engine calls that allocate need that thread.
+- Co-op over a host and client link (`coop_role=host|client`, `src/net_proto.h`, replaces `coop_send` and
+  `coop_listen`): the host listens on `coop_bind` (default `127.0.0.1`, loopback until the guard has a peer
+  rule) port `coop_port`; the client connects to `coop_host=<ipv4>:<port>`. `coop_password` (optional, both
+  sides), `coop_state_hz` (30, player states a second), `coop_delay_ms` (120 for a link). Packets carry a CRC;
+  events are acknowledged, resent, ordered and never doubled; both sides must run the same game build and mod
+  build. `NETWORK-DESIGN.md` has the design; `net_test.exe` tests the transport in a simulator.
+- `tools/chaos_live.py` (two running copies, B joining through the hub's UDP relay from `tools/chaos`): profiles from good_wifi to hell, a 10 s blackout, one-way cuts, a 70 s blackout; the stand-in has to keep following and recover.
+- Real addresses (`network=coop_peer`, needs `coop_role`): the guard stays offline for the game itself, but the
+  mod's own UDP socket (and only that socket) may send to a non-loopback address: a client to the host's
+  `coop_host` address and port only, a host to whoever its valid packets came from. Inbound packets were never
+  blocked. A host then listens on `0.0.0.0` unless `coop_bind` says otherwise (on a PC with a firewall the
+  first run asks to allow it). `network=offline` keeps the mod on loopback.
+- Joining (`coop_role=client`, needs `steam_cloud=sandbox`): the client plays in the host's world. Its mod
+  connects at start-up; the game's first look at its save through the cloud calls waits until the host's save
+  (the newest `<hex>_ShadowOfWar.sav` in the host's sandbox cloud folder, re-read every 2 s while nobody is
+  joined) has arrived and its SHA-256 has checked out. It is then put in place under the name the game asks for
+  and replaces the local copy. No host, a wrong password or build, a host without a save, a damaged or
+  interrupted download (`coop_join_timeout_sec`, default 20) or a place that stays taken all end the game with
+  a message (exit code `0xC0DE0007`): a client that went on with its own save would play another world.
+  `coop_join=off` keeps the client's own save (tests). A restarted client takes the place of a dead one once
+  the host has heard nothing from it for 5 s; until then it is told "busy" and keeps asking.
 - Co-op over loopback (`src/coop.cpp`): `coop_send=127.0.0.1:<port>` sends this copy's
   player (position, rotation, health, its 25 animation inputs, its root-motion speed, its
   non-zero game actions, its locomotion mode, its on-ground flag and the attack it is in;
@@ -262,6 +283,28 @@ gets, via `stacks`), `wait-world.ps1`, `walk-loop.sh`, `records.py`, `dis_annot.
 python -I tools\probe.py <profile dir> ping "scan 48 8B 0D ? ? ? ? E8" "read rva:1C76D08 32"
 ```
 
+## Playing with a friend over the internet (not yet tried with a second person)
+
+The guard keeps the game itself offline; `network=coop_peer` lets only the co-op socket talk to the other copy.
+Both players need the same game build and mod build, and `steam_cloud=sandbox` (the client plays in the host's
+save, which is copied into its own sandbox, never into its real saves).
+
+1. Put both PCs on one virtual LAN with an overlay VPN: Tailscale, ZeroTier or Radmin VPN (free, no port
+   forwarding). Privacy VPNs that hide your address do not work for this. Each PC gets a private address
+   (Tailscale: 100.x.y.z).
+2. Host's `sowguard.ini`: `network=coop_peer`, `coop_role=host`, `coop_port=47011`, optionally
+   `coop_password=...` and `coop_bind=<the VPN address>` (default under coop_peer: all addresses). Start the
+   game. `sowguard.log` then lists lines `coop: a client on this network or VPN joins with
+   coop_host=<address>:47011`; the VPN's address is the one to give your friend. The host's firewall may ask to
+   allow the game once (UDP, private network).
+3. Client's `sowguard.ini`: `network=coop_peer`, `coop_role=client`, `coop_host=<that address>:47011`, the
+   same `coop_password`. Start the game after the host. The game waits at its save for the host's, copies it,
+   and closes with a message if it cannot (no host, wrong password or build, a host that has not saved yet).
+4. Plain port forwarding also works: forward UDP `coop_port` to the host and give the client the host's public
+   address.
+
+What is covered by tests: the same thing between two copies on one PC through a simulated bad network (loss,
+jitter, blackouts) and over a LAN address. Not tried: two PCs, a real VPN, a real router.
 ## Build and test (no game needed)
 
 ```
@@ -270,11 +313,11 @@ build\test_guard.exe run <scratch dir> <abs path>\build\bink2w64.dll <original b
 build\test_guard.exe mutant <scratch dir> <abs path>\build\mutant\bink2w64.dll <original bink2w64.dll>
 ```
 
-`run` builds a fake owner tree per case and must print `RESULT: PASS (39 of 39 cases
+`run` builds a fake owner tree per case and must print `RESULT: PASS (53 of 53 cases
 passed)` (a case name as a sixth argument runs only that case). `mutant` runs a build
 with redirect, guard, offline mode, Steam guard, the virtual pad,
 background running, the simulation-thread hook and the `stacks` patch compiled out (and
-a debug-print stub that loses r9) and must catch all 18 dependent cases. The co-op
+a debug-print stub that loses r9) and must catch all 20 dependent cases. The co-op
 cases use a fake player, fake game functions with the game's byte shapes (teleport,
 move request, the AI tick's tree call, the tree, the float animation-variable setter, the
 AI movement component's step) and a fake simulation thread; `coop_puppet_walk` also checks
@@ -308,7 +351,8 @@ git-ignored).
 - AFD request layouts were measured on Windows 11 26200 (`test_guard.exe probe`); other
   Windows builds may differ. A request the guard cannot parse is blocked, not passed.
 
-- Test copies only, never the owner's install. Ran in test copies of build 3095001 ; any other build is refused and untested.
+- Test copies only, never the owner's install. Ran in test copies of build 3095001 (with
+  its SteamStub and Denuvo); any other build is refused and untested.
 - 8.3 short names are not resolved (the source areas are also protected, so a short-name
   write to them would not be redirected; it would only be caught if it matched).
 - Writes by other processes (Steam client itself) are outside this process's control.

@@ -207,7 +207,10 @@ def check_link(s, r):
     modes = {k: m.group(1) if m else '?' for k, m in modes.items()}
     want = {'follow': 'anim', 'inputs': 'on', 'actions': 'on', 'follower': 'on', 'targetable': 'off', 'air': 'on',
             'attacks': 'on'}
-    ok = n1 - n0 >= 40 and 'present=1' in r1 and 'puppet abs:' in r1 and modes == want
+    # The loopback pair sends a state per frame (~58 a second); the host/client transport 30 a second
+    # (coop_state_hz) and its status carries " net=<role>/<state>", which must be connected.
+    net = re.search(r' net=(\w+)/(\w+)', r1)
+    ok = n1 - n0 >= (20 if net else 40) and (not net or net.group(2) == 'connected') and 'present=1' in r1 and 'puppet abs:' in r1 and modes == want
     return ok, f'{n1 - n0} packets in 1 s, stand-in {"yes" if "puppet abs:" in r1 else "no"}, ' + \
         ' '.join(f'{k}={v}' for k, v in modes.items())
 

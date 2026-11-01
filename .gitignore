@@ -1,5 +1,5 @@
 build/
 test-run*/
-test-run*.log
-*.obj
-*.pdb
+*.log
+vcenv.cmd
+__pycache__/

@@ -24,8 +24,11 @@
 #include <cstdio>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include "net_proto.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -50,6 +53,7 @@ constexpr DWORD kExitExeIdentity = 0xC0DE0003;
 constexpr DWORD kExitSteamAppId = 0xC0DE0004;
 constexpr DWORD kExitProtected = 0xC0DE0010;
 constexpr DWORD kExitSteamGuard = 0xC0DE0006;
+constexpr DWORD kExitCoopJoin = 0xC0DE0007;
 constexpr const char* kGameExeSha256 = "ed0d95cabb033cd66aaa99d699374881846c3cb03ec345f1123d82d45e0bdaef";
 
 // ---------------------------------------------------------------- file helpers
@@ -83,6 +87,18 @@ bool Exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) 
 bool FileIs(const std::wstring& path, const std::string& want) {
   std::string got;
   return ReadText(path, &got) && got == want;
+}
+
+// Whole-file comparison (ReadText stops at 4 KiB).
+bool FileBytesAre(const std::wstring& path, const std::vector<uint8_t>& want) {
+  HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return false;
+  std::vector<uint8_t> got(want.size() + 1);
+  DWORD n = 0;
+  const BOOL ok = ReadFile(f, got.data(), (DWORD)got.size(), &n, nullptr);
+  CloseHandle(f);
+  got.resize(ok ? n : 0);
+  return got == want;
 }
 
 void MakeDirs(const std::wstring& p) {
@@ -1536,10 +1552,107 @@ int PadChild(const Layout& L, HMODULE proxy, bool send_load) {
   return 0;
 }
 
+// coop_join_*: a client whose game asks for its save. The mod must have the host's in place by then (or have
+// ended the process); this fake game reads it through the cloud calls like the real one.
+std::vector<uint8_t> JoinSave(size_t n) {
+  std::vector<uint8_t> d(n);
+  uint32_t x = 12345;
+  for (auto& b : d) {
+    x = x * 1664525u + 1013904223u;
+    b = (uint8_t)(x >> 24);
+  }
+  return d;
+}
+constexpr size_t kJoinSaveBytes = 300000;
+const char* const kJoinName = "\\0123abcd_ShadowOfWar.sav";
+
+int JoinChild(const Layout& L, HMODULE fake) {
+  using SetReady = void (*)(int);
+  using Rs = void* (*)();
+  auto set_ready = reinterpret_cast<SetReady>(GetProcAddress(fake, "FakeSteam_SetReady"));
+  void* rs = reinterpret_cast<Rs>(GetProcAddress(fake, "FakeSteam_RemoteStorage"))();
+  Sleep(300);
+  set_ready(1);
+  std::string log;
+  for (int i = 0; i < 100 && log.find("served from the sandbox cloud") == std::string::npos; ++i) {
+    Sleep(50);
+    ReadText(L.Profile(L"sowguard.log"), &log);
+  }
+  using Fn = uint64_t (*)(void*, uint64_t, uint64_t, uint64_t);
+  auto call = [&](int slot, uint64_t a, uint64_t b, uint64_t c) {
+    return reinterpret_cast<Fn>((*static_cast<void* const* const*>(rs))[slot])(rs, a, b, c);
+  };
+  auto s = [](const void* p) { return (uint64_t)(uintptr_t)p; };
+  std::string bad;
+  if ((uint8_t)call(13, s(kJoinName), 0, 0) != 1) bad += " FileExists";  // the first look: the mod's gate
+  const int32_t size = (int32_t)call(15, s(kJoinName), 0, 0);
+  if (size != (int32_t)kJoinSaveBytes) bad += " GetFileSize(" + std::to_string(size) + ")";
+  std::vector<uint8_t> buf(kJoinSaveBytes + 16);
+  const int32_t got = (int32_t)call(1, s(kJoinName), s(buf.data()), (int32_t)buf.size());
+  buf.resize(got > 0 ? (size_t)got : 0);
+  if (buf != JoinSave(kJoinSaveBytes)) bad += " FileRead(" + std::to_string(got) + ")";
+  WriteText(L.dir + L"\\join.txt", bad.empty() ? "join ok" : "join wrong:" + bad);
+  return 0;
+}
+
+// coop_peer_*: a copy with a co-op role and a network mode. The only socket that may reach a non-loopback address
+// under network=coop_peer is the mod's own; this child also tries one of its own (a stray) at the same address.
+int PeerChild(const Layout& L) {
+  WSADATA wsa;
+  WSAStartup(MAKEWORD(2, 2), &wsa);
+  wchar_t host[80] = {};
+  GetPrivateProfileStringW(L"sowguard", L"coop_host", L"", host, 80, (L.dir + L"\\sowguard.ini").c_str());
+  if (host[0]) {
+    std::wstring h = host;
+    const size_t colon = h.rfind(L':');
+    char ip[64] = {};
+    for (size_t i = 0; i < colon && i < 63; ++i) ip[i] = (char)h[i];
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons((u_short)wcstoul(h.c_str() + colon + 1, nullptr, 10));
+    inet_pton(AF_INET, ip, &to.sin_addr);
+    Sleep(1500);  // the mod's own socket exists by now
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    const int r = sendto(s, "STRAY", 5, 0, reinterpret_cast<const sockaddr*>(&to), sizeof to);
+    WriteText(L.dir + L"\\stray.txt", r == 5 ? "stray sent" : "stray refused " + std::to_string(WSAGetLastError()));
+    closesocket(s);
+  }
+  while (!Exists(L.dir + L"\\stop")) Sleep(50);
+  return 0;
+}
+
+std::string Narrow(const std::wstring& w) {
+  std::string out;
+  for (wchar_t c : w) out += (char)c;
+  return out;
+}
+
+// This PC's address towards the outside (a UDP connect sends nothing), or false when it has none.
+bool LocalIPv4(std::wstring* out) {
+  WSADATA wsa;
+  WSAStartup(MAKEWORD(2, 2), &wsa);
+  SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  sockaddr_in to{}, me{};
+  to.sin_family = AF_INET;
+  to.sin_port = htons(9);
+  inet_pton(AF_INET, "192.0.2.1", &to.sin_addr);
+  int len = sizeof me;
+  bool ok = s != INVALID_SOCKET && connect(s, reinterpret_cast<sockaddr*>(&to), sizeof to) == 0 &&
+            getsockname(s, reinterpret_cast<sockaddr*>(&me), &len) == 0 && me.sin_addr.s_addr != 0 &&
+            me.sin_addr.s_addr != htonl(INADDR_LOOPBACK);
+  if (ok) {
+    char buf[32];
+    inet_ntop(AF_INET, &me.sin_addr, buf, sizeof buf);
+    out->assign(buf, buf + strlen(buf));
+  }
+  if (s != INVALID_SOCKET) closesocket(s);
+  return ok;
+}
+
 int Child(const std::wstring& name, const std::wstring& dir, const std::wstring& arg) {
   Layout L(dir);
   HMODULE fake_steam = nullptr;
-  if (name == L"steam_block" || name == L"steam_wrapper_mismatch" || name == L"steam_cloud") {
+  if (name == L"steam_block" || name == L"steam_wrapper_mismatch" || name == L"steam_cloud" || name == L"coop_join") {
     // Like the game: steam_api64.dll is loaded before the guard's thread looks for it.
     fake_steam = LoadLibraryW((dir + L"\\steam_api64.dll").c_str());
     if (!fake_steam) return 5;
@@ -1551,7 +1664,8 @@ int Child(const std::wstring& name, const std::wstring& dir, const std::wstring&
       VirtualProtect(f, 1, old, &old);
     }
   }
-  const bool recv_case = name == L"coop_puppet_recv" || name == L"coop_puppet_recv_nobuttons";
+  const bool recv_net = name == L"coop_puppet_recv_net";
+  const bool recv_case = name == L"coop_puppet_recv" || name == L"coop_puppet_recv_nobuttons" || recv_net;
   if (name == L"coop_loop" || name == L"coop_puppet" || name == L"coop_puppet_walk" || recv_case) {
     BuildPlayerFixtures();
     BuildLkpFixture();
@@ -1581,6 +1695,11 @@ int Child(const std::wstring& name, const std::wstring& dir, const std::wstring&
     WritePrivateProfileStringW(L"sowguard", L"coop_listen", v, ini.c_str());
     // A receiver only: the test itself sends the packets (so nothing here records inputs).
     if (recv_case) WritePrivateProfileStringW(L"sowguard", L"coop_send", nullptr, ini.c_str());
+    if (recv_net) {
+      WritePrivateProfileStringW(L"sowguard", L"coop_listen", nullptr, ini.c_str());
+      WritePrivateProfileStringW(L"sowguard", L"coop_role", L"host", ini.c_str());
+      WritePrivateProfileStringW(L"sowguard", L"coop_port", v, ini.c_str());
+    }
   }
   if (name == L"probe_stacks") BuildStacksFixtures(dir);
   if (name == L"probe_pad_save") {
@@ -1616,6 +1735,12 @@ int Child(const std::wstring& name, const std::wstring& dir, const std::wstring&
   if (name == L"probe_serve") return ProbeChild(L);
   if (name == L"steam_block") return SteamChild(L, fake_steam);
   if (name == L"steam_cloud") return SteamCloudChild(L, fake_steam);
+  if (name == L"coop_join") return JoinChild(L, fake_steam);
+  if (name == L"coop_peer") return PeerChild(L);
+  if (name == L"coop_host_offer") {
+    while (!Exists(L.dir + L"\\stop")) Sleep(50);
+    return 0;
+  }
   if (name == L"steam_wrapper_mismatch") {
     Sleep(10000);  // the guard should have stopped the process by now
     return 1;
@@ -1810,6 +1935,7 @@ struct Case {
   bool drop_ini = false;
   std::function<bool(const Layout&)> live;  // runs while the child is alive, then a "stop" file ends it
   bool fake_steam = false;                  // copy build\fake\steam_api64.dll into the case
+  std::wstring hold_mutex;                  // the parent holds this mutex while the child runs
 };
 
 void PrepareCase(const Env& env, const Layout& L, const Case& c) {
@@ -2252,9 +2378,11 @@ struct TestPacket {
 #pragma pack(pop)
 static_assert(sizeof(TestPacket) == 564, "coop packet version 8");
 
-bool RecvLive(const Layout& L) {
+// net: the test is a client of the transport (src/net_proto.h) and the child its host (coop_role=host,
+// coop_port); the packets go as states over it instead of straight to a coop_listen port.
+bool RecvLiveImpl(const Layout& L, bool net) {
   bool ok = Check(WaitFile(L.Profile(L"sowprobe.txt"), 10000), "probe wrote its pipe name");
-  const unsigned port = GetPrivateProfileIntW(L"sowguard", L"coop_listen", 0, (L.dir + L"\\sowguard.ini").c_str());
+  const unsigned port = GetPrivateProfileIntW(L"sowguard", net ? L"coop_port" : L"coop_listen", 0, (L.dir + L"\\sowguard.ini").c_str());
   ok &= Check(port != 0, "the child chose a listen port");
   if (!ok) return false;
   WriteText(L.dir + L"\\go", "");
@@ -2267,6 +2395,36 @@ bool RecvLive(const Layout& L) {
   to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   LARGE_INTEGER f, c;
   QueryPerformanceFrequency(&f);
+  u_long nonblocking = 1;
+  if (net) ioctlsocket(sock, FIONBIO, &nonblocking);
+  sownet::Config ncfg;
+  ncfg.role = sownet::Role::kClient;
+  for (size_t i = 0; i < 32; ++i) ncfg.exe_sha[i] = (uint8_t)strtoul(std::string(kGameExeSha256).substr(2 * i, 2).c_str(), nullptr, 16);
+  ncfg.mod_build = 8;  // the packet version, as coop.cpp
+  auto now_ms = [&]() -> uint64_t {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (uint64_t)(t.QuadPart * 1000 / f.QuadPart);
+  };
+  sownet::Endpoint ep(ncfg, [&](const uint8_t* d, size_t n, uint64_t) {
+    sendto(sock, reinterpret_cast<const char*>(d), (int)n, 0, reinterpret_cast<const sockaddr*>(&to), sizeof to);
+  });
+  auto pump = [&]() {
+    char buf[1300];
+    for (int i = 0; i < 64; ++i) {
+      const int n = recvfrom(sock, buf, sizeof buf, 0, nullptr, nullptr);
+      if (n <= 0) break;
+      ep.receive(reinterpret_cast<const uint8_t*>(buf), (size_t)n, now_ms(), 1);
+    }
+    ep.tick(now_ms());
+  };
+  if (net) {
+    for (int i = 0; i < 400 && ep.status() != sownet::Status::kConnected; ++i) {
+      pump();
+      Sleep(20);
+    }
+    ok &= Check(ep.status() == sownet::Status::kConnected, "the test connected to the child as its host");
+  }
   TestPacket pk{};
   memcpy(pk.magic, "SOWC", 4);
   pk.version = 8;
@@ -2336,13 +2494,26 @@ bool RecvLive(const Layout& L) {
     ++pk.seq;
     QueryPerformanceCounter(&c);
     pk.time_us = (uint64_t)(c.QuadPart * 1000000 / f.QuadPart);
-    sendto(sock, reinterpret_cast<const char*>(&pk), sizeof pk, 0, reinterpret_cast<const sockaddr*>(&to), sizeof to);
+    if (net) {
+      ep.sendState(reinterpret_cast<const uint8_t*>(&pk), sizeof pk);
+      pump();
+    } else {
+      sendto(sock, reinterpret_cast<const char*>(&pk), sizeof pk, 0, reinterpret_cast<const sockaddr*>(&to), sizeof to);
+    }
     Sleep(16);
+  }
+  if (net) {
+    ep.close(now_ms());
+    pump();
   }
   closesocket(sock);
   Sleep(300);
-  return Check(LogHas(L, "coop: the puppet gets the sender's animation inputs"), "log: the puppet gets the inputs");
+  return Check(LogHas(L, "coop: the puppet gets the sender's animation inputs"), "log: the puppet gets the inputs") &&
+         (!net || Check(LogHas(L, "coop: connection connected"), "log: the host's connection came up"));
 }
+
+bool RecvLive(const Layout& L) { return RecvLiveImpl(L, false); }
+bool RecvLiveNet(const Layout& L) { return RecvLiveImpl(L, true); }
 
 bool WalkLive(const Layout& L) {
   bool ok = Check(WaitFile(L.Profile(L"sowprobe.txt"), 10000), "probe wrote its pipe name");
@@ -2387,7 +2558,13 @@ int RunCases(const Env& env, const std::vector<Case>& cases, bool expect_failure
     wprintf(L"[%s]\n", c.name.c_str());
     fflush(stdout);
     bool live_ok = true;
+    HANDLE held = nullptr;
+    if (!c.hold_mutex.empty()) {
+      held = CreateMutexW(nullptr, FALSE, c.hold_mutex.c_str());
+      live_ok &= Check(held && GetLastError() != ERROR_ALREADY_EXISTS, "test holds the mutex (as another copy would)");
+    }
     DWORD code = RunChild(L, c.child.empty() ? c.name : c.child, env.exe_to_hash, c.live, &live_ok);
+    if (held) CloseHandle(held);
     Snapshot(L.dir + L"\\owner", L"", &after);
     bool ok = live_ok;
     ok &= Check(code == c.expect, "exit code");
@@ -2401,6 +2578,220 @@ int RunCases(const Env& env, const std::vector<Case>& cases, bool expect_failure
   printf("\nRESULT: %s (%d of %zu %s)\n", failed == 0 ? "PASS" : "FAIL", passed, cases.size(),
          expect_failures ? "mutant cases caught" : "cases passed");
   return failed == 0 ? 0 : 1;
+}
+
+// The host side of the join, in the test process: the real transport, with an optional hand on the wire.
+struct JoinHostOpts {
+  std::vector<uint8_t> save;  // empty: the host has no save
+  std::string password;
+  // Each datagram the host sends to the child; false drops it, and it may be edited.
+  std::function<bool(std::vector<uint8_t>*, unsigned)> wire;
+  unsigned max_ms = 15000;
+};
+
+bool JoinHostLive(const Layout& L, unsigned port, const JoinHostOpts& o) {
+  WSADATA wsa;
+  WSAStartup(MAKEWORD(2, 2), &wsa);
+  SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  sockaddr_in at{};
+  at.sin_family = AF_INET;
+  at.sin_port = htons((u_short)port);
+  at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  u_long nonblocking = 1;
+  bool ok = Check(sock != INVALID_SOCKET && ioctlsocket(sock, FIONBIO, &nonblocking) == 0 &&
+                      bind(sock, reinterpret_cast<const sockaddr*>(&at), sizeof at) == 0,
+                  "the test listens as the host");
+  if (!ok) return false;
+  LARGE_INTEGER f;
+  QueryPerformanceFrequency(&f);
+  auto now_ms = [&]() -> uint64_t {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (uint64_t)(t.QuadPart * 1000 / f.QuadPart);
+  };
+  sownet::Config cfg;
+  cfg.role = sownet::Role::kHost;
+  for (size_t i = 0; i < 32; ++i) cfg.exe_sha[i] = (uint8_t)strtoul(std::string(kGameExeSha256).substr(2 * i, 2).c_str(), nullptr, 16);
+  cfg.mod_build = 8;  // the packet version, as coop.cpp
+  cfg.password = o.password;
+  cfg.session_seed = 7;
+  unsigned sent = 0;
+  sownet::Endpoint host(cfg, [&](const uint8_t* d, size_t n, uint64_t dst) {
+    std::vector<uint8_t> dg(d, d + n);
+    if (o.wire && !o.wire(&dg, sent++)) return;
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl((uint32_t)(dst >> 16));
+    to.sin_port = htons((u_short)(dst & 0xFFFF));
+    sendto(sock, reinterpret_cast<const char*>(dg.data()), (int)dg.size(), 0, reinterpret_cast<const sockaddr*>(&to), sizeof to);
+  });
+  if (!o.save.empty()) host.offerSave(o.save);
+  for (const uint64_t t0 = now_ms(); now_ms() - t0 < o.max_ms;) {
+    char buf[1300];
+    for (int i = 0; i < 64; ++i) {
+      sockaddr_in from{};
+      int from_len = sizeof from;
+      const int n = recvfrom(sock, buf, sizeof buf, 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+      if (n <= 0) break;
+      host.receive(reinterpret_cast<const uint8_t*>(buf), (size_t)n, now_ms(), ((uint64_t)ntohl(from.sin_addr.s_addr) << 16) | ntohs(from.sin_port));
+    }
+    host.tick(now_ms());
+    if (Exists(L.dir + L"\\join.txt") || LogHas(L, "FATAL 0x")) break;
+    Sleep(1);
+  }
+  Sleep(200);
+  closesocket(sock);
+  return true;
+}
+
+// The mod as a host: it offers the newest main save of its sandbox cloud folder, re-read when it changes.
+bool HostOfferLive(const Layout& L, unsigned port) {
+  const std::wstring dir = L.Profile(L"steam-userdata\\356190\\remote");
+  bool ok = Check(WaitFile(dir, 5000), "the host made its cloud folder");
+  std::vector<uint8_t> v1 = JoinSave(40000), v2 = JoinSave(52000);
+  const std::string n1(v1.begin(), v1.end()), n2(v2.begin(), v2.end());
+  WriteText(dir + L"\\0123abcd_ShadowOfWar.sav", n1);
+  WriteText(dir + L"\\0123abcd_1_ShadowOfWar.sav", "a numbered slot is not the main save");
+  Sleep(2600);
+  WriteText(dir + L"\\0123abcd_ShadowOfWar.sav", n2);  // the game saved again
+  Sleep(2600);
+  WSADATA wsa;
+  WSAStartup(MAKEWORD(2, 2), &wsa);
+  SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  sockaddr_in to{};
+  to.sin_family = AF_INET;
+  to.sin_port = htons((u_short)port);
+  to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  u_long nonblocking = 1;
+  ioctlsocket(sock, FIONBIO, &nonblocking);
+  LARGE_INTEGER f;
+  QueryPerformanceFrequency(&f);
+  auto now_ms = [&]() -> uint64_t {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (uint64_t)(t.QuadPart * 1000 / f.QuadPart);
+  };
+  sownet::Config cfg;
+  cfg.role = sownet::Role::kClient;
+  for (size_t i = 0; i < 32; ++i) cfg.exe_sha[i] = (uint8_t)strtoul(std::string(kGameExeSha256).substr(2 * i, 2).c_str(), nullptr, 16);
+  cfg.mod_build = 8;
+  sownet::Endpoint ep(cfg, [&](const uint8_t* d, size_t n, uint64_t) {
+    sendto(sock, reinterpret_cast<const char*>(d), (int)n, 0, reinterpret_cast<const sockaddr*>(&to), sizeof to);
+  });
+  for (const uint64_t t0 = now_ms(); now_ms() - t0 < 8000 && ep.status() != sownet::Status::kConnected;) {
+    char buf[1300];
+    for (int i = 0; i < 64; ++i) {
+      const int n = recvfrom(sock, buf, sizeof buf, 0, nullptr, nullptr);
+      if (n <= 0) break;
+      ep.receive(reinterpret_cast<const uint8_t*>(buf), (size_t)n, now_ms(), 1);
+    }
+    ep.tick(now_ms());
+    Sleep(1);
+  }
+  ok &= Check(ep.status() == sownet::Status::kConnected, "the test joined the mod's host");
+  ok &= Check(ep.receivedSave() == v2, "and got the newest main save (not the older version, not a slot), whole");
+  ep.close(now_ms());
+  closesocket(sock);
+  return ok;
+}
+
+// The test is the other end, on this PC's non-loopback address. A client child's datagrams are counted: the mod's
+// (SOWN) and the child's own stray one.
+bool PeerClientLive(const Layout& L, const std::wstring& ip, unsigned port) {
+  WSADATA wsa;
+  WSAStartup(MAKEWORD(2, 2), &wsa);
+  SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  sockaddr_in at{};
+  at.sin_family = AF_INET;
+  at.sin_port = htons((u_short)port);
+  inet_pton(AF_INET, Narrow(ip).c_str(), &at.sin_addr);
+  u_long nonblocking = 1;
+  bool ok = Check(sock != INVALID_SOCKET && ioctlsocket(sock, FIONBIO, &nonblocking) == 0 &&
+                      bind(sock, reinterpret_cast<const sockaddr*>(&at), sizeof at) == 0,
+                  "the test listens as the host, on this PC's own address");
+  unsigned sown = 0, stray = 0;
+  for (const ULONGLONG t0 = GetTickCount64(); ok && GetTickCount64() - t0 < 5000;) {
+    char buf[1300];
+    const int n = recvfrom(sock, buf, sizeof buf, 0, nullptr, nullptr);
+    if (n >= 5 && memcmp(buf, "STRAY", 5) == 0) ++stray;
+    else if (n >= 4 && memcmp(buf, "SOWN", 4) == 0) ++sown;
+    if (n <= 0) Sleep(5);
+  }
+  closesocket(sock);
+  WriteText(L.dir + L"\\peer.txt", "sown>0=" + std::to_string(sown > 0) + " stray=" + std::to_string(stray));
+  return ok;
+}
+
+// The test is a client of a host child on this PC's address: the host's reply has to leave through the guard.
+bool PeerHostLive(const Layout& L, const std::wstring& ip, unsigned port) {
+  WSADATA wsa;
+  WSAStartup(MAKEWORD(2, 2), &wsa);
+  SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  sockaddr_in to{};
+  to.sin_family = AF_INET;
+  to.sin_port = htons((u_short)port);
+  inet_pton(AF_INET, Narrow(ip).c_str(), &to.sin_addr);
+  u_long nonblocking = 1;
+  ioctlsocket(sock, FIONBIO, &nonblocking);
+  LARGE_INTEGER f;
+  QueryPerformanceFrequency(&f);
+  auto now_ms = [&]() -> uint64_t {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (uint64_t)(t.QuadPart * 1000 / f.QuadPart);
+  };
+  sownet::Config cfg;
+  cfg.role = sownet::Role::kClient;
+  for (size_t i = 0; i < 32; ++i) cfg.exe_sha[i] = (uint8_t)strtoul(std::string(kGameExeSha256).substr(2 * i, 2).c_str(), nullptr, 16);
+  cfg.mod_build = 8;
+  sownet::Endpoint ep(cfg, [&](const uint8_t* d, size_t n, uint64_t) {
+    sendto(sock, reinterpret_cast<const char*>(d), (int)n, 0, reinterpret_cast<const sockaddr*>(&to), sizeof to);
+  });
+  for (const uint64_t t0 = now_ms(); now_ms() - t0 < 6000 && ep.status() != sownet::Status::kConnected;) {
+    char buf[1300];
+    for (int i = 0; i < 64; ++i) {
+      const int n = recvfrom(sock, buf, sizeof buf, 0, nullptr, nullptr);
+      if (n <= 0) break;
+      ep.receive(reinterpret_cast<const uint8_t*>(buf), (size_t)n, now_ms(), 1);
+    }
+    ep.tick(now_ms());
+    Sleep(1);
+  }
+  WriteText(L.dir + L"\\peer.txt", ep.status() == sownet::Status::kConnected ? "connected=1" : "connected=0");
+  ep.close(now_ms());
+  closesocket(sock);
+  return true;
+}
+
+// A case: the client of a host with `o`; `want_join` says whether the client should end up with the host's save.
+Case JoinCase(const wchar_t* name, unsigned port, unsigned timeout_sec, JoinHostOpts o, const char* fail_log) {
+  const bool want_join = fail_log == nullptr;
+  std::vector<std::pair<std::wstring, std::wstring>> ini = {
+      {L"coop_role", L"client"},
+      {L"coop_host", L"127.0.0.1:" + std::to_wstring(port)},
+      {L"steam_cloud", L"sandbox"},
+      {L"coop_join_timeout_sec", std::to_wstring(timeout_sec)},
+  };
+  const std::string expect_log = fail_log ? fail_log : "";
+  const std::vector<uint8_t> save = JoinSave(kJoinSaveBytes);
+  Case c{name, L"coop_join", want_join ? 0 : kExitCoopJoin, ini, [=](const Layout& L) {
+           const std::wstring cloud = L.Profile(L"steam-userdata\\356190\\remote\\0123abcd_ShadowOfWar.sav");
+           const std::wstring local = L.PSow(L"0123abcd_ShadowOfWar.sav");
+           if (want_join) {
+             std::string r;
+             ReadText(L.dir + L"\\join.txt", &r);
+             return Check(r == "join ok", "the game read exactly the host's save through the cloud calls") &
+                    Check(FileBytesAre(cloud, save), "the host's save is in the sandbox cloud folder, byte for byte") &
+                    Check(FileBytesAre(local, save), "and replaced the local copy") &
+                    Check(LogHas(L, "coop: joined: the host's save (300000 bytes"), "log: joined");
+           }
+           return Check(!Exists(cloud) && !Exists(local), "no save was put in place") &
+                  Check(!Exists(L.dir + L"\\join.txt"), "the game never got a save to read") &
+                  Check(LogHas(L, expect_log.c_str()), "log: the reason is named");
+         }};
+  c.fake_steam = true;
+  c.live = [=](const Layout& L) { return JoinHostLive(L, port, o); };
+  return c;
 }
 
 std::vector<Case> AllCases(const Env& env) {
@@ -2664,6 +3055,11 @@ std::vector<Case> AllCases(const Env& env) {
             }};
   recv.live = RecvLive;
   v.push_back(recv);
+  // The same sender, over the transport: the test is a client, the child the host.
+  Case recv_net = recv;
+  recv_net.name = L"coop_puppet_recv_net";
+  recv_net.live = RecvLiveNet;
+  v.push_back(recv_net);
   auto nobuttons_ini = recv_ini;
   nobuttons_ini.push_back({L"coop_puppet_actions", L"off"});
   nobuttons_ini.push_back({L"coop_puppet_follower", L"off"});
@@ -2714,6 +3110,117 @@ std::vector<Case> AllCases(const Env& env) {
                                    "no world start reported after 4 presses",
                                    "without a world-start line, exactly the 4 presses allowed");
                }});
+  {
+    // Joining: the client's mod takes the host's save before the game reads its own.
+    const unsigned jp = 47600 + (GetCurrentProcessId() % 40) * 10;
+    const std::vector<uint8_t> js = JoinSave(kJoinSaveBytes);
+    JoinHostOpts ok;
+    ok.save = js;
+    v.push_back(JoinCase(L"coop_join_ok", jp, 10, ok, nullptr));
+    JoinHostOpts lossy = ok;
+    lossy.wire = [](std::vector<uint8_t>*, unsigned i) { return (i * 2654435761u >> 7) % 4 != 0; };  // a quarter lost
+    v.push_back(JoinCase(L"coop_join_lossy", jp + 1, 20, lossy, nullptr));
+    JoinHostOpts stall = ok;
+    auto stall_from = std::make_shared<ULONGLONG>(0);
+    stall.wire = [stall_from](std::vector<uint8_t>*, unsigned i) {
+      if (i < 30) return true;
+      if (!*stall_from) *stall_from = GetTickCount64();
+      return GetTickCount64() - *stall_from > 1500;  // the link is dead for 1.5 s in the middle of the download
+    };
+    v.push_back(JoinCase(L"coop_join_stall", jp + 2, 12, stall, nullptr));
+    JoinHostOpts corrupt = ok;
+    corrupt.wire = [](std::vector<uint8_t>* d, unsigned) {
+      // A damaged save with a good datagram checksum (the CRC is recomputed): only the SHA-256 can catch it.
+      size_t at = sownet::kHeaderSize;
+      while (at + 3 <= d->size() - 4) {
+        const uint8_t type = (*d)[at];
+        const size_t len = (*d)[at + 1] | ((*d)[at + 2] << 8);
+        if (at + 3 + len > d->size() - 4) break;
+        if (type == sownet::kSaveChunk && len > 100) {
+          (*d)[at + 3 + len - 1] ^= 0x55;
+          const uint32_t crc = sownet::Crc32(d->data(), d->size() - 4);
+          memcpy(d->data() + d->size() - 4, &crc, 4);
+        }
+        at += 3 + len;
+      }
+      return true;
+    };
+    v.push_back(JoinCase(L"coop_join_corrupt", jp + 3, 8, corrupt, "The host's save could not be received"));
+    JoinHostOpts cut = ok;
+    cut.wire = [](std::vector<uint8_t>*, unsigned i) { return i < 60; };  // the link dies a third of the way in
+    v.push_back(JoinCase(L"coop_join_interrupted", jp + 4, 4, cut, "The host's save did not arrive in time"));
+    Case nohost = JoinCase(L"coop_join_nohost", jp + 5, 2, JoinHostOpts{}, "The host did not answer");
+    nohost.live = nullptr;  // nobody is there
+    v.push_back(nohost);
+    JoinHostOpts nosave;
+    v.push_back(JoinCase(L"coop_join_nosave", jp + 6, 6, nosave, "The host has no save to share"));
+    JoinHostOpts pw = ok;
+    pw.password = "secret";
+    v.push_back(JoinCase(L"coop_join_password", jp + 7, 6, pw, "The co-op password is wrong"));
+    Case offer{L"coop_host_offer", L"", 0,
+               {{L"coop_role", L"host"}, {L"coop_port", std::to_wstring(jp + 8)}, {L"steam_cloud", L"sandbox"}},
+               [=](const Layout& L) {
+                 return Check(LogHas(L, "coop: offering the host's save 0123abcd_ShadowOfWar.sav (52000 bytes)"),
+                              "log: the host offered the newer save") &
+                        Check(!LogHas(L, "0123abcd_1_ShadowOfWar.sav"), "log: the numbered slot was never offered");
+               }};
+    offer.live = [=](const Layout& L) { return HostOfferLive(L, jp + 8); };
+    v.push_back(offer);
+  }
+  {
+    // network=coop_peer: the co-op socket may reach its peer on a real address; nothing else may.
+    std::wstring ip;
+    const unsigned pp = 47600 + (GetCurrentProcessId() % 40) * 10 + 9;
+    if (!LocalIPv4(&ip)) {
+      printf("(this PC has no non-loopback IPv4 address: the coop_peer cases are skipped)\n");
+    } else {
+      const std::wstring hostport = ip + L":" + std::to_wstring(pp);
+      auto client_ini = [&](const wchar_t* mode, unsigned port) {
+        return std::vector<std::pair<std::wstring, std::wstring>>{{L"network", mode}, {L"coop_role", L"client"},
+                                                                  {L"coop_join", L"off"},
+                                                                  {L"coop_host", ip + L":" + std::to_wstring(port)}};
+      };
+      auto host_ini = [&](const wchar_t* mode, unsigned port) {
+        return std::vector<std::pair<std::wstring, std::wstring>>{{L"network", mode}, {L"coop_role", L"host"},
+                                                                  {L"coop_port", std::to_wstring(port)},
+                                                                  {L"coop_bind", ip}};
+      };
+      Case allowed{L"coop_peer_client", L"coop_peer", 0, client_ini(L"coop_peer", pp), [=](const Layout& L) {
+                     std::string r, s;
+                     ReadText(L.dir + L"\\peer.txt", &r);
+                     ReadText(L.dir + L"\\stray.txt", &s);
+                     return Check(r == "sown>0=1 stray=0", "the mod's own socket reached the host's address; the child's own did not") &
+                            Check(s == "stray refused 10051", "the child's own socket got 'network unreachable'") &
+                            Check(LogHas(L, "coop_peer: the co-op socket may send to"),
+                                  "log: the co-op socket was let through");
+                   }};
+      allowed.live = [=](const Layout& L) { return PeerClientLive(L, ip, pp); };
+      v.push_back(allowed);
+      Case offline{L"coop_peer_client_offline", L"coop_peer", 0, client_ini(L"offline", pp + 1), [=](const Layout& L) {
+                     std::string r;
+                     ReadText(L.dir + L"\\peer.txt", &r);
+                     return Check(r == "sown>0=0 stray=0", "network=offline: not even the mod's socket gets out") &
+                            Check(LogHas(L, "offline: sendto to"), "log: the send was refused");
+                   }};
+      offline.live = [=](const Layout& L) { return PeerClientLive(L, ip, pp + 1); };
+      v.push_back(offline);
+      Case host{L"coop_peer_host", L"coop_peer", 0, host_ini(L"coop_peer", pp + 2), [=](const Layout& L) {
+                  std::string r;
+                  ReadText(L.dir + L"\\peer.txt", &r);
+                  return Check(r == "connected=1", "a client on this PC's address joined the host, which answered through the guard") &
+                         Check(LogHas(L, "coop: a client on this network or VPN joins with coop_host="), "log: the host says which address to give a friend");
+                }};
+      host.live = [=](const Layout& L) { return PeerHostLive(L, ip, pp + 2); };
+      v.push_back(host);
+      Case host_off{L"coop_peer_host_offline", L"coop_peer", 0, host_ini(L"offline", pp + 3), [=](const Layout& L) {
+                      std::string r;
+                      ReadText(L.dir + L"\\peer.txt", &r);
+                      return Check(r == "connected=0", "network=offline: the host's answers never leave, nobody joins");
+                    }};
+      host_off.live = [=](const Layout& L) { return PeerHostLive(L, ip, pp + 3); };
+      v.push_back(host_off);
+    }
+  }
   v.push_back({L"forwarders", L"", 0, {}, nullptr});
   v.push_back({L"hash", L"", 0, {}, nullptr});
   return v;
@@ -2776,7 +3283,8 @@ int wmain(int argc, wchar_t** argv) {
           c.name == L"steam_block" || c.name == L"pad_load" ||
           c.name == L"steam_cloud" || c.name == L"probe_pad_save" || c.name == L"coop_loop" ||
           c.name == L"background_run" || c.name == L"coop_puppet" || c.name == L"probe_stacks" ||
-          c.name == L"coop_puppet_walk" || c.name == L"coop_puppet_recv" || c.name == L"coop_puppet_recv_nobuttons")
+          c.name == L"coop_puppet_walk" || c.name == L"coop_puppet_recv" || c.name == L"coop_puppet_recv_nobuttons" ||
+          c.name == L"coop_join_ok" || c.name == L"coop_peer_client")
         picked.push_back(c);
     return RunCases(env, picked, true);
   }

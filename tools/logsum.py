@@ -32,7 +32,7 @@ for l in sess:
         k = 'steam blocked ' + msg.split('blocked ')[1].split('(')[0]
     kinds[k] += 1
     if ('.sav' in msg and '(write)' in msg) or 'FATAL' in msg or 'PROTECTED' in msg or 'WATCH' in msg \
-            or msg.startswith(('offline', 'instance mutex renamed', 'steam: user-stats', 'steam: remote')) \
+            or msg.startswith(('offline', 'steam: user-stats', 'steam: remote')) \
             or ('steam: blocked' in msg and 'FileWrite' not in msg):
         keep.append(f'{t:8.1f}s  {mask(msg)[:200]}')
 print(f'{len(sess)} lines, last at {rel(sess[-1])[0]:.1f}s')

@@ -879,6 +879,22 @@ std::string Handle(const std::string& line) {
       if (v == "off" && !SimRequestBrainHook(g_cfg.brain_site_rva, g_cfg.tree_rva, &r)) return "err " + r + "\n";
       SimSetPuppetAi(v == "on");
       out << "ok puppet ai " << v << "\n";
+    } else if (a == "tp") {
+      float at[3];
+      if (!(in >> at[0] >> at[1] >> at[2])) return "err usage: puppet tp <x> <y> <z> [yaw degrees]\n";
+      float yaw = 0;
+      const bool has_yaw = static_cast<bool>(in >> yaw);
+      float cur[3], rot[4];
+      if (!SimPuppetXform(cur, rot)) return "err no puppet\n";
+      if (has_yaw) {
+        const float h = yaw * 3.14159265f / 360.0f;  // half the angle, in radians
+        rot[0] = 0;
+        rot[1] = sinf(h);
+        rot[2] = 0;
+        rot[3] = cosf(h);
+      }
+      if (!SimRequestPuppetMove(g_cfg.teleport_rva, at, rot, &r)) return "err " + r + "\n";
+      out << "ok queued\n";
     } else if (a == "walk" || a == "idle") {
       float dest[3] = {}, scale = 1.0f;
       int type = 0;
@@ -976,10 +992,10 @@ std::string Handle(const std::string& line) {
       in >> v >> who;
       char* e = nullptr;
       const unsigned long id = strtoul(v.c_str(), &e, 16);
-      if (v.empty() || *e || (!who.empty() && who != "player"))
-        return "err usage: puppet attack <attack id, hex> [player]\n";
+      if (v.empty() || *e || (!who.empty() && who != "player" && who != "at"))
+        return "err usage: puppet attack <attack id, hex> [player | at]\n";
       return SimPuppetAttack(g_cfg.attack_thunk_rva, g_cfg.attack_table_rva, (uint32_t)id,
-                             who == "player" ? g_cfg.gameclient_rva : 0);
+                             who == "player" ? g_cfg.gameclient_rva : 0, who == "at");
     } else if (a == "reset") {
       std::string v;
       in >> v;
@@ -1043,6 +1059,68 @@ std::string Handle(const std::string& line) {
     out << CoopStatus();
   } else if (cmd == "inputs") {
     out << SimInputsReport();
+  } else if (cmd == "enemies") {
+    out << CoopEnemyStatus();
+  } else if (cmd == "adopt") {
+    // Experiment: make a character a proxy (its behavior tree skipped, a follower) / release it; "registry" starts the
+    // enemy registry (needed for the skip).
+    std::string a, b, r;
+    in >> a >> b;
+    if (a == "registry") {
+      if (!SimEnemyRegistryStart(g_cfg.brain_site_rva, g_cfg.tree_rva, &r)) return "err " + r + "\n";
+      return "ok registry on\n";
+    }
+    uintptr_t who = 0;
+    if (!ParseAddr(a, &who) || !who) return "err usage: adopt registry | adopt abs:<character> [off]\n";
+    if (b == "off") {
+      SimProxyDrop(who);
+      return "ok released\n";
+    }
+    return SimProxyAdopt(who) ? "ok adopted\n" : "err not a character with a health object pointing back at it\n";
+  } else if (cmd == "retarget") {
+    std::string a, b;
+    uintptr_t enemy = 0, target = 0;
+    in >> a >> b;
+    if (a == "show") {
+      ParseAddr(b, &enemy);
+      char t[64];
+      snprintf(t, sizeof t, "ok target abs:%llX retargeted=%ld\n", (unsigned long long)SimEnemyTarget(enemy), SimRetargeted());
+      return t;
+    }
+    if (!ParseAddr(a, &enemy) || !enemy || (b != "off" && (!ParseAddr(b, &target) || !target)))
+      return "err usage: retarget abs:<enemy> abs:<target character> | retarget abs:<enemy> off | retarget show abs:<enemy>\n";
+    out << (SimRetarget(enemy, b == "off" ? 0 : target) ? "ok\n" : "err the table is full\n");
+  } else if (cmd == "standinhit") {
+    std::string a, id;
+    uintptr_t who = 0;
+    in >> a >> id;
+    if (!ParseAddr(a, &who) || !who || id.empty()) return "err usage: standinhit abs:<enemy> <attack id, hex>\n";
+    out << CoopTestStandinHit(who, (uint32_t)strtoul(id.c_str(), nullptr, 16));
+  } else if (cmd == "damage") {
+    std::string a, id;
+    uintptr_t who = 0;
+    in >> a >> id;
+    if (!ParseAddr(a, &who) || !who || id.empty()) return "err usage: damage abs:<proxy character> <attack id, hex>\n";
+    out << CoopTestDamage(who, (uint32_t)strtoul(id.c_str(), nullptr, 16));
+  } else if (cmd == "despawn") {
+    if (!g_cfg.write) return "err despawn disabled (probe_write=0)\n";
+    std::string a, r;
+    uintptr_t at = 0;
+    in >> a;
+    if (!ParseAddr(a, &at) || !at) return "err usage: despawn abs:<character>\n";
+    if (!SimDespawnOffscreen(0x1A8BB74, at, &r)) return "err " + r + "\n";
+    out << "ok queued for the simulation thread\n";
+  } else if (cmd == "ambient") {
+    if (!g_cfg.write) return "err ambient disabled (probe_write=0)\n";
+    std::string v, r;
+    in >> v;
+    if (v == "on" || v == "off") {
+      if (!SimAmbientHookInstall(0x166DF8, &r)) return "err " + r + "\n";
+      SimAmbientBlock(v == "on");
+    } else if (!v.empty()) {
+      return "err usage: ambient [on|off]  (on: no new ambient characters)\n";
+    }
+    out << SimAmbientReport();
   } else if (cmd == "graphwatch") {
     if (!g_cfg.write) return "err graphwatch disabled (probe_write=0)\n";
     unsigned ms = 0;
@@ -1153,8 +1231,8 @@ DWORD WINAPI ReadyThread(void*) {
       SowLog(L"probe: ready after %lld ms (%zu hit(s) of the ready pattern, first %S)", g_ready_ms, hits.size(),
              Where(hits[0]).c_str());
       if (g_cfg.hook_debug_print) {
-        if (g_cfg.write) InstallDebugPrintHook();
-        else SowLog(L"probe: hook_debug_print=1 needs probe_write=1, not hooked");
+        if (g_cfg.write || g_cfg.coop) InstallDebugPrintHook();
+        else SowLog(L"probe: hook_debug_print=1 needs probe_write=1 or a coop_role, not hooked");
       }
       return 0;
     }

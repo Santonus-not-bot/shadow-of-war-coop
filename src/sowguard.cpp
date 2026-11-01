@@ -149,7 +149,7 @@ struct Rule {
   std::wstring fromU, suffixU;
 };
 
-enum class NetMode { kAllow, kOffline, kDenySockets };
+enum class NetMode { kAllow, kOffline, kDenySockets, kCoopPeer };
 
 struct State {
   std::wstring profile;
@@ -162,6 +162,8 @@ struct State {
   volatile LONG log_lines = 0;
   volatile LONG read_notes = 0;
   volatile LONG net_notes = 0;
+  volatile uintptr_t peer_sock = 0;  // network=coop_peer: the mod's own socket
+  volatile LONG peer_ip = 0, peer_port = 0, peer_any = 0, peer_notes = 0;
 } g;
 
 thread_local int t_depth = 0;
@@ -529,10 +531,13 @@ constexpr NTSTATUS kStatusNetworkUnreachable = (NTSTATUS)0xC000023CL;  // -> WSA
 enum class Dest { kLoopback, kRemote, kUnknown };
 
 // p points at a sockaddr of len bytes.
-Dest ClassifySockaddr(const uint8_t* p, size_t len, wchar_t* text, size_t text_len) {
+Dest ClassifySockaddr(const uint8_t* p, size_t len, wchar_t* text, size_t text_len, uint32_t* ip = nullptr,
+                      uint16_t* port = nullptr) {
   if (len < 2) return Dest::kUnknown;
   uint16_t family = (uint16_t)(p[0] | p[1] << 8);
   if (family == 2 /* AF_INET */ && len >= 8) {
+    if (ip) memcpy(ip, p + 4, 4);
+    if (port) *port = (uint16_t)(p[2] << 8 | p[3]);
     swprintf_s(text, text_len, L"%u.%u.%u.%u:%u", p[4], p[5], p[6], p[7], p[2] << 8 | p[3]);
     return p[4] == 127 ? Dest::kLoopback : Dest::kRemote;
   }
@@ -551,15 +556,16 @@ Dest ClassifySockaddr(const uint8_t* p, size_t len, wchar_t* text, size_t text_l
 }
 
 // Kept free of C++ objects so __try can guard reads of the caller's buffers.
-Dest AfdDestination(ULONG code, const uint8_t* in, ULONG in_len, wchar_t* text, size_t text_len) {
+Dest AfdDestination(ULONG code, const uint8_t* in, ULONG in_len, wchar_t* text, size_t text_len, uint32_t* ip,
+                    uint16_t* port) {
   __try {
-    if (code == kAfdConnect && in_len > 24) return ClassifySockaddr(in + 24, in_len - 24, text, text_len);
-    if (code == kAfdSuperConnect && in_len > 10) return ClassifySockaddr(in + 10, in_len - 10, text, text_len);
+    if (code == kAfdConnect && in_len > 24) return ClassifySockaddr(in + 24, in_len - 24, text, text_len, ip, port);
+    if (code == kAfdSuperConnect && in_len > 10) return ClassifySockaddr(in + 10, in_len - 10, text, text_len, ip, port);
     if (code == kAfdSendDatagram && in_len >= 104) {
       ULONG addr_len = *reinterpret_cast<const ULONG*>(in + 88);
       const uint8_t* addr = *reinterpret_cast<const uint8_t* const*>(in + 96);
       if (!addr || addr_len < 2 || addr_len > 128) return Dest::kUnknown;
-      return ClassifySockaddr(addr, addr_len, text, text_len);
+      return ClassifySockaddr(addr, addr_len, text, text_len, ip, port);
     }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     swprintf_s(text, text_len, L"unreadable request");
@@ -584,10 +590,21 @@ NTSTATUS NTAPI HkNtDeviceIoControlFile(HANDLE h, HANDLE event, PVOID apc, PVOID 
 #ifndef SOWGUARD_MUTANT
     // Offline: fail every outgoing connect or datagram that is not loopback with
     // "network unreachable", as an unplugged PC would. Sockets themselves still work.
-    if (g.net == NetMode::kOffline && (code == kAfdConnect || code == kAfdSuperConnect || code == kAfdSendDatagram)) {
+    if ((g.net == NetMode::kOffline || g.net == NetMode::kCoopPeer) &&
+        (code == kAfdConnect || code == kAfdSuperConnect || code == kAfdSendDatagram)) {
       wchar_t text[96] = L"?";
-      Dest d = AfdDestination(code, static_cast<const uint8_t*>(in), in_len, text, 96);
-      if (d != Dest::kLoopback) {
+      uint32_t ip = 0;
+      uint16_t port = 0;
+      Dest d = AfdDestination(code, static_cast<const uint8_t*>(in), in_len, text, 96, &ip, &port);
+      // network=coop_peer: the mod's own socket may send to its peer (a client: the host's address; a host: the
+      // address its valid packets came from). No other socket, and no other address for a client, is let through.
+      const bool peer_ok = d == Dest::kRemote && g.net == NetMode::kCoopPeer && ip != 0 && g.peer_sock != 0 &&
+                           (uintptr_t)h == g.peer_sock &&
+                           (g.peer_any || ((uint32_t)g.peer_ip == ip && (uint16_t)g.peer_port == port));
+      if (peer_ok) {
+        if (InterlockedIncrement(&g.net_notes) <= 200 && InterlockedIncrement(&g.peer_notes) <= 3)
+          Log(L"coop_peer: the co-op socket may send to %s", text);
+      } else if (d != Dest::kLoopback) {
         if (InterlockedIncrement(&g.net_notes) <= 200)
           Log(L"offline: %s to %s refused (network unreachable)%s",
               code == kAfdSendDatagram ? L"sendto" : code == kAfdSuperConnect ? L"ConnectEx" : L"connect", text,
@@ -744,6 +761,7 @@ void Init(HMODULE self) {
   if (net.empty() || net == L"offline") g.net = NetMode::kOffline;
   else if (net == L"deny_sockets") g.net = NetMode::kDenySockets;
   else if (net == L"allow") g.net = NetMode::kAllow;
+  else if (net == L"coop_peer") g.net = NetMode::kCoopPeer;
   else Fatal(kExitConfig, L"network must be offline, deny_sockets or allow (got %s)", net.c_str());
   g.net_trace = IniBool(ini, L"net_trace", false);
   const std::wstring exe = ModulePath(nullptr);
@@ -907,6 +925,7 @@ void Init(HMODULE self) {
     pc.wait_sec = (unsigned)GetPrivateProfileIntW(L"sowguard", L"probe_wait_sec", 300, ini.c_str());
     pc.write = IniBool(ini, L"probe_write", false);
     pc.hook_debug_print = IniBool(ini, L"hook_debug_print", false);
+    pc.coop = IniStr(ini, L"coop_role") == L"host" || IniStr(ini, L"coop_role") == L"client";
     // Default: the call site the save editor uses; its call target is the debug print.
     std::wstring dp = IniStr(ini, L"debug_print_pattern");
     if (dp.empty()) dp = L"E8 ? ? ? ? 48 83 C3 10 48 8D 54 24 40 48 89 5C 24 30 48 8D 4C 24 30 E8 ? ? ? ? 84 C0 75 AE";
@@ -940,8 +959,52 @@ void Init(HMODULE self) {
   // Coop over loopback: coop_send=127.0.0.1:<port>, coop_listen=<port>, coop_show=lkp.
   const std::wstring send = IniStr(ini, L"coop_send");
   const unsigned listen = (unsigned)GetPrivateProfileIntW(L"sowguard", L"coop_listen", 0, ini.c_str());
-  if (!send.empty() || listen) {
+  const std::wstring net_role = IniStr(ini, L"coop_role");
+  if (g.net == NetMode::kCoopPeer && net_role.empty()) Fatal(kExitConfig, L"network=coop_peer needs coop_role=host|client");
+  if (!send.empty() || listen || !net_role.empty()) {
     CoopConfig cc;
+    if (!net_role.empty()) {
+      if (net_role != L"host" && net_role != L"client") Fatal(kExitConfig, L"coop_role must be host or client (got %s)", net_role.c_str());
+      if (!send.empty() || listen) Fatal(kExitConfig, L"coop_role replaces coop_send and coop_listen; use one or the other");
+      cc.net_role = net_role == L"host" ? "host" : "client";
+      cc.net_port = (unsigned)GetPrivateProfileIntW(L"sowguard", L"coop_port", 0, ini.c_str());
+      std::string bind_addr;
+      for (wchar_t c : IniStr(ini, L"coop_bind")) bind_addr += (char)c;
+      if (!bind_addr.empty()) cc.net_bind = bind_addr;
+      for (wchar_t c : IniStr(ini, L"coop_host")) cc.net_peer += (char)c;
+      for (wchar_t c : IniStr(ini, L"coop_password")) cc.net_password += (char)c;
+      cc.state_hz = (unsigned)GetPrivateProfileIntW(L"sowguard", L"coop_state_hz", (INT)cc.state_hz, ini.c_str());
+      if (cc.state_hz < 1 || cc.state_hz > 120) Fatal(kExitConfig, L"coop_state_hz must be 1..120");
+      if (cc.net_role == "host" && (cc.net_port == 0 || cc.net_port > 65535)) Fatal(kExitConfig, L"a host needs coop_port 1..65535");
+      if (cc.net_role == "client" && cc.net_peer.empty()) Fatal(kExitConfig, L"a client needs coop_host=<ip>:<port>");
+      if (g.net == NetMode::kCoopPeer && cc.net_role == "host" && bind_addr.empty()) cc.net_bind = "0.0.0.0";
+      cc.exe_sha_hex = kExeSha256;
+      cc.delay_ms = 120;  // the default for a real link; coop_delay_ms below overrides
+      if (cloud == L"sandbox") {
+        cc.save_dir = sg.cloud_dir;
+        cc.save_local_dir = p_local + L"\\Shadow of War";
+      }
+      const std::wstring join = IniStr(ini, L"coop_join");
+      if (join == L"off") cc.join = false;
+      else if (!join.empty() && join != L"on") Fatal(kExitConfig, L"coop_join must be on or off (got %s)", join.c_str());
+      cc.join_timeout_sec = (unsigned)GetPrivateProfileIntW(L"sowguard", L"coop_join_timeout_sec", (INT)cc.join_timeout_sec, ini.c_str());
+      if (cc.join_timeout_sec < 2 || cc.join_timeout_sec > 600) Fatal(kExitConfig, L"coop_join_timeout_sec must be 2..600");
+      if (cc.net_role == "client" && cc.join && cc.save_dir.empty())
+        Fatal(kExitConfig, L"a client plays in the host's save, which needs steam_cloud=sandbox (or coop_join=off)");
+      cc.join_message = !test_mode;
+      const std::wstring enemies = IniStr(ini, L"coop_enemies");
+      if (enemies == L"on") cc.enemies = true;
+      else if (!enemies.empty() && enemies != L"off") Fatal(kExitConfig, L"coop_enemies must be on or off (got %s)", enemies.c_str());
+      const std::wstring travel = IniStr(ini, L"coop_follow_travel");
+      if (travel == L"off") cc.follow_travel = false;
+      else if (!travel.empty() && travel != L"on") Fatal(kExitConfig, L"coop_follow_travel must be on or off (got %s)", travel.c_str());
+      const std::wstring decoy = IniStr(ini, L"coop_decoy");
+      if (decoy == L"on") cc.decoy = true;
+      else if (!decoy.empty() && decoy != L"off") Fatal(kExitConfig, L"coop_decoy must be on or off (got %s)", decoy.c_str());
+      cc.decoy_dy = (float)GetPrivateProfileIntW(L"sowguard", L"coop_decoy_dy", 0, ini.c_str());
+      cc.enemy_radius = (float)GetPrivateProfileIntW(L"sowguard", L"coop_enemy_radius", (INT)cc.enemy_radius, ini.c_str());
+      if (cc.enemy_radius < 500 || cc.enemy_radius > 20000) Fatal(kExitConfig, L"coop_enemy_radius must be 500..20000");
+    }
     if (!send.empty()) {
       const std::wstring host = L"127.0.0.1:";
       if (send.compare(0, host.size(), host) != 0) Fatal(kExitConfig, L"coop_send must be 127.0.0.1:<port> (got %s)", send.c_str());
@@ -1046,6 +1109,13 @@ void Init(HMODULE self) {
   _vsnwprintf_s(msg, _TRUNCATE, fmt, ap);
   va_end(ap);
   Fatal(code, L"%s", msg);
+}
+
+void SowAllowPeerSocket(uintptr_t sock, uint32_t ipv4_net_order, uint16_t port, bool any) {
+  InterlockedExchange(&g.peer_ip, (LONG)ipv4_net_order);
+  InterlockedExchange(&g.peer_port, (LONG)port);
+  InterlockedExchange(&g.peer_any, any ? 1 : 0);
+  g.peer_sock = sock;
 }
 
 void SowLog(const wchar_t* fmt, ...) {
