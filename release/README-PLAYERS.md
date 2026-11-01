@@ -67,8 +67,10 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 ## Known problems
 
 - **Not tried on two PCs.** Only tested on one PC.
-- If the **host dies**, the game's death screen pauses the host's world, so the client's view of enemies stands still
-  until the host continues. If the client dies, the game's own death flow runs on its copy.
+- If the host's game stops (the death screen, a loading screen, its pause menu), the client gets no news from it: after
+  5 seconds the host's enemies disappear from the client's screen, and they come back when the host plays on. (The
+  host's death screen itself was not tried; a stop of the host's game was.) If the client dies, the game's own death
+  flow runs on its copy.
 - The client cannot fast-travel by itself: if it does (or respawns far away), it is taken back to the host about 3 s after it arrives. Captains, Nemesis
   events, fortress sieges and world events are the host's only; the client does not see them as such.
 - Animation: the stand-in has no leap animation (it keeps its position right, the pose is wrong); the client sees no

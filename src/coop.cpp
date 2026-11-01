@@ -581,7 +581,10 @@ volatile LONG g_test_dmg_result = 0;   // 0 none, 1 applied, -1 failed
 volatile LONG g_enemy_dmg_sent = 0, g_enemy_dmg_applied = 0, g_enemy_dmg_failed = 0, g_enemy_dmg_stale = 0;
 volatile LONG g_enemy_hits_unmatched = 0, g_enemy_hits_sent = 0, g_enemy_hits_applied = 0, g_enemy_hits_failed = 0, g_enemy_hits_stale = 0;
 volatile LONG g_enemy_sent = 0, g_enemy_announced = 0, g_enemy_spawned = 0, g_enemy_spawn_failed = 0,
-              g_enemy_despawn_asked = 0;
+              g_enemy_despawn_asked = 0, g_enemy_away = 0;
+// No state from the host for this long: its world is stopped (a death screen, a load, its pause menu), so its
+// enemies' pictures would stand frozen. They are taken away, and shown again where the host's next states put them.
+constexpr ULONGLONG kHostAwayMs = 5000;
 std::string g_enemy_last_error;
 
 void QueueEnemyEvent(const uint8_t* p, size_t n) {
@@ -873,6 +876,29 @@ void EnemyClientFrame() {
     g_enemy_client.onEvent(ev.data(), ev.size(), &gone);
   }
   if (!snap.empty()) g_enemy_client.onSnapshot(snap.data(), snap.size(), snap_ms);
+  bool away = false;
+  EnterCriticalSection(&g_lock);
+  away = g_have && now > g_last_at + kHostAwayMs;
+  LeaveCriticalSection(&g_lock);
+  static bool was_away = false;
+  if (away != was_away) {
+    was_away = away;
+    if (away) {
+      InterlockedIncrement(&g_enemy_away);
+      for (auto& kv : proxies) {
+        sowenemy::Proxy& p = kv.second;
+        FreeProxy(p);
+        p.have = false;  // shown again once the host's states carry it again
+        p.applied_record = 0;
+        p.applied_attack = p.applied_stamp = 0;
+        p.applied_loco = 255;
+        p.shown_set = false;
+      }
+    }
+    SowLog(away ? L"coop: no state from the host for %llu s: its enemies are taken away until it is back"
+                : L"coop: the host is back: its enemies are shown again", (unsigned long long)(kHostAwayMs / 1000));
+  }
+  // (The away check above comes first: the transport reports the host lost after a short silence, and this returns then.)
   if (status != sownet::Status::kConnected && status != sownet::Status::kSyncing) return;
   unsigned spawns_left = 2;
   for (auto& kv : proxies) {
@@ -1662,7 +1688,7 @@ std::string CoopTestDamage(uintptr_t proxy, uint32_t attack_id) {
 }
 
 std::string CoopEnemyStatus() {
-  char b[460];
+  char b[520];
   size_t spawned_now = 0, with_pos = 0;
   if (g_cfg.net_role == "client")
     for (auto& kv : g_enemy_client.proxies()) {
@@ -1671,11 +1697,11 @@ std::string CoopEnemyStatus() {
     }
   snprintf(b, sizeof b,
            "ok enemies=%s role=%s host_known=%zu host_announced=%ld host_snapshots=%ld client_proxies=%zu with_pos=%zu "
-           "standing=%zu spawned=%ld failed=%ld despawn_asked=%ld hits_sent=%ld hits_on_proxies=%ld hits_applied=%ld hits_failed=%ld hits_stale=%ld travels=%ld hits_unmatched=%ld dmg_sent=%ld dmg_applied=%ld dmg_failed=%ld dmg_stale=%ld\n",
+           "standing=%zu spawned=%ld failed=%ld despawn_asked=%ld hits_sent=%ld hits_on_proxies=%ld hits_applied=%ld hits_failed=%ld hits_stale=%ld travels=%ld hits_unmatched=%ld dmg_sent=%ld dmg_applied=%ld dmg_failed=%ld dmg_stale=%ld away=%ld\n",
            g_cfg.enemies ? "on" : "off", g_cfg.net_role.c_str(), g_enemy_host.known(), g_enemy_announced, g_enemy_sent,
            g_cfg.net_role == "client" ? g_enemy_client.proxies().size() : (size_t)0, with_pos, spawned_now, g_enemy_spawned,
            g_enemy_spawn_failed, g_enemy_despawn_asked, g_enemy_hits_sent, SimProxyHits(), g_enemy_hits_applied, g_enemy_hits_failed,
-           g_enemy_hits_stale, g_travels, g_enemy_hits_unmatched, g_enemy_dmg_sent, g_enemy_dmg_applied, g_enemy_dmg_failed, g_enemy_dmg_stale);
+           g_enemy_hits_stale, g_travels, g_enemy_hits_unmatched, g_enemy_dmg_sent, g_enemy_dmg_applied, g_enemy_dmg_failed, g_enemy_dmg_stale, g_enemy_away);
   return b;
 }
 
