@@ -953,6 +953,8 @@ void Init(HMODULE self) {
       pc.teleport_rva = wcstoull(IniStr(ini, L"teleport_rva").c_str(), nullptr, 16);
     if (test_mode && !IniStr(ini, L"anim_var_rva").empty())
       pc.anim_var_rva = wcstoull(IniStr(ini, L"anim_var_rva").c_str(), nullptr, 16);
+    if (test_mode && !IniStr(ini, L"slowmo_rva").empty())
+      pc.slowmo_rva = wcstoull(IniStr(ini, L"slowmo_rva").c_str(), nullptr, 16);
     StartProbe(pc);
   }
 
@@ -995,6 +997,9 @@ void Init(HMODULE self) {
       const std::wstring enemies = IniStr(ini, L"coop_enemies");
       if (enemies == L"on") cc.enemies = true;
       else if (!enemies.empty() && enemies != L"off") Fatal(kExitConfig, L"coop_enemies must be on or off (got %s)", enemies.c_str());
+      const std::wstring slowmo = IniStr(ini, L"coop_slowmo");
+      if (slowmo == L"on") cc.slowmo_off = false;
+      else if (!slowmo.empty() && slowmo != L"off") Fatal(kExitConfig, L"coop_slowmo must be on or off (got %s)", slowmo.c_str());
       const std::wstring travel = IniStr(ini, L"coop_follow_travel");
       if (travel == L"off") cc.follow_travel = false;
       else if (!travel.empty() && travel != L"on") Fatal(kExitConfig, L"coop_follow_travel must be on or off (got %s)", travel.c_str());

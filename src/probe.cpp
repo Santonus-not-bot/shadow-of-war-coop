@@ -1110,6 +1110,22 @@ std::string Handle(const std::string& line) {
     if (!ParseAddr(a, &at) || !at) return "err usage: despawn abs:<character>\n";
     if (!SimDespawnOffscreen(0x1A8BB74, at, &r)) return "err " + r + "\n";
     out << "ok queued for the simulation thread\n";
+  } else if (cmd == "slowmo") {
+    std::string v, r;
+    in >> v;
+    if (v == "off") {
+      if (!g_cfg.write) return "err slowmo off disabled (probe_write=0)\n";
+      if (!SimSlowMoOff(g_cfg.slowmo_rva, &r)) return "err " + r + "\n";
+    } else if (v == "start") {
+      if (!g_cfg.write) return "err slowmo start disabled (probe_write=0)\n";
+      std::string rec;
+      in >> rec;
+      if (!SimSlowMoStart(0x7CE80C, rec, &r)) return "err " + r + "\n";
+      out << "ok queued for the simulation thread\n";
+    } else if (!v.empty()) {
+      return "err usage: slowmo [off | start <record>]\n";
+    }
+    out << SimSlowMoReport(g_cfg.slowmo_rva);
   } else if (cmd == "ambient") {
     if (!g_cfg.write) return "err ambient disabled (probe_write=0)\n";
     std::string v, r;

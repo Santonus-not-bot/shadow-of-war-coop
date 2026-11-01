@@ -1047,12 +1047,19 @@ void PuppetSpawnFrame() {
 }
 
 // The simulation thread, once per frame: send this copy's player, move the puppet.
+bool g_slowmo_requested = false;
+
 void CoopFrame() {
   if ((g_cfg.send_port || !g_cfg.net_role.empty()) && !g_inputs_requested) {
     g_inputs_requested = true;
     std::string e;
     if (!SimAnimInputsInstall(g_cfg.anim_var_rva, g_cfg.gameclient_rva, &e))
       SowLog(L"coop: the player's animation inputs are not sent: %S", e.c_str());
+  }
+  if (!g_cfg.net_role.empty() && g_cfg.slowmo_off && !g_slowmo_requested) {
+    g_slowmo_requested = true;
+    std::string e;
+    if (!SimSlowMoOff(g_cfg.slowmo_rva, &e)) SowLog(L"coop: slow motion stays on: %S", e.c_str());
   }
   if ((g_cfg.send_port && g_send_socket != INVALID_SOCKET) || g_net) SendSample();
   SimApplyRetargets();

@@ -22,6 +22,7 @@ struct ProbeConfig {
   uintptr_t teleport_rva = 0x19B7AC4;      // the game's queued teleport (probe "teleport")
   uintptr_t anim_var_rva = 0x176D78;       // sets a named float animation variable ("puppet mirror")
   uintptr_t attack_thunk_rva = 0x2D6B3C;   // starts an attack ("puppet attack"; bytes checked)
+  uintptr_t slowmo_rva = 0x5CF709;         // the `jne` after slow motion's per-timer test (probe "slowmo off")
   uintptr_t attack_table_rva = 0x27008F8;  // holds the game's attack table
 };
 

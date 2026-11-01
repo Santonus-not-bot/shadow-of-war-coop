@@ -397,6 +397,8 @@ alignas(16) uint8_t g_dp_area[64] = {
 };
 const char* kDpCallSitePattern = "E8 ? ? ? ? D3 B6 57 0B 5E 01 7A";
 volatile uint64_t g_write_target = 0;
+// Slow motion's per-timer test: cmp byte ptr [rsi-4],0 (80 7E FC 00), then the jne (75 42) the mod turns into nops.
+alignas(16) uint8_t g_slowmo_fixture[16] = {0x80, 0x7E, 0xFC, 0x00, 0x75, 0x42, 0x90, 0x90, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
 volatile uint8_t g_channels[4] = {0, 0, 0, 0};  // debug_channels lists [0] and [2]
 
 bool WaitFile(const std::wstring& path, int ms);
@@ -447,9 +449,10 @@ std::string CheckRegisters(void* target) {
 int HookChild(const Layout& L, const std::wstring& name) {
   const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
   char info[128];
-  snprintf(info, sizeof info, "area=%llX write=%llX\n",
+  snprintf(info, sizeof info, "area=%llX write=%llX slowmo=%llX\n",
            (unsigned long long)(reinterpret_cast<uintptr_t>(g_dp_area) - base),
-           (unsigned long long)(reinterpret_cast<uintptr_t>(&g_write_target) - base));
+           (unsigned long long)(reinterpret_cast<uintptr_t>(&g_write_target) - base),
+           (unsigned long long)(reinterpret_cast<uintptr_t>(g_slowmo_fixture + 4) - base));
   WriteText(L.dir + L"\\probe_info.txt", info);
   if (!WaitFile(L.dir + L"\\go", 15000)) return 3;
   using DebugPrint = void (*)(const char*, const char*, ...);
@@ -1723,6 +1726,9 @@ int Child(const std::wstring& name, const std::wstring& dir, const std::wstring&
     swprintf_s(channels, L"%llX,%llX", (unsigned long long)(reinterpret_cast<uintptr_t>(&g_channels[0]) - base),
                (unsigned long long)(reinterpret_cast<uintptr_t>(&g_channels[2]) - base));
     WritePrivateProfileStringW(L"sowguard", L"debug_channels", channels, (dir + L"\\sowguard.ini").c_str());
+    wchar_t sm[32];
+    swprintf_s(sm, L"%llX", (unsigned long long)(reinterpret_cast<uintptr_t>(g_slowmo_fixture + 4) - base));
+    WritePrivateProfileStringW(L"sowguard", L"slowmo_rva", sm, (dir + L"\\sowguard.ini").c_str());
   }
   HMODULE proxy = LoadLibraryW((dir + L"\\bink2w64.dll").c_str());
   if (!proxy) {
@@ -2125,8 +2131,8 @@ bool HookLive(const Layout& L, const std::string& want) {
   ReadText(L.Profile(L"sowprobe.txt"), &name);
   ReadText(L.dir + L"\\probe_info.txt", &info);
   while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) name.pop_back();
-  unsigned long long area = 0, target = 0;
-  sscanf_s(info.c_str(), "area=%llX write=%llX", &area, &target);
+  unsigned long long area = 0, target = 0, slowmo = 0;
+  sscanf_s(info.c_str(), "area=%llX write=%llX slowmo=%llX", &area, &target, &slowmo);
   ProbePipe p;
   ok &= Check(p.Open(std::wstring(name.begin(), name.end())), "connect to the probe pipe");
   if (!ok) return false;
@@ -2158,6 +2164,18 @@ bool HookLive(const Layout& L, const std::string& want) {
     ok &= Check(Starts(r, "ok wrote 8"), "write accepted with probe_write=1");
     snprintf(cmd, sizeof cmd, "read rva:%llX 8", target);
     ok &= Check(p.Ask(cmd).find("41 42 43 44 45 46 47 48\n") != std::string::npos, "write reads back");
+  }
+  // Slow motion off: the jne after the per-timer test becomes two nops; nothing else of the fixture changes.
+  r = p.Ask("slowmo off");
+  if (want == "off") {
+    ok &= Check(Starts(r, "err slowmo off disabled"), "slowmo off refused without probe_write=1");
+  } else {
+    ok &= Check(r.find("patch=off") != std::string::npos, "slowmo off reports the patch");
+    snprintf(cmd, sizeof cmd, "read rva:%llX 8", slowmo - 4);
+    ok &= Check(p.Ask(cmd).find("80 7e fc 00 90 90 90 90\n") != std::string::npos,
+                "the jne is two nops; the bytes around it are unchanged");
+    r = p.Ask("slowmo off");
+    ok &= Check(r.find("patch=off") != std::string::npos, "a second slowmo off is accepted");
   }
   WriteText(L.dir + L"\\go", "");
   ok &= Check(WaitFile(L.dir + L"\\called", 20000), "child made its debug-print calls without crashing");

@@ -176,6 +176,12 @@ bool SimAmbientHookInstall(uintptr_t fn_rva, std::string* err);
 void SimAmbientBlock(bool on);
 std::string SimAmbientReport();
 
+// Slow motion off (see simhook.cpp): the per-timer test's `jne` becomes two nops. A start (the SlowMO.Start console
+// program's call, run on the simulation thread) and a report of the five timers' rates are for tests.
+bool SimSlowMoOff(uintptr_t jne_rva, std::string* err);
+bool SimSlowMoStart(uintptr_t fn_rva, const std::string& record, std::string* err);
+std::string SimSlowMoReport(uintptr_t jne_rva);
+
 bool SimAnimResetHookInstall(uintptr_t reset_rva, std::string* err);
 void SimKeepPuppetAnimOnTeleport(bool on);  // each frame; false: the puppet's resets run
 long SimAnimResetsSkipped();

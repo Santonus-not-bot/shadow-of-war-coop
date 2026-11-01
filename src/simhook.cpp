@@ -857,13 +857,33 @@ void RunDespawn() {
   SowLog(L"sim: abs:%llX told to despawn offscreen", (unsigned long long)g_despawn_char);
 }
 
+// Starts a slow-motion record by name: 7CE80C(const char* record) finds the record (a binary search of the record
+// table by name hash; the SlowMO.Start console program stops there), 5D09E0(this unused, record) sets it as the world
+// UI's slow motion ("SetWorldUISlowMo = ..." in the log). Queued by the probe's "slowmo start", run on the simulation
+// thread.
+volatile LONG g_slowmo_start_pending = 0;
+uintptr_t g_slowmo_start_fn = 0, g_slowmo_set_fn = 0;
+char g_slowmo_start_name[96] = {};
+
+bool SlowMoStartPending() { return g_slowmo_start_pending != 0; }
+
+void RunSlowMoStart() {
+  if (!InterlockedExchange(&g_slowmo_start_pending, 0)) return;
+  using Find_t = void*(__fastcall*)(const char* record);
+  using Set_t = void(__fastcall*)(void* unused, void* record);
+  void* const rec = reinterpret_cast<Find_t>(g_slowmo_start_fn)(g_slowmo_start_name);
+  if (rec) reinterpret_cast<Set_t>(g_slowmo_set_fn)(nullptr, rec);
+  SowLog(L"sim: slow motion record %S %S", g_slowmo_start_name, rec ? "requested (as the world UI's)" : "not found");
+}
+
 bool ExtraPending() {
-  return DespawnPending() || g_brain_state == kBrainQueued || g_walk_pending || g_player_tp_pending || SpawnPending() ||
+  return SlowMoStartPending() || DespawnPending() || g_brain_state == kBrainQueued || g_walk_pending || g_player_tp_pending || SpawnPending() ||
          AnimResPending() || TracePending() || HoldPending() || AttackPending() || PlayPending() ||
          MovePending();
 }
 
 void RunExtra() {
+  if (SlowMoStartPending()) RunSlowMoStart();
   if (DespawnPending()) RunDespawn();
   if (g_brain_state == kBrainQueued) InstallBrainNow();
   if (g_walk_pending) RunQueuedWalk();
@@ -2511,6 +2531,73 @@ std::string SimAmbientReport() {
   std::ostringstream out;
   out << "ok ambient hook=" << (g_ambient_hook ? "in" : "off") << " block=" << (g_ambient_block ? "on" : "off")
       << " rejected=" << g_ambient_rejected << "\n";
+  return out.str();
+}
+
+// Slow motion (SlowMoUtil): every slow-motion record runs as an instance whose per-frame update (5CF6C4) walks five
+// timers (player, simulation, ...). For a timer whose "wanted" byte ([slot-4]) is set it applies the record's scale
+// (5CF8CC, then 5CF834); for one whose byte is clear it sets the timer back to 1/1. The `jne` after that byte test
+// (75 42 at 5CF709) is the whole difference: with it turned into two nops every timer is set to 1/1 each frame, so no
+// record slows anything, and nothing else (the timers' other users, the records, their sounds) is touched.
+bool SimSlowMoOff(uintptr_t jne_rva, std::string* err) {
+  uint8_t* const at = const_cast<uint8_t*>(Base()) + jne_rva;
+  if (Head(at, "9090") && Head(at - 4, "807EFC00")) return true;  // already off
+  if (!Head(at - 4, "807EFC00" "7542")) {
+    *err = "slow motion's per-timer test differs from the known build; refused";
+    return false;
+  }
+  DWORD old = 0;
+  if (!VirtualProtect(at, 2, PAGE_EXECUTE_READWRITE, &old)) {
+    *err = "cannot make the game's code writable";
+    return false;
+  }
+#ifndef SOWGUARD_MUTANT  // negative control: slow motion still runs
+  const uint16_t nops = 0x9090;
+  InterlockedExchange16(reinterpret_cast<volatile SHORT*>(at), (SHORT)nops);
+#endif
+  FlushInstructionCache(GetCurrentProcess(), at, 2);
+  VirtualProtect(at, 2, old, &old);
+  SowLog(L"sim: slow motion is off (rva:%llX)", (unsigned long long)jne_rva);
+  return true;
+}
+
+bool SimSlowMoStart(uintptr_t fn_rva, const std::string& record, std::string* err) {
+  const uint8_t* f = Base() + fn_rva;
+  if (!Head(f, "4883EC284533C0E8")) {
+    *err = "the slow-motion start's bytes differ from the known build; refused";
+    return false;
+  }
+  if (record.empty() || record.size() >= sizeof g_slowmo_start_name) {
+    *err = "bad record name";
+    return false;
+  }
+  memcpy(g_slowmo_start_name, record.c_str(), record.size() + 1);
+  g_slowmo_start_fn = reinterpret_cast<uintptr_t>(f);
+  g_slowmo_set_fn = reinterpret_cast<uintptr_t>(Base() + 0x5D09E0);
+  if (!Head(Base() + 0x5D09E0, "48895C240848897424105748" "83EC20")) {
+    *err = "the world UI slow motion setter's bytes differ from the known build; refused";
+    return false;
+  }
+  InterlockedExchange(&g_slowmo_start_pending, 1);
+  return true;
+}
+
+// The five timers' rates: scale (num/den) of the rate object each timer points to.
+std::string SimSlowMoReport(uintptr_t jne_rva) {
+  static const uintptr_t kGlobals[5] = {0x2702598, 0x2702548, 0x2702570, 0x2702558, 0x2702578};
+  std::ostringstream out;
+  out << "ok timers";
+  for (int i = 0; i < 5; ++i) {
+    uintptr_t timer = 0, rate = 0;
+    float ratio = 0;
+    if (ReadQ(reinterpret_cast<uintptr_t>(Base()) + kGlobals[i], &timer) && timer && ReadQ(timer + 8, &rate) && rate &&
+        ReadFloats(rate + 0x30, &ratio, 1))
+      out << " " << i << "=" << ratio;
+    else
+      out << " " << i << "=?";
+  }
+  const uint8_t* const at = Base() + jne_rva;
+  out << " patch=" << (Head(at, "9090") ? "off" : Head(at, "7542") ? "slow-motion-on" : "unknown") << "\n";
   return out.str();
 }
 

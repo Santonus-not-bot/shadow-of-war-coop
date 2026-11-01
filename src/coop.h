@@ -25,6 +25,8 @@ struct CoopConfig {
   // Stage 2 (STAGE2-DESIGN.md): the host's enemies shown on the client as proxies. coop_enemies=on|off.
   bool enemies = false;
   float enemy_radius = 3500.0f;        // coop_enemy_radius: enemies within this of either player are shared
+  bool slowmo_off = true;              // coop_slowmo=on keeps the game's slow motion; by default co-op has none (a role is set)
+  uintptr_t slowmo_rva = 0x5CF709;     // the `jne` after slow motion's per-timer test
   bool follow_travel = true;           // coop_follow_travel=off: a client does not follow the host's long jumps (fast travel)
   bool decoy = false;                  // coop_decoy=on: enemies attack an invisible-ish ally where the stand-in stands
   float decoy_dy = 0.0f;               // coop_decoy_dy: its height above the stand-in

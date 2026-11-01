@@ -61,12 +61,12 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 - The client's strikes hurt the host's enemies (kills included); enemies' swings that reach the client hurt it, and
   enemies turn on the client through an invisible ally the host keeps at the client's place.
 - Fast travel by the host takes the client along.
+- The game's slow motion (combat finishers, wraith aiming, domination scenes) is switched off on both sides, so neither player slows the other's world.
 - A client that quits or crashes can rejoin; the host forgets a lost client after a minute.
 
 ## Known problems
 
 - **Not tried on two PCs.** Only tested on one PC.
-- Slow motion is not switched off yet (it is meant to be off in co-op).
 - If the **host dies**, the game's death screen pauses the host's world, so the client's view of enemies stands still
   until the host continues. If the client dies, the game's own death flow runs on its copy.
 - The client cannot fast-travel by itself (it would end up away from the host; use the host's). Captains, Nemesis
@@ -93,7 +93,7 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 ## Settings (`sowguard.ini`, written by `setup-copy.ps1`)
 
 `coop_role=host|client`, `coop_port` (host, default 47011), `coop_host=<address>:<port>` (client), `coop_password`,
-`coop_enemies=on|off`, `coop_decoy=on|off` (host), `coop_follow_travel=on|off` (client), `coop_enemy_radius`
+`coop_enemies=on|off`, `coop_decoy=on|off` (host), `coop_follow_travel=on|off` (client), `coop_slowmo=on` (keeps the game's slow motion; off by default in co-op), `coop_enemy_radius`
 (default 3500), `coop_join=off`, `coop_join_timeout_sec` (default 20), `autoload_max_presses` (how many times the mod
 presses Continue for you at the menus; 0: none, you click). The full list is in `README.md`.
 
