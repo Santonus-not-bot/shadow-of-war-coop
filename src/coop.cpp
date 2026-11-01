@@ -1008,6 +1008,30 @@ void TravelFrame() {
       }
     }
   }
+  // This player's own long jump (the game's fast travel, a respawn) is not the host's: after the load it is taken back
+  // to the host, so only the host's travel moves both ("the host decides"). The player's own teleport below is not one.
+  static float prev[3] = {};
+  static bool have_prev = false;
+  static ULONGLONG ignore_until = 0;
+  {
+    Packet me{};
+    if (ReadPlayer(&me) && (me.pos[0] != 0.0f || me.pos[2] != 0.0f)) {
+      const ULONGLONG now = GetTickCount64();
+      const float dx = me.pos[0] - prev[0], dy = me.pos[1] - prev[1], dz = me.pos[2] - prev[2];
+      if (have_prev && now >= ignore_until && std::sqrt(dx * dx + dy * dy + dz * dz) > kTravelJump) {
+        EnterCriticalSection(&g_lock);
+        if (!g_travel_due && g_have && (g_last.flags & 1)) {
+          memcpy(g_travel_to, g_last.pos, sizeof g_travel_to);
+          g_travel_at = now + 3000;
+          g_travel_due = true;
+          SowLog(L"coop: this player travelled alone (%.0f units); back to the host in 3 s", std::sqrt(dx * dx + dy * dy + dz * dz));
+        }
+        LeaveCriticalSection(&g_lock);
+      }
+      memcpy(prev, me.pos, sizeof prev);
+      have_prev = true;
+    }
+  }
   EnterCriticalSection(&g_lock);
   if (g_travel_due && GetTickCount64() >= g_travel_at) {
     due = true;
@@ -1019,8 +1043,9 @@ void TravelFrame() {
   to[0] += 100.0f;
   std::string e;
   if (SimRequestPlayerTeleport(g_cfg.teleport_rva, g_cfg.gameclient_rva, to, &e)) {
+    ignore_until = GetTickCount64() + 5000;
     InterlockedIncrement(&g_travels);
-    SowLog(L"coop: the host travelled: this player goes to %.0f,%.0f,%.0f", to[0], to[1], to[2]);
+    SowLog(L"coop: this player is taken to the host at %.0f,%.0f,%.0f", to[0], to[1], to[2]);
   } else {
     SowLog(L"coop: cannot follow the host's travel: %S", e.c_str());
   }

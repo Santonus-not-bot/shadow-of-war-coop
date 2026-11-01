@@ -48,7 +48,7 @@ network, never yet between two PCs over a real network. Read "What works" and "K
    version, the host has no save yet, the transfer was damaged or too slow).
 3. Both play in the same world. A client that starts far from where the host is now is taken next to the host once it is in the world; the host's enemies appear on the
    client; the client's strikes hurt them; they hit back.
-4. When the host fast-travels (or respawns), the client follows within a couple of seconds.
+4. When the host fast-travels (or respawns), the client follows within a couple of seconds. A client that fast-travels (or respawns) alone is taken back to the host a few seconds after it arrives.
 
 To stop, quit the game normally. To remove everything, delete the copy folder (`E:\SoWCoop`).
 
@@ -69,7 +69,7 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 - **Not tried on two PCs.** Only tested on one PC.
 - If the **host dies**, the game's death screen pauses the host's world, so the client's view of enemies stands still
   until the host continues. If the client dies, the game's own death flow runs on its copy.
-- The client cannot fast-travel by itself (it would end up away from the host; use the host's). Captains, Nemesis
+- The client cannot fast-travel by itself: if it does (or respawns far away), it is taken back to the host about 3 s after it arrives. Captains, Nemesis
   events, fortress sieges and world events are the host's only; the client does not see them as such.
 - Animation: the stand-in has no leap animation (it keeps its position right, the pose is wrong); the client sees no
   hit reaction on an enemy until the host's enemy reacts (about a tenth of a second).
