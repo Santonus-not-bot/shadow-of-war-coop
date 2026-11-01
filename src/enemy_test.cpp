@@ -24,6 +24,16 @@ static Seen Orc(uintptr_t key, float x, float z, const char* type = "Orc_Infantr
   return s;
 }
 
+
+static bool ClientTrackerAcceptsNemesis() {
+  ClientTracker c;
+  NemesisMsg n{};
+  strcpy_s(n.event, "Promote");
+  const std::vector<uint8_t> ev = NemesisEvent(n);
+  std::vector<uint32_t> gone;
+  return c.onEvent(ev.data(), ev.size(), &gone) || !c.proxies().empty();
+}
+
 static const Snapshot* AsSnap(const std::vector<uint8_t>& v) { return reinterpret_cast<const Snapshot*>(v.data()); }
 
 int main() {
@@ -166,6 +176,42 @@ int main() {
     Check(h.idOf(0xAAAA) == id1 && h.idOf(0xBBBB) == 0 && h.idOf(0x1) == 0, "the host finds the id of an announced character, 0 for any other");
     const std::vector<uint8_t> zero = HitEvent(0, 1, pos);
     Check(!ParseHit(zero.data(), zero.size(), &m), "enemy id 0 is refused");
+  }
+
+  {
+    printf("\n  Nemesis events (host to client)\n");
+    NemesisMsg n{};
+    for (int i = 0; i < 16; ++i) n.subj[i] = (uint8_t)(0x10 + i), n.other[i] = (uint8_t)(0x30 + i);
+    n.event_hash = 0xABCD1234u;
+    n.region_hash = 0x7927EEB6u;
+    n.flags[0] = 1;
+    n.flags[1] = 0;
+    strcpy_s(n.event, "Promote");
+    strcpy_s(n.subj_name, "Kruk");
+    strcpy_s(n.other_name, "Pushkrimp");
+    const std::vector<uint8_t> ev = NemesisEvent(n);
+    NemesisMsg back{};
+    Check(ev.size() == sizeof(NemesisMsg) && ev[0] == kOpNemesis && ParseNemesis(ev.data(), ev.size(), &back), "a Nemesis event is one fixed-size message that reads back");
+    Check(memcmp(back.subj, n.subj, 16) == 0 && memcmp(back.other, n.other, 16) == 0 && back.event_hash == n.event_hash &&
+              back.region_hash == n.region_hash && back.flags[0] == 1 && strcmp(back.event, "Promote") == 0 &&
+              strcmp(back.subj_name, "Kruk") == 0 && strcmp(back.other_name, "Pushkrimp") == 0,
+          "with both references, the event and region hashes, the flags and the names intact");
+    Check(!ParseNemesis(ev.data(), ev.size() - 1, &back) && !ParseNemesis(ev.data(), ev.size() + 1, &back), "a message of another size is refused");
+    std::vector<uint8_t> wrong = ev;
+    wrong[0] = kOpHit;
+    Check(!ParseNemesis(wrong.data(), wrong.size(), &back), "so is one with another op");
+    NemesisMsg unnamed = n;
+    unnamed.event[0] = 0;
+    const std::vector<uint8_t> noname = NemesisEvent(unnamed);
+    Check(!ParseNemesis(noname.data(), noname.size(), &back), "and one without an event name");
+    NemesisMsg longname = n;
+    memset(longname.event, 'x', sizeof longname.event);
+    const std::vector<uint8_t> ln = NemesisEvent(longname);
+    Check(ParseNemesis(ln.data(), ln.size(), &back) && strlen(back.event) == sizeof back.event - 1, "a name without its end is cut, not read past");
+    Check(!NemesisShared("FactionMember_RoleSelected_Standard") && !NemesisShared("DEBUG_AddPIS") && !NemesisShared("IsPlayerFollowerApply") &&
+              NemesisShared("Promote") && NemesisShared("ActiveGeneric_Death"),
+          "the events a world load fires are not shared; promotions and deaths are");
+    Check(!ClientTrackerAcceptsNemesis(), "a Nemesis message is not an enemy message (the enemy tracker ignores it)");
   }
 
   printf("\nRESULT: %s (%d of %d checks passed)\n", g_bad == 0 ? "PASS" : "FAIL", g_ok, g_ok + g_bad);

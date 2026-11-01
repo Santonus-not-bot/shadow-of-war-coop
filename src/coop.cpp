@@ -585,10 +585,11 @@ volatile LONG g_enemy_sent = 0, g_enemy_announced = 0, g_enemy_spawned = 0, g_en
 // No state from the host for this long: its world is stopped (a death screen, a load, its pause menu), so its
 // enemies' pictures would stand frozen. They are taken away, and shown again where the host's next states put them.
 constexpr ULONGLONG kHostAwayMs = 5000;
+volatile LONG g_nemesis_sent = 0, g_nemesis_got = 0, g_nemesis_skipped = 0;
 std::string g_enemy_last_error;
 
 void QueueEnemyEvent(const uint8_t* p, size_t n) {
-  if (n < 5 || n > 64) return;
+  if (n < 5 || n > 200) return;
   EnterCriticalSection(&g_lock);
   if (g_enemy_events_in.size() < 4096) g_enemy_events_in.emplace_back(p, p + n);
   LeaveCriticalSection(&g_lock);
@@ -700,6 +701,93 @@ void EnemyHostDamage() {
     LeaveCriticalSection(&g_net_lock);
   }
   if (pending.size() > 64) pending.clear();
+}
+
+// ---- Nemesis events ------------------------------------------------------------------------------------------
+// Both roles record the events their game applies (SimFactionHookInstall). The host sends each one that is not load
+// noise; the client counts the host's (EnemyClientFrame hands them to NemesisGot) and its own.
+
+std::vector<std::vector<uint8_t>> g_nemesis_out;  // host: kept until the transport can take them
+
+volatile LONG g_nemesis_applied = 0, g_nemesis_failed = 0;
+
+void NemesisGot(const sowenemy::NemesisMsg& m) {
+  InterlockedIncrement(&g_nemesis_got);
+  if (!g_cfg.nemesis_follow) {
+    if (g_nemesis_got <= 20) SowLog(L"coop: Nemesis event from the host: %S (subject %S, other %S)", m.event, m.subj_name, m.other_name);
+    return;
+  }
+  SimFactionEvent e{};
+  memcpy(e.subj, m.subj, 16);
+  memcpy(e.other, m.other, 16);
+  e.event_hash = m.event_hash;
+  e.region_hash = m.region_hash;
+  memcpy(e.flags, m.flags, 2);
+  std::string err;
+  if (SimFactionReplay(g_cfg.faction_event_rva, e, &err)) {
+    if (InterlockedIncrement(&g_nemesis_applied) <= 20)
+      SowLog(L"coop: Nemesis event from the host applied here: %S (subject %S, other %S)", m.event, m.subj_name, m.other_name);
+  } else if (InterlockedIncrement(&g_nemesis_failed) <= 20) {
+    SowLog(L"coop: Nemesis event from the host not applied: %S (subject %S): %S", m.event, m.subj_name, err.c_str());
+  }
+}
+
+void NemesisFrame() {
+  static bool installed = false;
+  if (!installed) {
+    installed = true;
+    std::string e;
+    if (!SimFactionHookInstall(g_cfg.faction_event_rva, g_cfg.faction_lookup_rva, &e)) SowLog(L"coop: Nemesis events are not recorded: %S", e.c_str());
+    else SowLog(L"coop: the Nemesis events this game applies are recorded");
+    if (g_cfg.net_role == "client" && g_cfg.nemesis_follow) {
+      SimFactionDrop(true);
+      SimFactionPrime();
+      SowLog(L"coop: this client's own Nemesis events are dropped; the host's are applied");
+    }
+    if (g_cfg.net_role == "client") {
+      if (!SimAmbushEnable(g_cfg.ambush_flag_rva, false, &e)) SowLog(L"coop: this client's own ambushes stay on: %S", e.c_str());
+      else SowLog(L"coop: this client's own ambushes are off (the host's show up as its enemies)");
+    }
+  }
+  static sownet::Status status = sownet::Status::kIdle;
+  if (TryEnterCriticalSection(&g_net_lock)) {  // never wait for it: see SendSample
+    status = g_net->status();
+    LeaveCriticalSection(&g_net_lock);
+  }
+  SimFactionEvent ev[64];
+  const size_t n = SimFactionTake(ev, 64);
+  if (g_cfg.net_role != "host") return;
+  for (size_t i = 0; i < n; ++i) {
+    if (status != sownet::Status::kConnected) continue;
+    if (!sowenemy::NemesisShared(ev[i].event)) {
+      InterlockedIncrement(&g_nemesis_skipped);
+      continue;
+    }
+    sowenemy::NemesisMsg m{};
+    memcpy(m.subj, ev[i].subj, 16);
+    memcpy(m.other, ev[i].other, 16);
+    m.event_hash = ev[i].event_hash;
+    m.region_hash = ev[i].region_hash;
+    memcpy(m.flags, ev[i].flags, 2);
+    memcpy(m.event, ev[i].event, sizeof m.event);
+    memcpy(m.subj_name, ev[i].subj_name, sizeof m.subj_name);
+    memcpy(m.other_name, ev[i].other_name, sizeof m.other_name);
+    g_nemesis_out.push_back(sowenemy::NemesisEvent(m));
+    static int raw_logged = 0;
+    if (raw_logged < 6) {
+      ++raw_logged;
+      char hex[0x60 * 2 + 1];
+      for (size_t k = 0; k < 0x60; ++k) snprintf(hex + 2 * k, 3, "%02X", ev[i].raw[k]);
+      SowLog(L"coop: Nemesis event %S raw %S", ev[i].event, hex);
+    }
+  }
+  if (!g_nemesis_out.empty() && TryEnterCriticalSection(&g_net_lock)) {
+    for (const auto& msg : g_nemesis_out) g_net->sendEvent(msg.data(), msg.size());
+    InterlockedAdd(&g_nemesis_sent, (LONG)g_nemesis_out.size());
+    g_nemesis_out.clear();
+    LeaveCriticalSection(&g_net_lock);
+  }
+  if (g_nemesis_out.size() > 256) g_nemesis_out.clear();
 }
 
 void EnemyHostFrame() {
@@ -853,6 +941,11 @@ void EnemyClientFrame() {
   LeaveCriticalSection(&g_lock);
   std::vector<uint32_t> gone;
   for (const auto& ev : events) {
+    sowenemy::NemesisMsg nm;
+    if (sowenemy::ParseNemesis(ev.data(), ev.size(), &nm)) {
+      NemesisGot(nm);
+      continue;
+    }
     sowenemy::HitMsg dm;
     if (sowenemy::ParseDamage(ev.data(), ev.size(), &dm)) {
       auto it = proxies.find(dm.id);
@@ -1116,6 +1209,7 @@ void CoopFrame() {
   SimApplyRetargets();
   if (g_cfg.net_role == "client" && g_cfg.follow_travel) TravelFrame();
   if (g_cfg.puppet && !g_cfg.spawn_type.empty()) PuppetSpawnFrame();
+  if (g_cfg.nemesis && g_net && (g_cfg.net_role == "host" || g_cfg.net_role == "client")) NemesisFrame();
   if (g_cfg.enemies && g_net) EnemyFrame();
   if (!g_cfg.puppet) return;
   if (!g_cfg.puppet_ai && !g_ai_requested) {
@@ -1688,7 +1782,7 @@ std::string CoopTestDamage(uintptr_t proxy, uint32_t attack_id) {
 }
 
 std::string CoopEnemyStatus() {
-  char b[520];
+  char b[600];
   size_t spawned_now = 0, with_pos = 0;
   if (g_cfg.net_role == "client")
     for (auto& kv : g_enemy_client.proxies()) {
@@ -1697,11 +1791,11 @@ std::string CoopEnemyStatus() {
     }
   snprintf(b, sizeof b,
            "ok enemies=%s role=%s host_known=%zu host_announced=%ld host_snapshots=%ld client_proxies=%zu with_pos=%zu "
-           "standing=%zu spawned=%ld failed=%ld despawn_asked=%ld hits_sent=%ld hits_on_proxies=%ld hits_applied=%ld hits_failed=%ld hits_stale=%ld travels=%ld hits_unmatched=%ld dmg_sent=%ld dmg_applied=%ld dmg_failed=%ld dmg_stale=%ld away=%ld\n",
+           "standing=%zu spawned=%ld failed=%ld despawn_asked=%ld hits_sent=%ld hits_on_proxies=%ld hits_applied=%ld hits_failed=%ld hits_stale=%ld travels=%ld hits_unmatched=%ld dmg_sent=%ld dmg_applied=%ld dmg_failed=%ld dmg_stale=%ld away=%ld nemesis_sent=%ld nemesis_got=%ld nemesis_skipped=%ld nemesis_applied=%ld nemesis_failed=%ld\n",
            g_cfg.enemies ? "on" : "off", g_cfg.net_role.c_str(), g_enemy_host.known(), g_enemy_announced, g_enemy_sent,
            g_cfg.net_role == "client" ? g_enemy_client.proxies().size() : (size_t)0, with_pos, spawned_now, g_enemy_spawned,
            g_enemy_spawn_failed, g_enemy_despawn_asked, g_enemy_hits_sent, SimProxyHits(), g_enemy_hits_applied, g_enemy_hits_failed,
-           g_enemy_hits_stale, g_travels, g_enemy_hits_unmatched, g_enemy_dmg_sent, g_enemy_dmg_applied, g_enemy_dmg_failed, g_enemy_dmg_stale, g_enemy_away);
+           g_enemy_hits_stale, g_travels, g_enemy_hits_unmatched, g_enemy_dmg_sent, g_enemy_dmg_applied, g_enemy_dmg_failed, g_enemy_dmg_stale, g_enemy_away, g_nemesis_sent, g_nemesis_got, g_nemesis_skipped, g_nemesis_applied, g_nemesis_failed);
   return b;
 }
 

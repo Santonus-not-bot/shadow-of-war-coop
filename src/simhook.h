@@ -174,7 +174,31 @@ bool SimDespawnNow(uintptr_t fn_rva, uintptr_t character);
 bool SimDespawnOffscreen(uintptr_t fn_rva, uintptr_t character, std::string* err);
 bool SimAmbientHookInstall(uintptr_t fn_rva, std::string* err);
 void SimAmbientBlock(bool on);
+bool SimAmbushEnable(uintptr_t flag_rva, bool on, std::string* err);
 std::string SimAmbientReport();
+
+// Nemesis events (HandleFactionEventAction): a stub on the handler's entry records every event the game applies
+// (the two member references, the event record's name, the members' names, the raw action) and, in drop mode,
+// does not let it run. SimFactionTake hands the recorded ones out in order.
+struct SimFactionEvent {
+  uint8_t subj[16], other[16];  // portable references: {faction record hash u32, 0, member id u32, extra u32}
+  uint32_t event_hash;          // the event record's name hash
+  uint32_t region_hash;         // the region (faction) object the handler ran on: its record's name hash
+  uint8_t flags[2];
+  char event[48], subj_name[40], other_name[40];
+  uint8_t raw[0x60];
+};
+bool SimFactionHookInstall(uintptr_t handler_rva, uintptr_t lookup_rva, std::string* err);
+// The name of the member a reference (16 bytes, as the game holds it) stands for in THIS copy (false: none).
+bool SimFactionResolve(const uint8_t ref[16], char name[40]);
+// The client: runs a host's event on this copy's Nemesis world (the handler called by hand, the records found again by
+// hash); false with err when a record or the manager is not known here.
+// The client: finds its region objects (once; a scan of the heap), so a replay does not wait for one of its own events.
+void SimFactionPrime();
+bool SimFactionReplay(uintptr_t handler_rva, const SimFactionEvent& e, std::string* err);
+void SimFactionDrop(bool on);  // on: the game's own events do not run (the client takes the host's)
+size_t SimFactionTake(SimFactionEvent* out, size_t max);
+std::string SimFactionReport();
 
 // Slow motion off (see simhook.cpp): the per-timer test's `jne` becomes two nops. A start (the SlowMO.Start console
 // program's call, run on the simulation thread) and a report of the five timers' rates are for tests.

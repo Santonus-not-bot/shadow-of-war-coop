@@ -27,12 +27,17 @@ struct CoopConfig {
   float enemy_radius = 3500.0f;        // coop_enemy_radius: enemies within this of either player are shared
   bool slowmo_off = true;              // coop_slowmo=on keeps the game's slow motion; by default co-op has none (a role is set)
   uintptr_t slowmo_rva = 0x5CF709;     // the `jne` after slow motion's per-timer test
+  bool nemesis = true;                 // coop_nemesis=off: the host's Nemesis events are not recorded or sent
+  bool nemesis_follow = true;          // a client runs the host's Nemesis events and drops its own; coop_nemesis=share only records
   bool follow_travel = true;           // coop_follow_travel=off: a client does not follow the host's long jumps (fast travel)
   bool decoy = false;                  // coop_decoy=on: enemies attack an invisible-ish ally where the stand-in stands
   float decoy_dy = 0.0f;               // coop_decoy_dy: its height above the stand-in
   bool enemy_direct = true;            // proxies are placed by writing their transform (not the game's teleport)
   uintptr_t play_rva = 0x664CA4;       // starts a named graph action
   uintptr_t despawn_rva = 0x1A8BB74;   // "AI told to despawn offscreen"
+  uintptr_t faction_event_rva = 0x40C304;  // HandleFactionEventAction
+  uintptr_t faction_lookup_rva = 0x18DDCC; // a member reference's FactionMember
+  uintptr_t ambush_flag_rva = 0x267D598;  // Faction.Ambush.Enable
   uintptr_t ambient_rva = 0x166DF8;    // the ambient spawn test
   unsigned send_port = 0;    // coop_send=127.0.0.1:<port>: send this copy's player (loopback only)
   unsigned listen_port = 0;  // coop_listen=<port>: receive the other copy's player

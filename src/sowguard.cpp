@@ -1000,6 +1000,10 @@ void Init(HMODULE self) {
       const std::wstring slowmo = IniStr(ini, L"coop_slowmo");
       if (slowmo == L"on") cc.slowmo_off = false;
       else if (!slowmo.empty() && slowmo != L"off") Fatal(kExitConfig, L"coop_slowmo must be on or off (got %s)", slowmo.c_str());
+      const std::wstring nem = IniStr(ini, L"coop_nemesis");
+      if (nem == L"off") cc.nemesis = false;
+      else if (nem == L"share") cc.nemesis_follow = false;
+      else if (!nem.empty() && nem != L"on" && nem != L"follow") Fatal(kExitConfig, L"coop_nemesis must be off, share or follow (got %s)", nem.c_str());
       const std::wstring travel = IniStr(ini, L"coop_follow_travel");
       if (travel == L"off") cc.follow_travel = false;
       else if (!travel.empty() && travel != L"on") Fatal(kExitConfig, L"coop_follow_travel must be on or off (got %s)", travel.c_str());

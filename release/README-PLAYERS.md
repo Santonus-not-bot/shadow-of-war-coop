@@ -61,6 +61,9 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 - The client's strikes hurt the host's enemies (kills included); enemies' swings that reach the client hurt it, and
   enemies turn on the client through an invisible ally the host keeps at the client's place.
 - Fast travel by the host takes the client along.
+- The host's Nemesis events (captains threatening, duelling, dying, being promoted; the player's kills and deaths and the
+  promotions they cause) are sent to the client, whose game runs the same events on its own Nemesis world, so the two
+  worlds keep the same captains in the same places. The client's own Nemesis events and ambushes are off.
 - The game's slow motion (combat finishers, wraith aiming, domination scenes) is switched off on both sides, so neither player slows the other's world.
 - A client that quits or crashes can rejoin; the host forgets a lost client after a minute.
 
@@ -71,8 +74,10 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
   5 seconds the host's enemies disappear from the client's screen, and they come back when the host plays on. (The
   host's death screen itself was not tried; a stop of the host's game was.) If the client dies, the game's own death
   flow runs on its copy.
-- The client cannot fast-travel by itself: if it does (or respawns far away), it is taken back to the host about 3 s after it arrives. Captains, Nemesis
-  events, fortress sieges and world events are the host's only; the client does not see them as such.
+- The client cannot fast-travel by itself: if it does (or respawns far away), it is taken back to the host about 3 s after it arrives. A captain
+  the host meets appears on the client as an ordinary orc of the same kind (his name, level and traits are not shown);
+  fortress sieges and other world events are the host's only. Setting `coop_nemesis=share` in the client's `sowguard.ini`
+  turns off the client running the host's Nemesis events (it only logs them).
 - Animation: the stand-in has no leap animation (it keeps its position right, the pose is wrong); the client sees no
   hit reaction on an enemy until the host's enemy reacts (about a tenth of a second).
 - The decoy ally may show next to the client's stand-in on the host's screen.

@@ -2525,12 +2525,272 @@ bool SimAmbientHookInstall(uintptr_t fn_rva, std::string* err) {
   return true;
 }
 
+// Faction.Ambush.Enable: a byte in the game's data (1: ambushes may start, 0: each attempt logs "is False (ignorning)"
+// and ends). The client turns it off: the host's ambushes show up as its enemies.
+bool SimAmbushEnable(uintptr_t flag_rva, bool on, std::string* err) {
+  volatile uint8_t* p = const_cast<volatile uint8_t*>(Base() + flag_rva);
+  if (reinterpret_cast<uintptr_t>(p) < reinterpret_cast<uintptr_t>(Base()) || reinterpret_cast<uintptr_t>(p) >= ImageEnd()) {
+    *err = "the ambush switch is outside the game's image";
+    return false;
+  }
+  __try {
+    if (*p > 1) {
+      *err = "the ambush switch holds neither 0 nor 1; left alone";
+      return false;
+    }
+    *p = on ? 1 : 0;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    *err = "the ambush switch is not writable";
+    return false;
+  }
+  return true;
+}
+
 void SimAmbientBlock(bool on) { InterlockedExchange(&g_ambient_block, on ? 1 : 0); }
 
 std::string SimAmbientReport() {
   std::ostringstream out;
   out << "ok ambient hook=" << (g_ambient_hook ? "in" : "off") << " block=" << (g_ambient_block ? "on" : "off")
       << " rejected=" << g_ambient_rejected << "\n";
+  return out.str();
+}
+
+// Nemesis events. HandleFactionEventAction (40C304) is the one place every applied event goes through (promotions
+// included): `mgr` is the faction manager, `action` the event (subject ref +0x00, other ref +0x10, event record +0x20,
+// flags +0x56/+0x57). The stub sits on the handler's second instruction (the first only stores rbx in the shadow space; the
+// entry is not on a position a 5-byte jump can be written at) and calls FactionFilter(mgr, action); a non-zero result
+// drops the event (a ret: nothing has been pushed yet).
+void TraceObjectName(uintptr_t obj, char out[65]);
+
+namespace {
+
+constexpr int kFeRing = 256;
+SimFactionEvent g_fe_ring[kFeRing];
+volatile LONG g_fe_count = 0;
+LONG g_fe_taken = 0;
+volatile LONG g_fe_hook = 0, g_fe_drop = 0, g_fe_dropped = 0, g_fe_seen = 0;
+uintptr_t g_fe_lookup = 0;
+uintptr_t g_fe_mgr = 0;  // the faction manager the handler last ran on
+
+bool CopyMem(void* out, uintptr_t at, size_t n) {
+  __try {
+    memcpy(out, reinterpret_cast<const void*>(at), n);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+void MemberName(uintptr_t mgr, uintptr_t ref_at, char out[40]) {
+  out[0] = 0;
+  __try {
+    const uintptr_t m = reinterpret_cast<uintptr_t (*)(uintptr_t, uintptr_t)>(g_fe_lookup)(mgr, ref_at);
+    if (m) {
+      const char* s = reinterpret_cast<const char*>(m + 0x498);
+      size_t i = 0;
+      for (; i + 1 < 40 && s[i] && (unsigned char)s[i] >= 32; ++i) out[i] = s[i];
+      out[i] = 0;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    out[0] = 0;
+  }
+}
+
+constexpr uintptr_t kEventTableGlobal = 0x2701A20;    // the event records (type 0xA4D)
+constexpr uintptr_t kFactionTableGlobal = 0x2701AD8;  // the faction (region) records (type 0xA51)
+volatile LONG g_fe_replaying = 0;
+
+constexpr uintptr_t kRegionVtable = 0x1FDDF78;  // the region (faction) objects, 0x290 bytes each
+constexpr uintptr_t kRegionRecord = 0xD8;       // their own faction record
+
+// The name hash of a region object's record (0: not a region object).
+uint32_t RegionHash(uintptr_t obj) {
+  uintptr_t vt = 0, rec = 0;
+  uint32_t head[2] = {};
+  if (!obj || !ReadQ(obj, &vt) || vt != reinterpret_cast<uintptr_t>(Base()) + kRegionVtable || !ReadQ(obj + kRegionRecord, &rec) || !rec ||
+      !CopyMem(head, rec, 8) || head[0] != 0xA51)
+    return 0;
+  return head[1];
+}
+
+uintptr_t g_regions[64];  // the region objects found by SimFactionPrime
+unsigned g_region_count = 0;
+
+uintptr_t FindRegion(uint32_t hash) {
+  for (int pass = 0; pass < 2; ++pass) {
+    for (unsigned i = 0; i < g_region_count; ++i)
+      if (RegionHash(g_regions[i]) == hash) return g_regions[i];
+    if (pass == 0) SimFactionPrime();
+  }
+  return 0;
+}
+
+// A reference as the game holds it is {faction record pointer, 0, member id, extra}; the pointer means nothing in another
+// copy, so it becomes the record's name hash (+4).
+void PortableRef(const uint8_t* raw, uint8_t out[16]) {
+  memcpy(out, raw, 16);
+  uintptr_t rec = 0;
+  memcpy(&rec, raw, 8);
+  uint32_t head[2] = {};
+  memset(out, 0, 8);
+  if (rec && CopyMem(head, rec, 8) && head[0] == 0xA51) memcpy(out, &head[1], 4);
+}
+
+bool __fastcall FactionFilter(uintptr_t mgr, uintptr_t action) {
+  InterlockedIncrement(&g_fe_seen);
+  g_fe_mgr = mgr;
+  if (g_fe_replaying) return false;  // an event this copy was asked to run: not recorded, not dropped
+  SimFactionEvent e{};
+  if (!CopyMem(e.raw, action, sizeof e.raw)) return false;
+  PortableRef(e.raw, e.subj);
+  PortableRef(e.raw + 16, e.other);
+  e.flags[0] = e.raw[0x56];
+  e.flags[1] = e.raw[0x57];
+  uintptr_t rec = 0;
+  memcpy(&rec, e.raw + 0x20, 8);
+  uint32_t head[2] = {};
+  if (rec && CopyMem(head, rec, 8) && head[0] == 0xA4D) e.event_hash = head[1];
+  e.region_hash = RegionHash(mgr);
+  char name[65];
+  TraceObjectName(rec, name);
+  strncpy_s(e.event, name, _TRUNCATE);
+  MemberName(mgr, action, e.subj_name);
+  MemberName(mgr, action + 0x10, e.other_name);
+  EnterCriticalSection(&g_lock);
+  g_fe_ring[g_fe_count % kFeRing] = e;
+  InterlockedIncrement(&g_fe_count);
+  LeaveCriticalSection(&g_lock);
+  if (g_fe_drop) {
+    InterlockedIncrement(&g_fe_dropped);
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+bool SimFactionHookInstall(uintptr_t handler_rva, uintptr_t lookup_rva, std::string* err) {
+  if (g_fe_hook == 1) return true;
+  uint8_t* const fn = const_cast<uint8_t*>(Base()) + handler_rva;
+  if (!Head(fn, "48895C240848896C24184889742420") || !Head(Base() + lookup_rva, "8B5208E9")) {
+    *err = "the Nemesis event handler's bytes differ from the known build; refused";
+    return false;
+  }
+  uint8_t* page = SimNearPage(4);
+  if (!page) {
+    *err = "no code page near the game image";
+    return false;
+  }
+  g_fe_lookup = reinterpret_cast<uintptr_t>(Base()) + lookup_rva;
+  // The argument registers and rflags saved, FactionFilter(rcx, rdx) called; non-zero: xor eax,eax; ret (the caller
+  // ignores rax). Otherwise the handler's second instruction (mov [rsp+18h],rbp) and a jump back after it.
+  std::vector<uint8_t> t = {0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x9C, 0x48, 0x83, 0xEC, 0x20, 0x48, 0xB8};
+  PutQ(&t, reinterpret_cast<uintptr_t>(&FactionFilter));
+  t.insert(t.end(), {0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x20, 0x9D, 0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59,
+                     0x84, 0xC0, 0x74, 0x03, 0x31, 0xC0, 0xC3});
+  t.insert(t.end(), fn + 5, fn + 10);
+  t.insert(t.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+  PutQ(&t, reinterpret_cast<uintptr_t>(fn + 10));
+  DWORD old = 0;
+  if (t.size() > 128 || !VirtualProtect(page, 4096, PAGE_EXECUTE_READWRITE, &old)) {
+    *err = "cannot write the stub";
+    return false;
+  }
+  memcpy(page + 1024, t.data(), t.size());
+  VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+  FlushInstructionCache(GetCurrentProcess(), page, 4096);
+  if (!PatchJump(reinterpret_cast<uintptr_t>(fn) + 5, page + 1024, err)) return false;
+  InterlockedExchange(&g_fe_hook, 1);
+  SowLog(L"sim: Nemesis events (rva:%llX) are recorded", (unsigned long long)handler_rva);
+  return true;
+}
+
+void SimFactionPrime() {
+  uintptr_t hits[64];
+  const size_t n = SimScanHeap(reinterpret_cast<uintptr_t>(Base()) + kRegionVtable, hits, 64, nullptr);
+  g_region_count = 0;
+  for (size_t i = 0; i < n; ++i)
+    if (RegionHash(hits[i])) g_regions[g_region_count++] = hits[i];
+  SowLog(L"sim: %u Nemesis region objects found", g_region_count);
+}
+
+bool SimFactionReplay(uintptr_t handler_rva, const SimFactionEvent& e, std::string* err) {
+  if (!g_fe_hook) {
+    *err = "the Nemesis hook is not in";
+    return false;
+  }
+  const uintptr_t region = FindRegion(e.region_hash);
+  if (!region) {
+    *err = "the event's region is not known here";
+    return false;
+  }
+  uint8_t action[0x100] = {};
+  memcpy(action, e.subj, 16);
+  memcpy(action + 16, e.other, 16);
+  auto record = [&](uintptr_t global, uint32_t kind, uint32_t hash) -> uintptr_t {
+    uintptr_t table = 0;
+    if (!ReadQ(reinterpret_cast<uintptr_t>(Base()) + global, &table)) return 0;
+    return reinterpret_cast<uintptr_t>(SearchTypeTable(table, kind, hash));
+  };
+  for (int i = 0; i < 2; ++i) {
+    uint32_t hash = 0;
+    memcpy(&hash, action + 16 * i, 4);
+    uintptr_t rec = 0;
+    memset(action + 16 * i, 0, 8);
+    if (hash) {
+      rec = record(kFactionTableGlobal, 0xA51, hash);
+      if (!rec) {
+        *err = "a faction record of the host's event is not known here";
+        return false;
+      }
+    }
+    memcpy(action + 16 * i, &rec, 8);
+  }
+  const uintptr_t ev = e.event_hash ? record(kEventTableGlobal, 0xA4D, e.event_hash) : 0;
+  if (!ev) {
+    *err = "the event record is not known here";
+    return false;
+  }
+  memcpy(action + 0x20, &ev, 8);
+  action[0x56] = e.flags[0];
+  action[0x57] = e.flags[1];
+  const auto fn = reinterpret_cast<void (*)(uintptr_t, uintptr_t)>(const_cast<uint8_t*>(Base()) + handler_rva);
+  InterlockedExchange(&g_fe_replaying, 1);
+  bool ok = true;
+  __try {
+    fn(region, reinterpret_cast<uintptr_t>(action));
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    ok = false;
+    *err = "the handler faulted";
+  }
+  InterlockedExchange(&g_fe_replaying, 0);
+  return ok;
+}
+
+bool SimFactionResolve(const uint8_t ref[16], char name[40]) {
+  name[0] = 0;
+  if (!g_fe_hook || !g_fe_mgr) return false;
+  uint8_t copy[16];
+  memcpy(copy, ref, 16);
+  MemberName(g_fe_mgr, reinterpret_cast<uintptr_t>(copy), name);
+  return name[0] != 0;
+}
+
+void SimFactionDrop(bool on) { InterlockedExchange(&g_fe_drop, on ? 1 : 0); }
+
+size_t SimFactionTake(SimFactionEvent* out, size_t max) {
+  size_t n = 0;
+  EnterCriticalSection(&g_lock);
+  if (g_fe_count - g_fe_taken > kFeRing) g_fe_taken = g_fe_count - kFeRing;  // the oldest were overwritten
+  while (g_fe_taken < g_fe_count && n < max) out[n++] = g_fe_ring[g_fe_taken++ % kFeRing];
+  LeaveCriticalSection(&g_lock);
+  return n;
+}
+
+std::string SimFactionReport() {
+  std::ostringstream out;
+  out << "ok faction hook=" << (g_fe_hook ? "in" : "off") << " drop=" << (g_fe_drop ? "on" : "off") << " seen=" << g_fe_seen
+      << " recorded=" << g_fe_count << " dropped=" << g_fe_dropped << " mgr=" << std::hex << g_fe_mgr << std::dec << "\n";
   return out.str();
 }
 

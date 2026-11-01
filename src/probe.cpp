@@ -1137,6 +1137,37 @@ std::string Handle(const std::string& line) {
       return "err usage: ambient [on|off]  (on: no new ambient characters)\n";
     }
     out << SimAmbientReport();
+  } else if (cmd == "faction") {
+    // faction [on | drop | keep | take [n] [raw]]: records the Nemesis events the game applies (on), makes the game skip
+    // its own (drop) or run them again (keep), and lists the recorded ones in order (take).
+    if (!g_cfg.write) return "err faction disabled (probe_write=0)\n";
+    std::string v, r;
+    in >> v;
+    if (v == "on" || v == "drop" || v == "keep") {
+      if (!SimFactionHookInstall(0x40C304, 0x18DDCC, &r)) return "err " + r + "\n";
+      SimFactionDrop(v == "drop");
+    } else if (v == "take") {
+      unsigned n = 40;
+      std::string w;
+      in >> n >> w;
+      std::vector<SimFactionEvent> ev(std::min<unsigned>(n ? n : 40, 200));
+      ev.resize(SimFactionTake(ev.data(), ev.size()));
+      for (const SimFactionEvent& e : ev) {
+        out << e.event << " subject=" << e.subj_name << " other=" << e.other_name << " flags=" << (int)e.flags[0] << "," << (int)e.flags[1];
+        if (w == "raw") {
+          char b[8];
+          out << " raw=";
+          for (size_t i = 0; i < sizeof e.raw; ++i) {
+            snprintf(b, sizeof b, "%02X", e.raw[i]);
+            out << b;
+          }
+        }
+        out << "\n";
+      }
+    } else if (!v.empty()) {
+      return "err usage: faction [on | drop | keep | take [n] [raw]]\n";
+    }
+    out << SimFactionReport();
   } else if (cmd == "graphwatch") {
     if (!g_cfg.write) return "err graphwatch disabled (probe_write=0)\n";
     unsigned ms = 0;

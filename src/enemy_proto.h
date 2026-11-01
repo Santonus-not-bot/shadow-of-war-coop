@@ -18,7 +18,7 @@ namespace sowenemy {
 
 constexpr size_t kMaxEnemies = 16;
 constexpr size_t kTypeBytes = 32;
-enum Op : uint8_t { kOpNew = 1, kOpGone = 2, kOpHit = 3, kOpDamage = 4 };
+enum Op : uint8_t { kOpNew = 1, kOpGone = 2, kOpHit = 3, kOpDamage = 4, kOpNemesis = 5 };
 enum Loco : uint8_t { kIdle = 0, kWalk = 1, kRun = 2 };
 enum Flag : uint8_t { kAlive = 1 };
 
@@ -85,6 +85,43 @@ inline bool ParseHitOp(const uint8_t* p, size_t n, uint8_t op, HitMsg* out) {
 
 inline bool ParseHit(const uint8_t* p, size_t n, HitMsg* out) { return ParseHitOp(p, n, kOpHit, out); }
 inline bool ParseDamage(const uint8_t* p, size_t n, HitMsg* out) { return ParseHitOp(p, n, kOpDamage, out); }
+
+// A Nemesis event the host's game applied (HandleFactionEventAction), to the client (reliable, host to client): the two
+// member references as the game holds them (16 bytes each), the two flag bytes, the event record's name and the members'
+// names (for logs and for finding the member again).
+#pragma pack(push, 1)
+struct NemesisMsg {
+  uint8_t op;
+  uint8_t subj[16], other[16];  // portable references (SimFactionEvent)
+  uint32_t event_hash, region_hash;
+  uint8_t flags[2];
+  char event[48], subj_name[40], other_name[40];
+};
+#pragma pack(pop)
+static_assert(sizeof(NemesisMsg) == 171, "NemesisMsg is 171 bytes");
+
+inline std::vector<uint8_t> NemesisEvent(const NemesisMsg& in) {
+  NemesisMsg m = in;
+  m.op = kOpNemesis;
+  m.event[sizeof m.event - 1] = m.subj_name[sizeof m.subj_name - 1] = m.other_name[sizeof m.other_name - 1] = 0;
+  return std::vector<uint8_t>(reinterpret_cast<uint8_t*>(&m), reinterpret_cast<uint8_t*>(&m) + sizeof m);
+}
+
+inline bool ParseNemesis(const uint8_t* p, size_t n, NemesisMsg* out) {
+  if (n != sizeof(NemesisMsg) || p[0] != kOpNemesis) return false;
+  memcpy(out, p, sizeof *out);
+  out->event[sizeof out->event - 1] = out->subj_name[sizeof out->subj_name - 1] = out->other_name[sizeof out->other_name - 1] = 0;
+  return out->event[0] != 0;
+}
+
+// The events the game fires while a world loads (roles chosen for every member, followers set up) are not shared: the
+// client loads the same save and does the same.
+inline bool NemesisShared(const char* event) {
+  static const char* const kSkip[] = {"FactionMember_RoleSelected", "Debug_", "DEBUG_", "IsPlayerFollowerApply", "DLC3_"};
+  for (const char* s : kSkip)
+    if (strncmp(event, s, strlen(s)) == 0) return false;
+  return true;
+}
 
 // What the game side reads about one enemy.
 struct Seen {
