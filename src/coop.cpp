@@ -581,7 +581,7 @@ volatile LONG g_test_dmg_result = 0;   // 0 none, 1 applied, -1 failed
 volatile LONG g_enemy_dmg_sent = 0, g_enemy_dmg_applied = 0, g_enemy_dmg_failed = 0, g_enemy_dmg_stale = 0;
 volatile LONG g_enemy_hits_unmatched = 0, g_enemy_hits_sent = 0, g_enemy_hits_applied = 0, g_enemy_hits_failed = 0, g_enemy_hits_stale = 0;
 volatile LONG g_enemy_sent = 0, g_enemy_announced = 0, g_enemy_spawned = 0, g_enemy_spawn_failed = 0,
-              g_enemy_despawn_asked = 0, g_enemy_away = 0;
+              g_enemy_despawn_asked = 0, g_enemy_away = 0, g_enemy_captains = 0, g_enemy_captains_missing = 0, g_enemy_members_sent = 0;
 // No state from the host for this long: its world is stopped (a death screen, a load, its pause menu), so its
 // enemies' pictures would stand frozen. They are taken away, and shown again where the host's next states put them.
 constexpr ULONGLONG kHostAwayMs = 5000;
@@ -589,7 +589,8 @@ volatile LONG g_nemesis_sent = 0, g_nemesis_got = 0, g_nemesis_skipped = 0;
 std::string g_enemy_last_error;
 
 void QueueEnemyEvent(const uint8_t* p, size_t n) {
-  if (n < 5 || n > 200) return;
+  const size_t limit = n > 0 && p[0] == sowenemy::kOpMemberData ? sizeof(sowenemy::MemberDataHead) + sowenemy::kMemberChunk : 200;
+  if (n < 5 || n > limit) return;
   EnterCriticalSection(&g_lock);
   if (g_enemy_events_in.size() < 4096) g_enemy_events_in.emplace_back(p, p + n);
   LeaveCriticalSection(&g_lock);
@@ -711,6 +712,53 @@ std::vector<std::vector<uint8_t>> g_nemesis_out;  // host: kept until the transp
 
 volatile LONG g_nemesis_applied = 0, g_nemesis_failed = 0;
 
+sowenemy::MemberAnnounced g_members_announced;  // host: the members the client has been sent
+sowenemy::MemberAssembler g_member_asm;         // client: the member being received
+volatile LONG g_member_sent = 0, g_member_got = 0, g_member_skipped = 0, g_member_built = 0, g_member_failed = 0;
+
+// Host: puts the member's text in front of what names him (queue), once, so that a client that has no such member (one
+// made after it joined) can make him. A member the client has already is not rebuilt there (same seed).
+void AnnounceMember(uint32_t faction_hash, uint32_t id, std::vector<std::vector<uint8_t>>& queue) {
+  if (!g_cfg.member_data || !faction_hash || id == sowenemy::kNoMember) return;
+  char name[40];
+  const uintptr_t member = SimFindMember(faction_hash, id, name);
+  if (!member) return;
+  const uint64_t seed = SimMemberSeed(member);
+  if (!g_members_announced.needs(faction_hash, id, seed)) return;
+  std::string text, err;
+  if (!SimMemberExport(member, &text, &err)) {
+    if (InterlockedIncrement(&g_member_failed) <= 5) SowLog(L"coop: member %S (%u) cannot be sent: %S", name, id, err.c_str());
+    return;
+  }
+  const auto chunks = sowenemy::MemberDataEvents(faction_hash, id, seed, text);
+  if (chunks.empty()) return;
+  for (const auto& c : chunks) queue.push_back(c);
+  if (InterlockedIncrement(&g_member_sent) <= 20)
+    SowLog(L"coop: member %S (id %u) sent to the client: %zu bytes in %zu messages", name, id, text.size(), chunks.size());
+}
+
+// Client: a member from the host. One this copy already has (same seed in that slot) is left alone.
+void MemberDataGot(const uint8_t* p, size_t n) {
+  uint32_t hash = 0, id = 0;
+  uint64_t seed = 0;
+  std::string text;
+  if (!g_member_asm.add(p, n, &hash, &id, &seed, &text)) return;
+  InterlockedIncrement(&g_member_got);
+  char name[40];
+  const uintptr_t have = SimFindMember(hash, id, name);
+  if (have && SimMemberSeed(have) == seed) {
+    InterlockedIncrement(&g_member_skipped);
+    return;
+  }
+  std::string err;
+  if (SimMemberImport(hash, id, text, &err)) {
+    if (InterlockedIncrement(&g_member_built) <= 20)
+      SowLog(L"coop: member %u made here from the host's (%zu bytes)%S", id, text.size(), have ? " in place of another" : "");
+  } else if (InterlockedIncrement(&g_member_failed) <= 20) {
+    SowLog(L"coop: member %u from the host could not be made here: %S", id, err.c_str());
+  }
+}
+
 void NemesisGot(const sowenemy::NemesisMsg& m) {
   InterlockedIncrement(&g_nemesis_got);
   if (!g_cfg.nemesis_follow) {
@@ -763,6 +811,12 @@ void NemesisFrame() {
       InterlockedIncrement(&g_nemesis_skipped);
       continue;
     }
+    for (const uint8_t* ref : {ev[i].subj, ev[i].other}) {
+      uint32_t hash = 0, id = 0;
+      memcpy(&hash, ref, 4);
+      memcpy(&id, ref + 8, 4);
+      AnnounceMember(hash, id, g_nemesis_out);
+    }
     sowenemy::NemesisMsg m{};
     memcpy(m.subj, ev[i].subj, 16);
     memcpy(m.other, ev[i].other, 16);
@@ -787,7 +841,7 @@ void NemesisFrame() {
     g_nemesis_out.clear();
     LeaveCriticalSection(&g_net_lock);
   }
-  if (g_nemesis_out.size() > 256) g_nemesis_out.clear();
+  if (g_nemesis_out.size() > 4096) g_nemesis_out.clear();
 }
 
 void EnemyHostFrame() {
@@ -828,6 +882,7 @@ void EnemyHostFrame() {
   if (session != g_enemy_session) {
     g_enemy_session = session;
     g_enemy_host.forgetAll();
+    g_members_announced.forgetAll();
   }
   Packet me{};
   float mine[3], theirs[3];
@@ -863,6 +918,11 @@ void EnemyHostFrame() {
     c.s.hp_frac = info.max_hp > 0 ? info.hp / info.max_hp : 1.0f;
     c.s.alive = info.hp > 0;
     sowenemy::CopyType(c.s.type, info.type);
+    if (g_cfg.captain_look && info.member_id != sowenemy::kNoMember) {
+      c.s.member_id = info.member_id;
+      c.s.faction_hash = info.faction_hash;
+      sowenemy::CopyName(c.s.name, info.member_name);
+    }
     cand.push_back(c);
   }
   std::sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.d < b.d; });
@@ -871,9 +931,14 @@ void EnemyHostFrame() {
   const sowenemy::HostTracker::Out out = g_enemy_host.update(chosen, now);
   // Events are kept until the transport can take them (the lock may be busy: see SendSample); a snapshot is not.
   static std::vector<std::vector<uint8_t>> pending;
+  for (const auto& c : chosen)
+    if (c.member_id != sowenemy::kNoMember) AnnounceMember(c.faction_hash, c.member_id, pending);
   for (const auto& ev : out.events) pending.push_back(ev);
   if (!TryEnterCriticalSection(&g_net_lock)) return;
-  for (const auto& ev : pending) g_net->sendEvent(ev.data(), ev.size());
+  for (const auto& ev : pending) {
+    g_net->sendEvent(ev.data(), ev.size());
+    if (!ev.empty() && ev[0] == sowenemy::kOpMember) InterlockedIncrement(&g_enemy_members_sent);
+  }
   InterlockedAdd(&g_enemy_announced, (LONG)pending.size());
   pending.clear();
   if (!out.snapshot.empty()) g_net->sendState2(out.snapshot.data(), out.snapshot.size());
@@ -888,6 +953,9 @@ void FreeProxy(sowenemy::Proxy& p) {
   if (p.applied_record) SimProxyStopAttack(p.handle, p.applied_record);
   // The host's enemy is gone (dead, out of range, or the session ended): the proxy dies and is asked to go once
   // it is out of sight. Until the game has removed it, it stays a proxy: no AI, so no stray fight.
+  // A captain's proxy was made from this copy's own member: it is let go of the member first, so that its death is an
+  // ordinary orc's and not this copy's captain's.
+  if (p.built_member != sowenemy::kNoMember) SimProxyDetachMember(p.handle);
   SimProxyHealth(p.handle, 0.0f);
   SimDespawnNow(g_cfg.despawn_rva, p.handle);
   if (g_limbo.size() < 48) g_limbo.push_back(p.handle);
@@ -941,6 +1009,10 @@ void EnemyClientFrame() {
   LeaveCriticalSection(&g_lock);
   std::vector<uint32_t> gone;
   for (const auto& ev : events) {
+    if (!ev.empty() && ev[0] == sowenemy::kOpMemberData) {
+      MemberDataGot(ev.data(), ev.size());
+      continue;
+    }
     sowenemy::NemesisMsg nm;
     if (sowenemy::ParseNemesis(ev.data(), ev.size(), &nm)) {
       NemesisGot(nm);
@@ -1005,17 +1077,47 @@ void EnemyClientFrame() {
       p.applied_loco = 255;
       p.next_spawn_ms = now + 1500;
     }
+    if (p.handle && g_cfg.captain_look && !p.member_failed && p.member_id != sowenemy::kNoMember && p.member_id != p.built_member) {
+      // the captain behind this enemy was announced after the proxy was built: build it again from his member
+      FreeProxy(p);
+      p.applied_record = 0;
+      p.applied_attack = p.applied_stamp = 0;
+      p.applied_loco = 255;
+      p.shown_set = false;
+      p.next_spawn_ms = now;
+    }
     if (!p.handle) {
       if (p.spawn_failed || spawns_left == 0 || now < p.next_spawn_ms || !(p.cur.flags & sowenemy::kAlive) || SimSpawnBusy()) continue;
       --spawns_left;
       SimSpawnRvas rv;
       rv.gameclient_rva = g_cfg.gameclient_rva;
       std::string report;
-      uintptr_t obj = 0;
-      if (SimSpawn(rv, p.type, p.cur.pos, nullptr, &report, &obj, true) && obj && SimProxyAdopt(obj)) {
+      uintptr_t obj = 0, member = 0;
+      if (g_cfg.captain_look && !p.member_failed && p.member_id != sowenemy::kNoMember) {
+        char found[40];
+        member = SimFindMember(p.faction_hash, p.member_id, found);
+        if (!member || strncmp(found, p.name, sizeof found) != 0) {  // not the same member here: the type's generic orc
+          SowLog(L"coop: enemy %u: no member %u named %S in this copy (here: %S)", p.id, p.member_id, p.name, member ? found : "none");
+          member = 0;
+          p.member_failed = true;
+          InterlockedIncrement(&g_enemy_captains_missing);
+        }
+      }
+      bool made = SimSpawn(rv, p.type, p.cur.pos, nullptr, &report, &obj, true, member) && obj && SimProxyAdopt(obj);
+      if (!made && member) {  // the member could not be spawned: the type's own
+        SowLog(L"coop: no proxy for enemy %u (%S) from member %S: %S; trying the type's own", p.id, p.type, p.name, report.c_str());
+        p.member_failed = true;
+        member = 0;
+        report.clear();
+        obj = 0;
+        made = SimSpawn(rv, p.type, p.cur.pos, nullptr, &report, &obj, true) && obj && SimProxyAdopt(obj);
+      }
+      if (made) {
         p.handle = obj;
         p.shown_set = false;
+        p.built_member = member ? p.member_id : sowenemy::kNoMember;
         InterlockedIncrement(&g_enemy_spawned);
+        if (member) InterlockedIncrement(&g_enemy_captains);
       } else {
         p.spawn_failed = true;
         InterlockedIncrement(&g_enemy_spawn_failed);
@@ -1791,11 +1893,11 @@ std::string CoopEnemyStatus() {
     }
   snprintf(b, sizeof b,
            "ok enemies=%s role=%s host_known=%zu host_announced=%ld host_snapshots=%ld client_proxies=%zu with_pos=%zu "
-           "standing=%zu spawned=%ld failed=%ld despawn_asked=%ld hits_sent=%ld hits_on_proxies=%ld hits_applied=%ld hits_failed=%ld hits_stale=%ld travels=%ld hits_unmatched=%ld dmg_sent=%ld dmg_applied=%ld dmg_failed=%ld dmg_stale=%ld away=%ld nemesis_sent=%ld nemesis_got=%ld nemesis_skipped=%ld nemesis_applied=%ld nemesis_failed=%ld\n",
+           "standing=%zu spawned=%ld failed=%ld despawn_asked=%ld hits_sent=%ld hits_on_proxies=%ld hits_applied=%ld hits_failed=%ld hits_stale=%ld travels=%ld hits_unmatched=%ld dmg_sent=%ld dmg_applied=%ld dmg_failed=%ld dmg_stale=%ld away=%ld nemesis_sent=%ld nemesis_got=%ld nemesis_skipped=%ld nemesis_applied=%ld nemesis_failed=%ld captains_sent=%ld captains_built=%ld captains_missing=%ld members_sent=%ld members_got=%ld members_skipped=%ld members_built=%ld members_failed=%ld\n",
            g_cfg.enemies ? "on" : "off", g_cfg.net_role.c_str(), g_enemy_host.known(), g_enemy_announced, g_enemy_sent,
            g_cfg.net_role == "client" ? g_enemy_client.proxies().size() : (size_t)0, with_pos, spawned_now, g_enemy_spawned,
            g_enemy_spawn_failed, g_enemy_despawn_asked, g_enemy_hits_sent, SimProxyHits(), g_enemy_hits_applied, g_enemy_hits_failed,
-           g_enemy_hits_stale, g_travels, g_enemy_hits_unmatched, g_enemy_dmg_sent, g_enemy_dmg_applied, g_enemy_dmg_failed, g_enemy_dmg_stale, g_enemy_away, g_nemesis_sent, g_nemesis_got, g_nemesis_skipped, g_nemesis_applied, g_nemesis_failed);
+           g_enemy_hits_stale, g_travels, g_enemy_hits_unmatched, g_enemy_dmg_sent, g_enemy_dmg_applied, g_enemy_dmg_failed, g_enemy_dmg_stale, g_enemy_away, g_nemesis_sent, g_nemesis_got, g_nemesis_skipped, g_nemesis_applied, g_nemesis_failed, g_enemy_members_sent, g_enemy_captains, g_enemy_captains_missing, g_member_sent, g_member_got, g_member_skipped, g_member_built, g_member_failed);
   return b;
 }
 

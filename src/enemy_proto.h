@@ -18,7 +18,9 @@ namespace sowenemy {
 
 constexpr size_t kMaxEnemies = 16;
 constexpr size_t kTypeBytes = 32;
-enum Op : uint8_t { kOpNew = 1, kOpGone = 2, kOpHit = 3, kOpDamage = 4, kOpNemesis = 5 };
+constexpr size_t kNameBytes = 40;
+constexpr uint32_t kNoMember = 0xFFFFFFFFu;
+enum Op : uint8_t { kOpNew = 1, kOpGone = 2, kOpHit = 3, kOpDamage = 4, kOpNemesis = 5, kOpMember = 6, kOpMemberData = 7 };
 enum Loco : uint8_t { kIdle = 0, kWalk = 1, kRun = 2 };
 enum Flag : uint8_t { kAlive = 1 };
 
@@ -114,6 +116,109 @@ inline bool ParseNemesis(const uint8_t* p, size_t n, NemesisMsg* out) {
   return out->event[0] != 0;
 }
 
+// MEMBERDATA (reliable, host to client): a Nemesis member as the game's own text (what FactionMember.Save writes), in
+// chunks of up to kMemberChunk bytes, for a member the client may not have (one the host's game made after the client
+// joined, or one that took another's slot). The host sends it before the first message that names the member and again
+// if the member in that slot is another one (its seed differs); the client builds the member in that slot unless it
+// already has one with that seed.
+constexpr size_t kMemberChunk = 900;
+constexpr size_t kMemberMaxChunks = 64;
+#pragma pack(push, 1)
+struct MemberDataHead {
+  uint8_t op;
+  uint32_t faction_hash, id;
+  uint64_t seed;
+  uint16_t index, count;
+};
+#pragma pack(pop)
+static_assert(sizeof(MemberDataHead) == 21, "MemberDataHead is 21 bytes");
+
+inline std::vector<std::vector<uint8_t>> MemberDataEvents(uint32_t faction_hash, uint32_t id, uint64_t seed, const std::string& text) {
+  std::vector<std::vector<uint8_t>> out;
+  const size_t count = std::max<size_t>(1, (text.size() + kMemberChunk - 1) / kMemberChunk);
+  if (count > kMemberMaxChunks) return out;
+  for (size_t i = 0; i < count; ++i) {
+    MemberDataHead h{};
+    h.op = kOpMemberData;
+    h.faction_hash = faction_hash;
+    h.id = id;
+    h.seed = seed;
+    h.index = (uint16_t)i;
+    h.count = (uint16_t)count;
+    const size_t from = i * kMemberChunk, len = std::min(kMemberChunk, text.size() - std::min(text.size(), from));
+    std::vector<uint8_t> e(sizeof h + len);
+    memcpy(e.data(), &h, sizeof h);
+    if (len) memcpy(e.data() + sizeof h, text.data() + from, len);
+    out.push_back(std::move(e));
+  }
+  return out;
+}
+
+// The client's side: puts the chunks of one member together (they arrive in order). add() is true when the last chunk of a
+// member came; the member is then in the out parameters. A chunk out of order drops what was gathered.
+class MemberAssembler {
+ public:
+  bool add(const uint8_t* p, size_t n, uint32_t* faction_hash, uint32_t* id, uint64_t* seed, std::string* text) {
+    if (n < sizeof(MemberDataHead) || p[0] != kOpMemberData) return false;
+    MemberDataHead h;
+    memcpy(&h, p, sizeof h);
+    if (h.count == 0 || h.count > kMemberMaxChunks || h.index >= h.count || n - sizeof h > kMemberChunk) {
+      reset();
+      return false;
+    }
+    if (h.index == 0) {
+      reset();
+      hash_ = h.faction_hash;
+      id_ = h.id;
+      seed_ = h.seed;
+      count_ = h.count;
+    } else if (!active_ || h.faction_hash != hash_ || h.id != id_ || h.seed != seed_ || h.count != count_ || h.index != next_) {
+      reset();
+      return false;
+    }
+    active_ = true;
+    text_.append(reinterpret_cast<const char*>(p + sizeof h), n - sizeof h);
+    next_ = h.index + 1;
+    if (next_ < count_) return false;
+    *faction_hash = hash_;
+    *id = id_;
+    *seed = seed_;
+    *text = std::move(text_);
+    reset();
+    return true;
+  }
+  void reset() {
+    active_ = false;
+    text_.clear();
+    next_ = 0;
+  }
+
+ private:
+  bool active_ = false;
+  uint32_t hash_ = 0, id_ = 0;
+  uint64_t seed_ = 0;
+  uint16_t count_ = 0, next_ = 0;
+  std::string text_;
+};
+
+// The host's side: which members it has told the client about, by faction and id, with the seed it told.
+class MemberAnnounced {
+ public:
+  // True when the member (faction, id, seed) must be sent now (never sent, or the slot holds another member now).
+  bool needs(uint32_t faction_hash, uint32_t id, uint64_t seed) {
+    auto key = ((uint64_t)faction_hash << 32) | id;
+    auto it = sent_.find(key);
+    if (it != sent_.end() && it->second == seed) return false;
+    sent_[key] = seed;
+    return true;
+  }
+  void forgetAll() { sent_.clear(); }
+  size_t size() const { return sent_.size(); }
+
+ private:
+  std::unordered_map<uint64_t, uint64_t> sent_;
+};
+
 // The events the game fires while a world loads (roles chosen for every member, followers set up) are not shared: the
 // client loads the same save and does the same.
 inline bool NemesisShared(const char* event) {
@@ -132,11 +237,32 @@ struct Seen {
   float hp_frac = 1.0f;
   bool alive = true;
   char type[kTypeBytes] = {};
+  uint32_t member_id = kNoMember;  // a captain: his Nemesis member (the id in his faction's table), else kNoMember
+  uint32_t faction_hash = 0;       // the name hash of that faction's record
+  char name[kNameBytes] = {};      // his name
 };
 
 inline void CopyType(char out[kTypeBytes], const char* name) {
   memset(out, 0, kTypeBytes);
   for (size_t i = 0; name && name[i] && i + 1 < kTypeBytes; ++i) out[i] = name[i];
+}
+inline void CopyName(char out[kNameBytes], const char* name) {
+  memset(out, 0, kNameBytes);
+  for (size_t i = 0; name && name[i] && i + 1 < kNameBytes; ++i) out[i] = name[i];
+}
+
+// MEMBER (reliable, host to client): the Nemesis member behind an enemy, announced after its NEW (and again if it changes):
+// the faction record's name hash and the member's id, which mean the same in a copy of the same save, and his name (for
+// logs and to check it is the same member). The client builds the proxy from its own member with that id.
+constexpr size_t kMemberBytes = 1 + 4 + 4 + 4 + kNameBytes;
+inline std::vector<uint8_t> MemberEvent(uint32_t id, uint32_t faction_hash, uint32_t member_id, const char name[kNameBytes]) {
+  std::vector<uint8_t> e(kMemberBytes);
+  e[0] = kOpMember;
+  memcpy(&e[1], &id, 4);
+  memcpy(&e[5], &faction_hash, 4);
+  memcpy(&e[9], &member_id, 4);
+  memcpy(&e[13], name, kNameBytes);
+  return e;
 }
 
 // The speeds (units a second) that separate idle, walk and run; an orc walks at about 200 and runs at about 500.
@@ -179,6 +305,11 @@ class HostTracker {
         out.events.push_back(newEvent(e.id, e.type));
       }
       Entry& e = it->second;
+      if (s.member_id != kNoMember && (e.member_id != s.member_id || e.faction_hash != s.faction_hash)) {
+        e.member_id = s.member_id;
+        e.faction_hash = s.faction_hash;
+        out.events.push_back(MemberEvent(e.id, s.faction_hash, s.member_id, s.name));
+      }
       const uint64_t dt = now_ms - e.last_ms;
       if (dt >= 60) {
         const float dx = s.pos[0] - e.last[0], dz = s.pos[2] - e.last[2];
@@ -233,6 +364,7 @@ class HostTracker {
   struct Entry {
     uint32_t id = 0;
     char type[kTypeBytes] = {};
+    uint32_t member_id = kNoMember, faction_hash = 0;
     float last[3] = {};
     uint64_t last_ms = 0;
     float speed = 0;
@@ -261,6 +393,10 @@ class HostTracker {
 struct Proxy {
   uint32_t id = 0;
   char type[kTypeBytes] = {};
+  uint32_t member_id = kNoMember, faction_hash = 0;  // the captain behind it, once the host has said
+  char name[kNameBytes] = {};
+  uint32_t built_member = kNoMember;  // the member the spawned proxy was built from (the game side)
+  bool member_failed = false;         // this copy has no such member: the proxy is the type's generic orc
   uintptr_t handle = 0;
   bool spawn_failed = false;
   bool have = false;  // a snapshot record has arrived
@@ -288,6 +424,17 @@ class ClientTracker {
       pr.id = id;
       memcpy(pr.type, p + 5, kTypeBytes);
       pr.type[kTypeBytes - 1] = 0;
+      return true;
+    }
+    if (p[0] == kOpMember && n == kMemberBytes) {
+      auto it = map_.find(id);
+      if (it == map_.end()) return true;  // an enemy already gone: nothing to do, but it is ours
+      Proxy& pr = it->second;
+      memcpy(&pr.faction_hash, p + 5, 4);
+      memcpy(&pr.member_id, p + 9, 4);
+      memcpy(pr.name, p + 13, kNameBytes);
+      pr.name[kNameBytes - 1] = 0;
+      pr.member_failed = false;
       return true;
     }
     if (p[0] == kOpGone && n == 1 + 4) {

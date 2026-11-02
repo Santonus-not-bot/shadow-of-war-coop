@@ -29,7 +29,9 @@ struct CoopConfig {
   uintptr_t slowmo_rva = 0x5CF709;     // the `jne` after slow motion's per-timer test
   bool nemesis = true;                 // coop_nemesis=off: the host's Nemesis events are not recorded or sent
   bool nemesis_follow = true;          // a client runs the host's Nemesis events and drops its own; coop_nemesis=share only records
-  bool follow_travel = true;           // coop_follow_travel=off: a client does not follow the host's long jumps (fast travel)
+  bool captain_look = true;            // coop_captain_look=off: the host's captains are shown as the type's generic orc
+  bool member_data = true;             // coop_member_data=off: the host does not send the members the client may lack
+  bool follow_travel = true;          // coop_follow_travel=off: a client does not follow the host's long jumps (fast travel)
   bool decoy = false;                  // coop_decoy=on: enemies attack an invisible-ish ally where the stand-in stands
   float decoy_dy = 0.0f;               // coop_decoy_dy: its height above the stand-in
   bool enemy_direct = true;            // proxies are placed by writing their transform (not the game's teleport)

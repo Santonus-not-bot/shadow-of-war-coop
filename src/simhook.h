@@ -149,7 +149,23 @@ struct SimEnemyInfo {
   float hp, max_hp;
   uint32_t attack_id, attack_stamp;
   char type[32];  // the character's spawn type ("Orc_Infantry"), what SimSpawn takes
+  // A captain: the Nemesis member the character was made from (member_id 0xFFFFFFFF: not one). The faction is the name
+  // hash of the faction record the member's id is meant in.
+  uint32_t member_id, faction_hash;
+  char member_name[40];
 };
+// The member (FactionMember object) with this id in the faction whose record has this name hash, 0 if this copy has none;
+// name (40 bytes) gets his name. May scan the heap for the faction objects once in a while (seconds): simulation thread only.
+uintptr_t SimFindMember(uint32_t faction_hash, uint32_t id, char name[40]);
+// A member as the game's own text (what FactionMember.Save writes), and a member made from such text and put into slot id of
+// its faction's member table (replacing the member there). Simulation thread only (SimCall).
+// A member's random seed (+0x168): what tells two members of one slot apart. 0 if unreadable.
+uint64_t SimMemberSeed(uintptr_t member);
+bool SimMemberExport(uintptr_t member, std::string* text, std::string* err);
+bool SimMemberImport(uint32_t faction_hash, uint32_t id, const std::string& text, std::string* err);
+// Runs fn on the simulation thread at its next frame and waits (false: it had not run in time; fn then still runs later,
+// so it must not refer to the caller's stack).
+bool SimCall(const std::function<void()>& fn, unsigned timeout_ms);
 // True while a spawn another thread asked for waits for the simulation thread (a proxy spawn must not take its place).
 bool SimSpawnBusy();
 // Starts noting every AI character whose behavior tree runs (installs the behavior-tree filter if need be).
@@ -159,6 +175,9 @@ bool SimEnemyRead(uintptr_t owner, SimEnemyInfo* out);
 // Proxies: characters the client spawned to show a host's enemy. Their behavior tree is skipped and they are
 // marked as the player's followers (out of the player's combat).
 bool SimProxyAdopt(uintptr_t owner);
+// A proxy made from a Nemesis member (SimSpawn's member) is let go of it: the character's member id becomes -1, so that what
+// happens to the character (its death) is an ordinary character's and does not touch the member.
+void SimProxyDetachMember(uintptr_t owner);
 void SimProxyDrop(uintptr_t owner);
 bool SimProxyValid(uintptr_t owner);
 bool SimProxyMove(uintptr_t teleport_rva, uintptr_t owner, const float pos[3], const float rot[4], bool direct);
@@ -322,8 +341,11 @@ struct SimSpawnRvas {
 };
 // look (nullptr: the type's own): an appearance record (type 0xA66, e.g. "PlayerSkin_Talion")
 // the new character is built with instead.
+// member: a FactionMember (SimFindMember): the character is made from that Nemesis member, the way the game spawns a captain
+// (his name, look and level come from the member; the spawn function takes the member as its eighth argument).
 bool SimSpawn(const SimSpawnRvas& r, const char* record, const float* pos, const char* look, std::string* report,
-              uintptr_t* spawned = nullptr, bool run_now = false);  // run_now: the caller is the simulation thread
+              uintptr_t* spawned = nullptr, bool run_now = false,  // run_now: the caller is the simulation thread
+              uintptr_t member = 0);
 
 // coop_puppet_spawn: spawn a character of type at pos, give it this copy's player's behavior
 // resource (so a "Talion", a cutscene actor, animates with the player's graph) and make it

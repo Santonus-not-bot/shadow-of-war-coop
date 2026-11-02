@@ -46,6 +46,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -828,13 +829,17 @@ std::string Handle(const std::string& line) {
     std::string record, look;
     float pos[3];
     in >> record;
-    if (record.empty()) return "err usage: spawn <character type> [x y z [appearance]]\n";
+    if (record.empty()) return "err usage: spawn <character type> [x y z [appearance|- [member address]]]\n";
     const bool at = static_cast<bool>(in >> pos[0] >> pos[1] >> pos[2]);
-    if (at) in >> look;
+    std::string member_text;
+    if (at) in >> look >> member_text;
+    if (look == "-") look.clear();
+    uintptr_t member = 0;
+    if (!member_text.empty() && !ParseAddr(member_text, &member)) return "err the member is an address (abs:...)\n";
     SimSpawnRvas r;
     r.gameclient_rva = g_cfg.gameclient_rva;
     std::string report;
-    if (!SimSpawn(r, record.c_str(), at ? pos : nullptr, look.empty() ? nullptr : look.c_str(), &report))
+    if (!SimSpawn(r, record.c_str(), at ? pos : nullptr, look.empty() ? nullptr : look.c_str(), &report, nullptr, false, member))
       return "err " + report + "\n";
     out << "ok " << report << "\n";
   } else if (cmd == "animres") {
@@ -1059,6 +1064,55 @@ std::string Handle(const std::string& line) {
     out << CoopStatus();
   } else if (cmd == "inputs") {
     out << SimInputsReport();
+  } else if (cmd == "memexport" || cmd == "memimport") {
+    // Experiment: memexport <faction record hash hex> <member id> <file>: the member as the game's text; memimport: the same
+    // text made into a member in that slot.
+    if (!g_cfg.write) return "err memexport/memimport disabled (probe_write=0)\n";
+    std::string hash_text, file;
+    unsigned id = 0;
+    if (!(in >> hash_text >> id >> file)) return "err usage: " + cmd + " <faction hash hex> <member id> <file>\n";
+    const uint32_t hash = (uint32_t)strtoul(hash_text.c_str(), nullptr, 16);
+    auto result = std::make_shared<std::string>();
+    const bool exporting = cmd == "memexport";
+    const bool ran = SimCall(
+        [result, hash, id, file, exporting]() {
+          std::string text, err;
+          if (exporting) {
+            char name[40];
+            const uintptr_t m = SimFindMember(hash, id, name);
+            if (!m) *result = "err no such member here";
+            else if (!SimMemberExport(m, &text, &err)) *result = "err " + err;
+            else {
+              FILE* f = nullptr;
+              if (fopen_s(&f, file.c_str(), "wb") == 0 && f) {
+                fwrite(text.data(), 1, text.size(), f);
+                fclose(f);
+                *result = "ok " + std::string(name) + ": " + std::to_string(text.size()) + " bytes";
+              } else {
+                *result = "err cannot write the file";
+              }
+            }
+          } else {
+            FILE* f = nullptr;
+            if (fopen_s(&f, file.c_str(), "rb") != 0 || !f) {
+              *result = "err cannot read the file";
+              return;
+            }
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+            fclose(f);
+            if (!SimMemberImport(hash, id, text, &err)) *result = "err " + err;
+            else {
+              char name[40];
+              const uintptr_t m = SimFindMember(hash, id, name);
+              *result = "ok member now at " + std::to_string(m) + " named " + name;
+            }
+          }
+        },
+        15000);
+    if (!ran) return "err the simulation thread did not run it in time\n";
+    return *result + "\n";
   } else if (cmd == "enemies") {
     out << CoopEnemyStatus();
   } else if (cmd == "adopt") {

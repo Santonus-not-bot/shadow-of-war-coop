@@ -1004,6 +1004,12 @@ void Init(HMODULE self) {
       if (nem == L"off") cc.nemesis = false;
       else if (nem == L"share") cc.nemesis_follow = false;
       else if (!nem.empty() && nem != L"on" && nem != L"follow") Fatal(kExitConfig, L"coop_nemesis must be off, share or follow (got %s)", nem.c_str());
+      const std::wstring capt = IniStr(ini, L"coop_captain_look");
+      if (capt == L"off") cc.captain_look = false;
+      else if (!capt.empty() && capt != L"on") Fatal(kExitConfig, L"coop_captain_look must be on or off (got %s)", capt.c_str());
+      const std::wstring mdata = IniStr(ini, L"coop_member_data");
+      if (mdata == L"off") cc.member_data = false;
+      else if (!mdata.empty() && mdata != L"on") Fatal(kExitConfig, L"coop_member_data must be on or off (got %s)", mdata.c_str());
       const std::wstring travel = IniStr(ini, L"coop_follow_travel");
       if (travel == L"off") cc.follow_travel = false;
       else if (!travel.empty() && travel != L"on") Fatal(kExitConfig, L"coop_follow_travel must be on or off (got %s)", travel.c_str());

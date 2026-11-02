@@ -876,13 +876,32 @@ void RunSlowMoStart() {
   SowLog(L"sim: slow motion record %S %S", g_slowmo_start_name, rec ? "requested (as the world UI's)" : "not found");
 }
 
+// Work other threads ask the simulation thread to do (SimCall): run at the next frame, in order.
+std::vector<std::pair<std::function<void()>, HANDLE>> g_tasks;
+volatile LONG g_task_count = 0;
+
+bool TasksPending() { return g_task_count != 0; }
+
+void RunTasks() {
+  std::vector<std::pair<std::function<void()>, HANDLE>> todo;
+  EnterCriticalSection(&g_lock);
+  todo.swap(g_tasks);
+  g_task_count = 0;
+  LeaveCriticalSection(&g_lock);
+  for (auto& t : todo) {
+    t.first();
+    if (t.second) SetEvent(t.second);
+  }
+}
+
 bool ExtraPending() {
-  return SlowMoStartPending() || DespawnPending() || g_brain_state == kBrainQueued || g_walk_pending || g_player_tp_pending || SpawnPending() ||
+  return TasksPending() || SlowMoStartPending() || DespawnPending() || g_brain_state == kBrainQueued || g_walk_pending || g_player_tp_pending || SpawnPending() ||
          AnimResPending() || TracePending() || HoldPending() || AttackPending() || PlayPending() ||
          MovePending();
 }
 
 void RunExtra() {
+  if (TasksPending()) RunTasks();
   if (SlowMoStartPending()) RunSlowMoStart();
   if (DespawnPending()) RunDespawn();
   if (g_brain_state == kBrainQueued) InstallBrainNow();
@@ -1261,6 +1280,7 @@ AppearanceLookup_t g_appearance_lookup = nullptr;
 Xform g_spawn_at{};
 SpawnFns g_spawn_fns{};
 uintptr_t g_spawned = 0;
+uintptr_t g_spawn_member = 0;  // the FactionMember the spawn is made from (0: none)
 std::string g_spawn_report;
 
 void RunSpawn();
@@ -1275,6 +1295,7 @@ void RunSpawn() {
   memcpy(look, g_spawn_look, sizeof look);
   const Xform at = g_spawn_at;
   const SpawnFns f = g_spawn_fns;
+  void* const member = reinterpret_cast<void*>(g_spawn_member);
   LeaveCriticalSection(&g_lock);
   if (!run) return;
   char b[320];
@@ -1296,7 +1317,7 @@ void RunSpawn() {
     g_override_appearance = appearance;
     g_override_type = appearance ? record : nullptr;
     obj = reinterpret_cast<uintptr_t>(f.spawn(reinterpret_cast<void*>(ctx), "CoopPuppet", at.pos, record, 1, 1,
-                                              nullptr, nullptr, nullptr));
+                                              nullptr, member, nullptr));
     g_override_type = nullptr;
     g_override_appearance = nullptr;
     uintptr_t active_q = 0;
@@ -1340,7 +1361,7 @@ void RunSpawn() {
 }  // namespace
 
 bool SimSpawn(const SimSpawnRvas& r, const char* record, const float* pos, const char* look, std::string* report,
-              uintptr_t* spawned, bool run_now) {
+              uintptr_t* spawned, bool run_now, uintptr_t member) {
   if (!g_installed) {
     *report = "simulation-thread hook not installed (sim_hook)";
     return false;
@@ -1411,6 +1432,7 @@ bool SimSpawn(const SimSpawnRvas& r, const char* record, const float* pos, const
   g_spawn_look_site = const_cast<uint8_t*>(look_site + 11);
   g_appearance_lookup = reinterpret_cast<AppearanceLookup_t>(const_cast<uint8_t*>(look_up));
   g_spawn_at = at;
+  g_spawn_member = member;
   InterlockedExchange(&g_spawn_done, 0);
   InterlockedExchange(&g_spawn_pending, 1);
   LeaveCriticalSection(&g_lock);
@@ -2602,6 +2624,8 @@ volatile LONG g_fe_replaying = 0;
 
 constexpr uintptr_t kRegionVtable = 0x1FDDF78;  // the region (faction) objects, 0x290 bytes each
 constexpr uintptr_t kRegionRecord = 0xD8;       // their own faction record
+constexpr uintptr_t kMemberVtable = 0x1FD5EA0;  // a FactionMember (a captain's Nemesis record), name inline at +0x498
+constexpr uintptr_t kMemberName = 0x498;
 
 // The name hash of a region object's record (0: not a region object).
 uint32_t RegionHash(uintptr_t obj) {
@@ -2712,6 +2736,243 @@ void SimFactionPrime() {
   for (size_t i = 0; i < n; ++i)
     if (RegionHash(hits[i])) g_regions[g_region_count++] = hits[i];
   SowLog(L"sim: %u Nemesis region objects found", g_region_count);
+}
+
+// A Nemesis member by its faction record's name hash and its id: the region object of that faction holds the member table
+// (+0x20; object with the array of member pointers from +0x18 to +0x20, the id the index), the same lookup the game makes.
+uintptr_t SimFindMember(uint32_t faction_hash, uint32_t id, char name[40]) {
+  static ULONGLONG last_prime = 0;
+  uintptr_t region = 0;
+  for (unsigned i = 0; i < g_region_count && !region; ++i)
+    if (RegionHash(g_regions[i]) == faction_hash) region = g_regions[i];
+  if (!region) {
+    const ULONGLONG now = GetTickCount64();
+    if (last_prime && now - last_prime < 30000) return 0;  // the scan takes seconds: not on every frame
+    last_prime = now;
+    SimFactionPrime();
+    for (unsigned i = 0; i < g_region_count && !region; ++i)
+      if (RegionHash(g_regions[i]) == faction_hash) region = g_regions[i];
+  }
+  uintptr_t table = 0, begin = 0, end = 0, member = 0, vt = 0;
+  if (!region || !ReadQ(region + 0x20, &table) || !table || !ReadQ(table + 0x18, &begin) || !ReadQ(table + 0x20, &end) || end <= begin ||
+      id >= (end - begin) / 8 || !ReadQ(begin + 8 * (uintptr_t)id, &member) || !member || !ReadQ(member, &vt) ||
+      vt != reinterpret_cast<uintptr_t>(Base()) + kMemberVtable)
+    return 0;
+  if (name) {
+    memset(name, 0, 40);
+    if (CopyMem(name, member + kMemberName, 39))
+      for (int i = 0; i < 39 && name[i]; ++i)
+        if ((unsigned char)name[i] < 32 || (unsigned char)name[i] > 126) name[i] = '?';
+  }
+  return member;
+}
+
+// ---- a Nemesis member as text, and a member made from it -------------------------------------------------------------
+// The game saves a member into a node tree (FactionMember.Save writes it to a text file) and builds one from it again
+// (its own world load). Both are called here with the same sequence as the game's: save 1C5BAC4, load F99FF0, table
+// slot replacement 1BD2E20. The text goes through a file in the temp folder (the game's functions read and write files).
+namespace {
+
+constexpr uintptr_t kDocInit = 0x18786F0, kDocAddRoot = 0x1878CA0, kMemberSave = 0x1BC45A8, kDocSaveFile = 0x187A3CC,
+                    kDocDtor = 0x1878A2C, kDocLoadFile = 0x1879AC4, kNodeChild = 0x18791F0, kMemAlloc = 0x3DE238,
+                    kMemberCtor = 0x1BB4C1C, kMemberLoad2 = 0x1BC20B0, kMemberLoad1 = 0x1BC159C, kSlotLive = 0x1BD16D4,
+                    kMgrRemove = 0xF67E70, kSlotReset = 0x1BD522C, kMgrRegister = 0xF67970, kSlotAssign = 0x1BD2220,
+                    kHolderRelease = 0x19EF15C, kGameGlobal = 0x26FFAA8;
+constexpr size_t kMemberObjectBytes = 0x528;
+const char kMemberRoot[] = "FACTIONMEMBER_SINGLESAVE";
+
+bool MemberFnsOk() {
+  const uint8_t* b = Base();
+  return Head(b + kDocInit, "33C04889014889410889411088") && Head(b + kDocAddRoot, "48895C2410574883EC20488BF9488BDA") &&
+         Head(b + kMemberSave, "48895C2410488974242055574156488BEC") && Head(b + kDocSaveFile, "48895C240848897C241055488D6C24A0") &&
+         Head(b + kDocDtor, "40534883EC20488B5108488BD9") && Head(b + kDocLoadFile, "48895C2408574883EC60488364242000") &&
+         Head(b + kNodeChild, "40534883EC20488BD94885D27443") && Head(b + kMemAlloc, "E903000000CCCCCC40534883EC20") &&
+         Head(b + kMemberCtor, "48895C241048896C2418565741564883EC20") && Head(b + kMemberLoad2, "4889742408574883EC20488BC2488BF9") &&
+         Head(b + kMemberLoad1, "48895C2410488974241855574156488BEC") && Head(b + kSlotLive, "33C04839010F95C0C3") &&
+         Head(b + kMgrRemove, "4883EC284C8B82780100004C8BD2") && Head(b + kSlotReset, "4883EC28488B014889114885C074") &&
+         Head(b + kMgrRegister, "48895C2410488974241848897C2420") && Head(b + kSlotAssign, "40534883EC20488BC2488BD9483BCA74") &&
+         Head(b + kHolderRelease, "4883EC28488B094885C9740A");
+}
+
+std::string MemberTempPath() {
+  char dir[MAX_PATH] = {};
+  GetTempPathA(MAX_PATH, dir);
+  char path[MAX_PATH + 40];
+  snprintf(path, sizeof path, "%ssowcoop-member-%lu.txt", dir, GetCurrentProcessId());
+  return path;
+}
+
+bool MemberExportRaw(uintptr_t member, const char* path) {
+  alignas(16) uint8_t doc[0x100] = {};
+  const uint8_t* b = Base();
+  bool ok = false;
+  __try {
+    reinterpret_cast<void(__fastcall*)(void*)>(const_cast<uint8_t*>(b + kDocInit))(doc);
+    void* root = reinterpret_cast<void*(__fastcall*)(void*, const char*)>(const_cast<uint8_t*>(b + kDocAddRoot))(doc, kMemberRoot);
+    if (root) {
+      reinterpret_cast<void(__fastcall*)(void*, void*)>(const_cast<uint8_t*>(b + kMemberSave))(reinterpret_cast<void*>(member), root);
+      ok = (reinterpret_cast<uint8_t(__fastcall*)(void*, const char*)>(const_cast<uint8_t*>(b + kDocSaveFile))(doc, path) & 1) != 0;
+    }
+    reinterpret_cast<void(__fastcall*)(void*)>(const_cast<uint8_t*>(b + kDocDtor))(doc);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return ok;
+}
+
+struct MemberImportCtx {
+  uintptr_t member = 0;
+};
+
+// Called by the game's file loader with the parsed document.
+void __fastcall MemberImportCb(void* doc, void* arg) {
+  MemberImportCtx* ctx = static_cast<MemberImportCtx*>(arg);
+  const uint8_t* b = Base();
+  __try {
+    void* node = reinterpret_cast<void*(__fastcall*)(void*, const char*)>(const_cast<uint8_t*>(b + kNodeChild))(doc, kMemberRoot);
+    if (!node) return;
+    void* mem = reinterpret_cast<void*(__fastcall*)(size_t)>(const_cast<uint8_t*>(b + kMemAlloc))(kMemberObjectBytes);
+    if (!mem) return;
+    mem = reinterpret_cast<void*(__fastcall*)(void*)>(const_cast<uint8_t*>(b + kMemberCtor))(mem);
+    reinterpret_cast<void(__fastcall*)(void*, void*)>(const_cast<uint8_t*>(b + kMemberLoad2))(mem, node);
+    reinterpret_cast<void(__fastcall*)(void*, void*)>(const_cast<uint8_t*>(b + kMemberLoad1))(mem, node);
+    ctx->member = reinterpret_cast<uintptr_t>(mem);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+bool MemberLoadRaw(const char* path, MemberImportCtx* ctx) {
+  const uint8_t* b = Base();
+  __try {
+    reinterpret_cast<uint8_t(__fastcall*)(const char*, void*, void*, void*)>(const_cast<uint8_t*>(b + kDocLoadFile))(
+        path, nullptr, reinterpret_cast<void*>(&MemberImportCb), ctx);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return ctx->member != 0;
+}
+
+// The tail of the game's table allocation (1BD2E20) for slot n, with the member already built: a live member in the slot
+// is removed from the faction manager and released, the manager registers the slot, the new member takes it.
+bool MemberPlaceRaw(uintptr_t table, uint32_t n, uintptr_t member) {
+  const uint8_t* b = Base();
+  uintptr_t begin = 0, game = 0, mgr = 0, reg_arg = 0;
+  if (!ReadQ(table + 0x18, &begin) || !ReadQ(reinterpret_cast<uintptr_t>(b) + kGameGlobal, &game) || !game ||
+      !ReadQ(game + 0x6C68, &mgr) || !mgr || !ReadQ(table + 0xA8, &reg_arg))
+    return false;
+  const uintptr_t slot = begin + 8 * (uintptr_t)n;
+  __try {
+    if (reinterpret_cast<uint8_t(__fastcall*)(void*)>(const_cast<uint8_t*>(b + kSlotLive))(reinterpret_cast<void*>(slot)) & 1) {
+      uintptr_t old = *reinterpret_cast<uintptr_t*>(slot);
+      reinterpret_cast<void(__fastcall*)(void*, void*)>(const_cast<uint8_t*>(b + kMgrRemove))(reinterpret_cast<void*>(mgr), reinterpret_cast<void*>(old));
+      reinterpret_cast<void(__fastcall*)(void*, void*)>(const_cast<uint8_t*>(b + kSlotReset))(reinterpret_cast<void*>(slot), nullptr);
+    }
+    reinterpret_cast<void(__fastcall*)(void*, void*, uint32_t)>(const_cast<uint8_t*>(b + kMgrRegister))(reinterpret_cast<void*>(mgr),
+                                                                                                         reinterpret_cast<void*>(reg_arg), n);
+    uintptr_t holder = member;
+    reinterpret_cast<void(__fastcall*)(void*, void*)>(const_cast<uint8_t*>(b + kSlotAssign))(reinterpret_cast<void*>(slot), &holder);
+    *reinterpret_cast<uint32_t*>(member + 0x174) = n;
+    reinterpret_cast<void(__fastcall*)(void*)>(const_cast<uint8_t*>(b + kHolderRelease))(&holder);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return true;
+}
+
+bool ReadWholeFile(const std::string& path, std::string* out) {
+  HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  const DWORD size = GetFileSize(h, nullptr);
+  out->assign(size == INVALID_FILE_SIZE ? 0 : size, '\0');
+  DWORD got = 0;
+  const bool ok = size != INVALID_FILE_SIZE && (size == 0 || ReadFile(h, &(*out)[0], size, &got, nullptr)) && got == size;
+  CloseHandle(h);
+  return ok;
+}
+
+bool WriteWholeFile(const std::string& path, const std::string& data) {
+  HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD put = 0;
+  const bool ok = data.empty() || WriteFile(h, data.data(), (DWORD)data.size(), &put, nullptr);
+  CloseHandle(h);
+  return ok && put == data.size();
+}
+
+}  // namespace
+
+uint64_t SimMemberSeed(uintptr_t member) {
+  uintptr_t seed = 0;
+  return member && ReadQ(member + 0x168, &seed) ? (uint64_t)seed : 0;
+}
+
+bool SimMemberExport(uintptr_t member, std::string* text, std::string* err) {
+  if (!MemberFnsOk()) {
+    *err = "the member save functions differ from the known build; refused";
+    return false;
+  }
+  const std::string path = MemberTempPath();
+  DeleteFileA(path.c_str());
+  if (!MemberExportRaw(member, path.c_str())) {
+    *err = "the game could not save the member";
+    return false;
+  }
+  const bool ok = ReadWholeFile(path, text);
+  DeleteFileA(path.c_str());
+  if (!ok) *err = "the saved member could not be read back";
+  return ok;
+}
+
+bool SimMemberImport(uint32_t faction_hash, uint32_t id, const std::string& text, std::string* err) {
+  if (!MemberFnsOk()) {
+    *err = "the member load functions differ from the known build; refused";
+    return false;
+  }
+  uintptr_t region = 0;
+  for (int pass = 0; pass < 2 && !region; ++pass) {
+    for (unsigned i = 0; i < g_region_count && !region; ++i)
+      if (RegionHash(g_regions[i]) == faction_hash) region = g_regions[i];
+    if (!region && pass == 0) SimFactionPrime();
+  }
+  uintptr_t table = 0, begin = 0, end = 0, limit_q = 0;
+  if (!region || !ReadQ(region + 0x20, &table) || !table || !ReadQ(table + 0x18, &begin) || !ReadQ(table + 0x20, &end) ||
+      !ReadQ(table + 0xB0, &limit_q)) {
+    *err = "no member table for that faction";
+    return false;
+  }
+  if (id >= (end - begin) / 8 || id >= (uint32_t)limit_q) {
+    *err = "the member's slot is beyond this copy's table";
+    return false;
+  }
+  const std::string path = MemberTempPath();
+  if (!WriteWholeFile(path, text)) {
+    *err = "cannot write the member's text";
+    return false;
+  }
+  MemberImportCtx ctx;
+  const bool loaded = MemberLoadRaw(path.c_str(), &ctx);
+  DeleteFileA(path.c_str());
+  if (!loaded) {
+    *err = "the game could not read the member";
+    return false;
+  }
+  if (!MemberPlaceRaw(table, id, ctx.member)) {
+    *err = "the member could not be put into its slot";
+    return false;
+  }
+  return true;
+}
+
+bool SimCall(const std::function<void()>& fn, unsigned timeout_ms) {
+  HANDLE ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+  if (!ev) return false;
+  EnterCriticalSection(&g_lock);
+  g_tasks.emplace_back(fn, ev);
+  InterlockedExchange(&g_task_count, 1);
+  LeaveCriticalSection(&g_lock);
+  if (WaitForSingleObject(ev, timeout_ms) != WAIT_OBJECT_0) return false;  // the handle is left to the task
+  CloseHandle(ev);
+  return true;
 }
 
 bool SimFactionReplay(uintptr_t handler_rva, const SimFactionEvent& e, std::string* err) {
@@ -4015,6 +4276,20 @@ bool SimEnemyRead(uintptr_t owner, SimEnemyInfo* out) {
     TraceObjectName(type_rec, name);
     strncpy_s(out->type, name, _TRUNCATE);
   }
+  // A captain keeps his Nemesis member's reference in the character: the faction record (+0x2708), the member id (+0x2710,
+  // -1 for anyone else).
+  out->member_id = 0xFFFFFFFFu;
+  uintptr_t faction = 0, id_q = 0;
+  uint32_t head[2] = {};
+  if (ReadQ(owner + 0x2710, &id_q) && (uint32_t)id_q != 0xFFFFFFFFu && ReadQ(owner + 0x2708, &faction) && faction &&
+      CopyMem(head, faction, 8) && head[0] == 0xA51) {
+    char name[40];
+    if (SimFindMember(head[1], (uint32_t)id_q, name)) {
+      out->member_id = (uint32_t)id_q;
+      out->faction_hash = head[1];
+      strncpy_s(out->member_name, name, _TRUNCATE);
+    }
+  }
   return true;
 }
 
@@ -4040,6 +4315,13 @@ bool SimProxyAdopt(uintptr_t owner) {
   } __except (EXCEPTION_EXECUTE_HANDLER) {
   }
   return true;
+}
+
+void SimProxyDetachMember(uintptr_t owner) {
+  __try {
+    *reinterpret_cast<volatile uint32_t*>(owner + 0x2710) = 0xFFFFFFFFu;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
 }
 
 void SimProxyDrop(uintptr_t owner) {

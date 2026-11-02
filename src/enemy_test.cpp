@@ -77,6 +77,112 @@ int main() {
           "a snapshot holds at most 16 enemies and stays under 600 bytes");
   }
 
+  printf("[captains: the member behind an enemy]\n");
+  {
+    HostTracker h;
+    ClientTracker c;
+    Seen cap = Orc(0x1000, 0, 0, "OlogHai_Infantry");
+    cap.member_id = 99;
+    cap.faction_hash = 0xA1B2C3D4;
+    CopyName(cap.name, "Ur-Gram");
+    auto o = h.update({cap, Orc(0x2000, 500, 0, "Orc_Archer")}, 1000);
+    int members = 0, news = 0;
+    for (const auto& e : o.events) {
+      members += e[0] == kOpMember;
+      news += e[0] == kOpNew;
+    }
+    Check(news == 2 && members == 1, "a captain gets a MEMBER after his NEW, an ordinary orc none");
+    Check(o.events.size() == 3 && o.events[1][0] == kOpMember && o.events[1].size() == kMemberBytes, "right after his NEW, in one fixed size");
+    std::vector<uint32_t> gone;
+    for (const auto& e : o.events) c.onEvent(e.data(), e.size(), &gone);
+    const Proxy* pc = nullptr;
+    for (auto& kv : c.proxies())
+      if (strcmp(kv.second.type, "OlogHai_Infantry") == 0) pc = &kv.second;
+    Check(pc && pc->member_id == 99 && pc->faction_hash == 0xA1B2C3D4 && strcmp(pc->name, "Ur-Gram") == 0,
+          "the client reads the member's id, faction and name");
+    o = h.update({cap, Orc(0x2000, 500, 0, "Orc_Archer")}, 1100);
+    Check(o.events.empty(), "it is said once, not every tick");
+    cap.member_id = 100;
+    o = h.update({cap, Orc(0x2000, 500, 0, "Orc_Archer")}, 1200);
+    Check(o.events.size() == 1 && o.events[0][0] == kOpMember, "and again if the character is another member");
+    h.forgetAll();
+    o = h.update({cap}, 1300);
+    Check(o.events.size() == 2 && o.events[1][0] == kOpMember, "a new session announces the captain again");
+    // bad input
+    std::vector<uint8_t> shortm(kMemberBytes - 1, 0);
+    shortm[0] = kOpMember;
+    Check(!c.onEvent(shortm.data(), shortm.size(), &gone), "a MEMBER of the wrong length is refused");
+    std::vector<uint8_t> orphan = MemberEvent(777, 1, 2, "Nobody");
+    Check(c.onEvent(orphan.data(), orphan.size(), &gone) && c.proxies().size() == 2, "a MEMBER for an enemy the client does not know changes nothing");
+    std::vector<uint8_t> unterminated(kMemberBytes, 'A');
+    unterminated[0] = kOpMember;
+    const uint32_t known = c.proxies().begin()->first;
+    memcpy(&unterminated[1], &known, 4);
+    c.onEvent(unterminated.data(), unterminated.size(), &gone);
+    Check(c.proxies()[known].name[kNameBytes - 1] == 0, "a name without an end is cut");
+  }
+
+  printf("[members: the game's text for a member, in chunks]\n");
+  {
+    std::string text;
+    for (int i = 0; i < 8048; ++i) text.push_back((char)('a' + i % 23));  // about the size of one member's text
+    const auto ev = MemberDataEvents(0xAABBCCDD, 99, 0x1122334455667788ull, text);
+    Check(ev.size() == 9 && ev[0][0] == kOpMemberData, "8,048 bytes go in 9 messages");
+    bool fits = true;
+    for (const auto& e : ev) fits = fits && e.size() <= sizeof(MemberDataHead) + kMemberChunk && e.size() < 1000;
+    Check(fits, "each under a datagram");
+    MemberAssembler a;
+    uint32_t hash = 0, id = 0;
+    uint64_t seed = 0;
+    std::string back;
+    bool done = false;
+    for (size_t i = 0; i < ev.size(); ++i) {
+      done = a.add(ev[i].data(), ev[i].size(), &hash, &id, &seed, &back);
+      Check(done == (i + 1 == ev.size()), "the member is complete at the last chunk only") ;
+      if (done != (i + 1 == ev.size())) break;
+    }
+    Check(done && hash == 0xAABBCCDD && id == 99 && seed == 0x1122334455667788ull && back == text, "and reads back whole");
+    // a chunk missing: nothing comes out, the next member is read fine
+    MemberAssembler b;
+    b.add(ev[0].data(), ev[0].size(), &hash, &id, &seed, &back);
+    Check(!b.add(ev[2].data(), ev[2].size(), &hash, &id, &seed, &back), "a chunk out of order is dropped");
+    bool again = false;
+    for (const auto& e : ev) again = b.add(e.data(), e.size(), &hash, &id, &seed, &back);
+    Check(again && back == text, "and the member sent again is read");
+    // another member's chunk in the middle
+    const auto other = MemberDataEvents(1, 2, 3, text);
+    MemberAssembler c;
+    c.add(ev[0].data(), ev[0].size(), &hash, &id, &seed, &back);
+    Check(!c.add(other[1].data(), other[1].size(), &hash, &id, &seed, &back), "a chunk of another member in the middle is dropped");
+    // bad input
+    uint8_t junk[5] = {kOpMemberData, 1, 2, 3, 4};
+    Check(!c.add(junk, sizeof junk, &hash, &id, &seed, &back), "a short message is refused");
+    MemberDataHead bad{};
+    bad.op = kOpMemberData;
+    bad.count = 65;
+    std::vector<uint8_t> toomany(reinterpret_cast<uint8_t*>(&bad), reinterpret_cast<uint8_t*>(&bad) + sizeof bad);
+    Check(!c.add(toomany.data(), toomany.size(), &hash, &id, &seed, &back), "more than 64 chunks is refused");
+    bad.count = 2;
+    bad.index = 2;
+    std::vector<uint8_t> past(reinterpret_cast<uint8_t*>(&bad), reinterpret_cast<uint8_t*>(&bad) + sizeof bad);
+    Check(!c.add(past.data(), past.size(), &hash, &id, &seed, &back), "a chunk index past the count is refused");
+    Check(MemberDataEvents(1, 1, 1, std::string(kMemberChunk * kMemberMaxChunks + 1, 'x')).empty(), "a text over 64 chunks is not sent");
+    const auto empty = MemberDataEvents(5, 6, 7, "");
+    MemberAssembler d;
+    Check(empty.size() == 1 && d.add(empty[0].data(), empty[0].size(), &hash, &id, &seed, &back) && back.empty(), "an empty text is one empty chunk");
+    // the host's list of what it sent
+    MemberAnnounced m;
+    Check(m.needs(1, 2, 3) && !m.needs(1, 2, 3), "a member is sent once");
+    Check(m.needs(1, 2, 4) && !m.needs(1, 2, 4), "and again when the slot holds another member (another seed)");
+    Check(m.needs(1, 3, 3) && m.needs(2, 2, 3), "another id or another faction is another member");
+    m.forgetAll();
+    Check(m.needs(1, 2, 4), "a new session sends everything again");
+    Check(!ClientTrackerAcceptsNemesis(), "the enemy tracker does not take member data as an enemy message (checked with the Nemesis message)");
+    ClientTracker ct;
+    std::vector<uint32_t> gone;
+    Check(!ct.onEvent(ev[0].data(), ev[0].size(), &gone) && ct.proxies().empty(), "member data is not an enemy event either");
+  }
+
   printf("[client: events, snapshots, bad input]\n");
   {
     HostTracker h;

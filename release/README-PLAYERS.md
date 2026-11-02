@@ -64,6 +64,8 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 - The host's Nemesis events (captains threatening, duelling, dying, being promoted; the player's kills and deaths and the
   promotions they cause) are sent to the client, whose game runs the same events on its own Nemesis world, so the two
   worlds keep the same captains in the same places. The client's own Nemesis events and ambushes are off.
+- A captain the host meets is shown on the client as himself: the client's game builds him from its own copy of his
+  Nemesis record (made from the host's if it has none), the way the game builds its own captains. What was checked: the same Nemesis record, seed and faction on both sides, and a screenshot of him on the client.
 - The game's slow motion (combat finishers, wraith aiming, domination scenes) is switched off on both sides, so neither player slows the other's world.
 - A client that quits or crashes can rejoin; the host forgets a lost client after a minute.
 
@@ -74,10 +76,16 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
   5 seconds the host's enemies disappear from the client's screen, and they come back when the host plays on. (The
   host's death screen itself was not tried; a stop of the host's game was.) If the client dies, the game's own death
   flow runs on its copy.
-- The client cannot fast-travel by itself: if it does (or respawns far away), it is taken back to the host about 3 s after it arrives. A captain
-  the host meets appears on the client as an ordinary orc of the same kind (his name, level and traits are not shown);
-  fortress sieges and other world events are the host's only. Setting `coop_nemesis=share` in the client's `sowguard.ini`
+- The client cannot fast-travel by itself: if it does (or respawns far away), it is taken back to the host about 3 s after it arrives. Fortress
+  sieges and other world events are the host's only. Setting `coop_nemesis=share` in the client's `sowguard.ini`
   turns off the client running the host's Nemesis events (it only logs them).
+- A captain the host's game made after the client joined (a replacement for a dead one, a promoted orc) is sent to the client
+  as the game's own text for him (about 8 KB, once) and made there in the same slot, so the host's events about him apply and
+  he is shown as himself. Checked on one PC: members made that way read back the same as the host's, and the events the
+  client applied matched the host's in order and names. What the host's kill code sets on a member (he is dead, how he died) is
+  not carried: only the host's Nemesis events are, so a captain the host killed may still be alive in the client's Nemesis
+  world. `coop_member_data=off` in the host's `sowguard.ini` stops the sending; `coop_captain_look=off` in the client's shows
+  every captain as an ordinary orc.
 - Animation: the stand-in has no leap animation (it keeps its position right, the pose is wrong); the client sees no
   hit reaction on an enemy until the host's enemy reacts (about a tenth of a second).
 - The decoy ally may show next to the client's stand-in on the host's screen.
