@@ -27,12 +27,19 @@ struct CoopConfig {
   float enemy_radius = 3500.0f;        // coop_enemy_radius: enemies within this of either player are shared
   bool slowmo_off = true;              // coop_slowmo=on keeps the game's slow motion; by default co-op has none (a role is set)
   uintptr_t slowmo_rva = 0x5CF709;     // the `jne` after slow motion's per-timer test
+  uintptr_t slowmo_request_rva = 0x5D08B8;  // the game's slow-motion request function (coop_slowmo=on caps it on a client)
+  unsigned slowmo_cap_ms = 4000;       // a slow-motion request on a client is ended after this
   bool nemesis = true;                 // coop_nemesis=off: the host's Nemesis events are not recorded or sent
   bool nemesis_follow = true;          // a client runs the host's Nemesis events and drops its own; coop_nemesis=share only records
   bool captain_look = true;            // coop_captain_look=off: the host's captains are shown as the type's generic orc
   bool member_data = true;             // coop_member_data=off: the host does not send the members the client may lack
   bool follow_travel = true;          // coop_follow_travel=off: a client does not follow the host's long jumps (fast travel)
-  bool decoy = false;                  // coop_decoy=on: enemies attack an invisible-ish ally where the stand-in stands
+  float wake_radius = 600.0f;          // coop_wake_radius: idle hostile enemies this near the client's decoy are woken (0: not)
+  bool anim_mirror = true;             // coop_anim_mirror=off: the client guesses its proxies' animations from their speed
+  uintptr_t action_start_rva = 0x195988;  // the animation state machine's start-action function
+  bool local_damage_report = true;     // coop_local_damage=off: damage done to a proxy here by an arrow is not told to the host
+  bool proxy_react = true;             // coop_proxy_react=off: the client's strikes on proxies are only reported (no reaction shown)
+  bool decoy = true;                   // coop_decoy=on: enemies attack an invisible-ish ally where the stand-in stands
   float decoy_dy = 0.0f;               // coop_decoy_dy: its height above the stand-in
   bool enemy_direct = true;            // proxies are placed by writing their transform (not the game's teleport)
   uintptr_t play_rva = 0x664CA4;       // starts a named graph action
@@ -102,6 +109,8 @@ std::string CoopEnemyStatus();
 
 // Probe "damage abs:<proxy> <attack id hex>": a swing of that proxy hits this copy's player (the client's damage path).
 std::string CoopTestDamage(uintptr_t proxy, uint32_t attack_id);
+// Experiment: kills a character through the game's hit function (on the simulation thread).
+std::string CoopTestKill(uintptr_t who);
 // Probe "standinhit abs:<enemy> <attack id hex>" (host): that enemy swings at the stand-in of the client.
 std::string CoopTestStandinHit(uintptr_t enemy, uint32_t attack_id);
 

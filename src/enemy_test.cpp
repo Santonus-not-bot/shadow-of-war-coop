@@ -183,6 +183,30 @@ int main() {
     Check(!ct.onEvent(ev[0].data(), ev[0].size(), &gone) && ct.proxies().empty(), "member data is not an enemy event either");
   }
 
+  printf("[animation: the host's graph actions]\n");
+  {
+    HostTracker h;
+    ClientTracker c;
+    auto o = h.update({Orc(0x1000, 0, 0)}, 1000);
+    std::vector<uint32_t> gone;
+    for (const auto& e : o.events) c.onEvent(e.data(), e.size(), &gone);
+    const uint32_t id = c.proxies().begin()->first;
+    const std::vector<uint8_t> a = AnimEvent(id, "WalkForward");
+    Check(a.size() == kAnimBytes && a[0] == kOpAnim, "an animation message is one fixed size");
+    Check(c.onEvent(a.data(), a.size(), &gone) && strcmp(c.proxies()[id].anim, "WalkForward") == 0 && c.proxies()[id].anim_seq == 1,
+          "the client keeps the action's name and counts it");
+    const std::vector<uint8_t> b = AnimEvent(id, "WalkForward");
+    c.onEvent(b.data(), b.size(), &gone);
+    Check(c.proxies()[id].anim_seq == 2, "each message counts (the same action started again is played again)");
+    const std::vector<uint8_t> long_name = AnimEvent(id, "ThisActionNameIsFarLongerThanThirtyOneBytesForSure");
+    Check(strlen(reinterpret_cast<const char*>(&long_name[5])) == 31, "a long name is cut to fit");
+    const std::vector<uint8_t> other = AnimEvent(9999, "Run");
+    Check(c.onEvent(other.data(), other.size(), &gone) && c.proxies().size() == 1, "a message for an enemy the client does not know changes nothing");
+    std::vector<uint8_t> shortmsg(kAnimBytes - 1, 0);
+    shortmsg[0] = kOpAnim;
+    Check(!c.onEvent(shortmsg.data(), shortmsg.size(), &gone), "a short one is refused");
+  }
+
   printf("[client: events, snapshots, bad input]\n");
   {
     HostTracker h;

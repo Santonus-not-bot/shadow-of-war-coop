@@ -20,9 +20,9 @@ constexpr size_t kMaxEnemies = 16;
 constexpr size_t kTypeBytes = 32;
 constexpr size_t kNameBytes = 40;
 constexpr uint32_t kNoMember = 0xFFFFFFFFu;
-enum Op : uint8_t { kOpNew = 1, kOpGone = 2, kOpHit = 3, kOpDamage = 4, kOpNemesis = 5, kOpMember = 6, kOpMemberData = 7 };
+enum Op : uint8_t { kOpNew = 1, kOpGone = 2, kOpHit = 3, kOpDamage = 4, kOpNemesis = 5, kOpMember = 6, kOpMemberData = 7, kOpAnim = 8 };
 enum Loco : uint8_t { kIdle = 0, kWalk = 1, kRun = 2 };
-enum Flag : uint8_t { kAlive = 1 };
+enum Flag : uint8_t { kAlive = 1, kTargetsClient = 2 };  // kTargetsClient: the host's enemy is after the client's stand-in
 
 #pragma pack(push, 1)
 struct Rec {
@@ -236,6 +236,7 @@ struct Seen {
   uint32_t attack_id = 0, attack_stamp = 0;
   float hp_frac = 1.0f;
   bool alive = true;
+  bool targets_client = false;  // its target on the host is the client's decoy
   char type[kTypeBytes] = {};
   uint32_t member_id = kNoMember;  // a captain: his Nemesis member (the id in his faction's table), else kNoMember
   uint32_t faction_hash = 0;       // the name hash of that faction's record
@@ -249,6 +250,17 @@ inline void CopyType(char out[kTypeBytes], const char* name) {
 inline void CopyName(char out[kNameBytes], const char* name) {
   memset(out, 0, kNameBytes);
   for (size_t i = 0; name && name[i] && i + 1 < kNameBytes; ++i) out[i] = name[i];
+}
+
+// ANIM (reliable, host to client): the graph action the host's enemy has just started ("WalkForward", an attack's animation),
+// by name; the client's proxy starts the same action on its graph.
+constexpr size_t kAnimBytes = 1 + 4 + 32;
+inline std::vector<uint8_t> AnimEvent(uint32_t id, const char* name) {
+  std::vector<uint8_t> e(kAnimBytes, 0);
+  e[0] = kOpAnim;
+  memcpy(&e[1], &id, 4);
+  for (size_t i = 0; name && name[i] && i < 31; ++i) e[5 + i] = (uint8_t)name[i];
+  return e;
 }
 
 // MEMBER (reliable, host to client): the Nemesis member behind an enemy, announced after its NEW (and again if it changes):
@@ -326,7 +338,7 @@ class HostTracker {
       r.attack_id = s.attack_id;
       r.attack_stamp = s.attack_stamp;
       r.hp = (uint16_t)std::max(0.0f, std::min(65535.0f, s.hp_frac * 65535.0f));
-      r.flags = s.alive ? kAlive : 0;
+      r.flags = (s.alive ? kAlive : 0) | (s.targets_client ? kTargetsClient : 0);
       r.loco = e.loco;
     }
     for (auto it = map_.begin(); it != map_.end();) {
@@ -396,6 +408,12 @@ struct Proxy {
   uint32_t member_id = kNoMember, faction_hash = 0;  // the captain behind it, once the host has said
   char name[kNameBytes] = {};
   uint32_t built_member = kNoMember;  // the member the spawned proxy was built from (the game side)
+  char anim[32] = {};                 // the host's latest graph action for it (empty: none yet)
+  uint32_t anim_seq = 0, applied_anim_seq = 0;
+  uint64_t anim_ms = 0;
+  uint64_t hit_ms = 0;                // when this player last struck it (or an arrow did)
+  float hp_written = -1.0f;            // the health this copy wrote last frame (anything below it was done here: an arrow)
+  bool killed = false;                // the proxy has been killed the game's way (its enemy died on the host)
   bool member_failed = false;         // this copy has no such member: the proxy is the type's generic orc
   uintptr_t handle = 0;
   bool spawn_failed = false;
@@ -424,6 +442,14 @@ class ClientTracker {
       pr.id = id;
       memcpy(pr.type, p + 5, kTypeBytes);
       pr.type[kTypeBytes - 1] = 0;
+      return true;
+    }
+    if (p[0] == kOpAnim && n == kAnimBytes) {
+      auto it = map_.find(id);
+      if (it == map_.end()) return true;
+      memcpy(it->second.anim, p + 5, 32);
+      it->second.anim[31] = 0;
+      ++it->second.anim_seq;
       return true;
     }
     if (p[0] == kOpMember && n == kMemberBytes) {

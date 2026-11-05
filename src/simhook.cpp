@@ -2235,6 +2235,7 @@ LONG g_hit_taken = 0;                // reports handed out so far
 volatile LONG g_hit_watch = 0;
 uintptr_t g_hit_gc = 0;
 volatile LONG g_proxy_hits = 0, g_proxy_hits_other = 0;
+volatile LONG g_proxy_react = 0;     // a hit of this copy's player on a proxy is also let through (reactions, counters, finishers)
 HitReportSlot g_dmg_ring[kHitRing];  // swings of enemies that reached the stand-in
 volatile LONG g_dmg_count = 0;
 LONG g_dmg_taken = 0;
@@ -2285,7 +2286,7 @@ bool __fastcall HitFilter(uintptr_t attacker, uintptr_t victim, const float* pos
   InterlockedIncrement(&g_hit_count);
   LeaveCriticalSection(&g_lock);
   InterlockedIncrement(&g_proxy_hits);
-  return true;
+  return g_proxy_react == 0;
 }
 
 }  // namespace
@@ -2401,6 +2402,8 @@ size_t SimHitReports(SimHitReport* out, size_t max) {
 }
 
 long SimProxyHits() { return g_proxy_hits; }
+
+void SimProxyReact(bool on) { InterlockedExchange(&g_proxy_react, on ? 1 : 0); }
 
 void SimStandinHurt(bool on) { InterlockedExchange(&g_standin_hurt, on ? 1 : 0); }
 
@@ -2900,6 +2903,136 @@ bool WriteWholeFile(const std::string& path, const std::string& data) {
 }
 
 }  // namespace
+
+bool SimMemberCharacter(uint32_t faction_hash, uint32_t id, uintptr_t* member, uintptr_t* character, float pos[3]) {
+  *member = SimFindMember(faction_hash, id, nullptr);
+  *character = 0;
+  if (!*member) return false;
+  uintptr_t ch = 0;
+  if (ReadQ(*member + 0x48, &ch) && ch && ReadFloats(ch + 0xAC, pos, 3)) *character = ch;
+  return true;
+}
+
+void SimMemberLink(uint32_t faction_hash, uint32_t id, uintptr_t character, uintptr_t only) {
+  const uintptr_t member = SimFindMember(faction_hash, id, nullptr);
+  if (!member) return;
+  __try {
+    volatile uintptr_t* slot = reinterpret_cast<volatile uintptr_t*>(member + 0x48);
+    if (character) {
+      if (*slot != character) *slot = character;
+    } else if (*slot == only) {
+      *slot = 0;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+namespace {
+constexpr unsigned kTapRing = 4096;
+volatile LONG g_tap_idx = 0;
+uintptr_t g_tap_graph[kTapRing] = {}, g_tap_def[kTapRing] = {};
+LONG g_tap_read = 0;
+volatile LONG g_tap_hook = 0;
+}  // namespace
+
+bool SimActionTapInstall(uintptr_t fn_rva, std::string* err) {
+  if (g_tap_hook) return true;
+  uint8_t* const fn = const_cast<uint8_t*>(Base()) + fn_rva;
+  if (!Head(fn, "488BC4488958104889701848897820" "55")) {
+    *err = "start-action bytes differ from the known build; refused";
+    return false;
+  }
+  uint8_t* page = SimNearPage(4);
+  if (!page) {
+    *err = "no code page near the game image";
+    return false;
+  }
+  // push rax; push r10; push r11; mov r11,&idx; mov eax,1; lock xadd [r11],eax; and eax,0FFFh; mov r10,[rsp+18h] (unused);
+  // mov r11,&graph; mov [r11+rax*8],rcx; mov r10,[rdx+60h]; mov r11,&def; mov [r11+rax*8],r10; pop r11; pop r10; pop rax;
+  // the first 7 bytes of the function and a jump after them.
+  std::vector<uint8_t> s = {0x50, 0x41, 0x52, 0x41, 0x53, 0x49, 0xBB};
+  PutQ(&s, reinterpret_cast<uintptr_t>(&g_tap_idx));
+  s.insert(s.end(), {0xB8, 0x01, 0x00, 0x00, 0x00, 0xF0, 0x41, 0x0F, 0xC1, 0x03, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0x49, 0xBB});
+  PutQ(&s, reinterpret_cast<uintptr_t>(g_tap_graph));
+  s.insert(s.end(), {0x49, 0x89, 0x0C, 0xC3, 0x4C, 0x8B, 0x52, 0x60, 0x49, 0xBB});
+  PutQ(&s, reinterpret_cast<uintptr_t>(g_tap_def));
+  s.insert(s.end(), {0x4D, 0x89, 0x14, 0xC3, 0x41, 0x5B, 0x41, 0x5A, 0x58});
+  s.insert(s.end(), fn, fn + 7);
+  s.insert(s.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+  PutQ(&s, reinterpret_cast<uintptr_t>(fn + 7));
+  DWORD old = 0;
+  if (s.size() > 256 || !VirtualProtect(page, 4096, PAGE_EXECUTE_READWRITE, &old)) {
+    *err = "cannot write the stub";
+    return false;
+  }
+  memcpy(page + 1792, s.data(), s.size());
+  VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+  FlushInstructionCache(GetCurrentProcess(), page, 4096);
+  if (!PatchJump(reinterpret_cast<uintptr_t>(fn), page + 1792, err)) return false;
+  g_tap_read = g_tap_idx;
+  InterlockedExchange(&g_tap_hook, 1);
+  SowLog(L"sim: graph action starts are recorded (rva:%llX)", (unsigned long long)fn_rva);
+  return true;
+}
+
+size_t SimActionTapDrain(SimActionStart* out, size_t max) {
+  if (!g_tap_hook) return 0;
+  LONG now = g_tap_idx;
+  if (now - g_tap_read > (LONG)kTapRing - 8) g_tap_read = now - (LONG)kTapRing + 8;  // fell behind: the oldest are gone
+  size_t n = 0;
+  while (g_tap_read != now && n < max) {
+    const unsigned slot = (unsigned)g_tap_read & (kTapRing - 1);
+    ++g_tap_read;
+    const uintptr_t graph = g_tap_graph[slot], def = g_tap_def[slot];
+    uintptr_t owner = 0, ch = 0;
+    if (!graph || !def || !ReadQ(graph + 0x28, &owner) || !owner || !ReadQ(owner + 0x40, &ch) || !ch) continue;
+    char name[65];
+    TraceObjectName(def, name);
+    if (!name[0]) continue;
+    out[n].character = ch;
+    memset(out[n].name, 0, sizeof out[n].name);
+    strncpy_s(out[n].name, name, _TRUNCATE);
+    ++n;
+  }
+  return n;
+}
+
+void SimSlowMoCap(uintptr_t request_rva, unsigned max_ms) {
+  static uintptr_t seen[16] = {};
+  static ULONGLONG since[16] = {};
+  const uint8_t* fn = Base() + request_rva;
+  uintptr_t mgr = 0, begin = 0, end = 0;
+  if (!Head(fn, "488BC448895808448848204C894018895010574883EC40") ||
+      !ReadQ(reinterpret_cast<uintptr_t>(Base()) + 0x2A86888, &mgr) || !mgr || !ReadQ(mgr, &begin) || !ReadQ(mgr + 8, &end) || end < begin ||
+      end - begin > 16 * 8)
+    return;
+  const ULONGLONG now = GetTickCount64();
+  uintptr_t now_seen[16] = {};
+  ULONGLONG now_since[16] = {};
+  unsigned n = 0;
+  for (uintptr_t p = begin; p < end && n < 16; p += 8) {
+    uintptr_t req = 0, id = 0;
+    if (!ReadQ(p, &req) || !req || !ReadQ(req + 0x80, &id)) continue;
+    ULONGLONG first = now;
+    for (int i = 0; i < 16; ++i)
+      if (seen[i] == req) first = since[i];
+    now_seen[n] = req;
+    now_since[n] = first;
+    ++n;
+    if (now - first > max_ms) {
+      __try {
+        reinterpret_cast<void(__fastcall*)(void*, uint32_t, void*, uint8_t)>(const_cast<uint8_t*>(fn))(reinterpret_cast<void*>(mgr), (uint32_t)id,
+                                                                                                         nullptr, 0);
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+      }
+      static int logged = 0;
+      if (++logged <= 10) SowLog(L"sim: a slow-motion request (source %u) was ended after %u ms", (unsigned)(id & 0xFFFFFFFF), max_ms);
+      now_since[n - 1] = now + 1000000;  // not again while it ramps out
+    }
+  }
+  memcpy(seen, now_seen, sizeof seen);
+  memcpy(since, now_since, sizeof since);
+}
 
 uint64_t SimMemberSeed(uintptr_t member) {
   uintptr_t seed = 0;
@@ -4005,6 +4138,7 @@ std::string SimGraphWatch(uintptr_t fn_rva, bool player, uintptr_t gameclient_rv
   if (!g_installed) return "err simulation-thread hook not installed (sim_hook)\n";
   if (!ms || ms > 20000) return "err usage: graphwatch <1..20000 ms> [player]\n";
   uint8_t* const fn = const_cast<uint8_t*>(Base()) + fn_rva;
+  if (g_tap_hook) return "err the action tap holds the start-action function\n";
   if (!g_gw_hook) {
     if (!Head(fn, "488BC4488958104889701848897820" "55")) return "err start-action bytes differ from the known build; refused\n";
     uint8_t* page = SimNearPage(4);
@@ -4293,12 +4427,42 @@ bool SimEnemyRead(uintptr_t owner, SimEnemyInfo* out) {
   return true;
 }
 
+bool SimHealthNow(uintptr_t owner, float* cur, float* max) {
+  uintptr_t health = 0;
+  float v[2] = {};
+  if (!CharacterHealth(owner, &health) || !ReadFloats(health + 0x428, &v[0], 1) || !ReadFloats(health + 0x42C, &v[1], 1)) return false;
+  *max = v[0];
+  *cur = v[1];
+  return true;
+}
+
+uint32_t SimAttackIdByName(const char* name) {
+  const uint8_t* hash_fn = Base() + 0x423E70;
+  if (!Head(hash_fn, "0FB60184C074274C8D0D")) return 0;
+  return reinterpret_cast<Hash_t>(const_cast<uint8_t*>(hash_fn))(name, nullptr, 0);
+}
+
+size_t SimProxyOwners(uintptr_t* owners, uintptr_t* healths, size_t max) {
+  size_t n = 0;
+  EnterCriticalSection(&g_lock);
+  for (int i = 0; i < kMaxProxy && n < max; ++i)
+    if (g_proxy_owner[i]) {
+      uintptr_t hp = 0;
+      CharacterHealth(g_proxy_owner[i], &hp);
+      owners[n] = g_proxy_owner[i];
+      healths[n] = hp;
+      ++n;
+    }
+  LeaveCriticalSection(&g_lock);
+  return n;
+}
+
 bool SimProxyValid(uintptr_t owner) {
   uintptr_t health = 0;
   return CharacterHealth(owner, &health);
 }
 
-bool SimProxyAdopt(uintptr_t owner) {
+bool SimProxyAdopt(uintptr_t owner, bool follower) {
   uintptr_t health = 0;
   if (!CharacterHealth(owner, &health)) return false;
   EnterCriticalSection(&g_lock);
@@ -4311,7 +4475,7 @@ bool SimProxyAdopt(uintptr_t owner) {
   LeaveCriticalSection(&g_lock);
   if (slot < 0) return false;
   __try {
-    *reinterpret_cast<volatile uint8_t*>(owner + kFollower) = 1;
+    if (follower) *reinterpret_cast<volatile uint8_t*>(owner + kFollower) = 1;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
   }
   return true;
@@ -4356,7 +4520,13 @@ bool SimProxyPlay(uintptr_t fn_rva, uintptr_t owner, const char* name) {
   return graph && CallPlayAction(graph, name, 0);
 }
 
-uintptr_t SimProxyAttack(uintptr_t thunk_rva, uintptr_t stop_rva, uintptr_t table_rva, uintptr_t owner, uint32_t id) {
+namespace {
+volatile LONG g_proxy_moves_ok = 0, g_proxy_moves_failed = 0;
+}  // namespace
+bool PlayAttackMoveOn(uintptr_t character, uintptr_t record);
+
+uintptr_t SimProxyAttack(uintptr_t thunk_rva, uintptr_t stop_rva, uintptr_t table_rva, uintptr_t owner, uint32_t id, bool at_player,
+                         uintptr_t gameclient_rva) {
   uintptr_t health = 0;
   if (!CharacterHealth(owner, &health)) return 0;
   if (!g_stop_attack) {
@@ -4365,8 +4535,22 @@ uintptr_t SimProxyAttack(uintptr_t thunk_rva, uintptr_t stop_rva, uintptr_t tabl
   }
   if (!g_start_attack && !StartAttackKnown(thunk_rva)) return 0;
   const uintptr_t rec = SimAttackRecord(table_rva, id);
-  return rec && CallStartAttack(health, rec) ? rec : 0;
+  uintptr_t target = 0;
+  if (at_player) {
+    uintptr_t gc = 0, player = 0;
+    if (ReadQ(reinterpret_cast<uintptr_t>(Base()) + gameclient_rva, &gc) && gc && ReadQ(gc + 0x888, &player) && player)
+      ReadQ(player + 0x26A8, &target);
+  }
+  if (!rec || !CallStartAttack(health, rec, target)) return 0;
+  // The swing itself is a move on the character's animation controller (an AI-off character plays none by itself): the same call
+  // the stand-in's swings use.
+  if (PlayAttackMoveOn(owner, rec)) InterlockedIncrement(&g_proxy_moves_ok);
+  else InterlockedIncrement(&g_proxy_moves_failed);
+  return rec;
 }
+
+long SimProxyMovesOk() { return g_proxy_moves_ok; }
+long SimProxyMovesFailed() { return g_proxy_moves_failed; }
 
 void SimProxyStopAttack(uintptr_t owner, uintptr_t record) {
   uintptr_t health = 0;
@@ -4470,6 +4654,68 @@ bool SimApplyDamage(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t attacker_o
   return true;
 }
 
+bool SimKillCharacter(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t owner, uintptr_t gameclient_rva, const char* attack_name) {
+  uintptr_t victim = 0, gc = 0, player = 0, attacker = 0;
+  if (!CharacterHealth(owner, &victim)) return false;
+  if (!ReadQ(reinterpret_cast<uintptr_t>(Base()) + gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &player) || !player ||
+      !ReadQ(player + 0x26A8, &attacker) || !attacker)
+    return false;
+  const uint8_t* hash_fn = Base() + 0x423E70;
+  if (!Head(hash_fn, "0FB60184C074274C8D0D")) return false;
+  const uint32_t id = reinterpret_cast<Hash_t>(const_cast<uint8_t*>(hash_fn))(attack_name, nullptr, 0);
+  const uintptr_t rec = SimAttackRecord(table_rva, id);
+  const uint8_t* f = Base() + hit_rva;
+  if (!rec || (!Head(f, "48895C240848896C24184889742420574156" "4157") && !(f[0] == 0xE9 || f[0] == 0xFF))) return false;
+  SimProxyDrop(owner);  // its hits are dropped while it is a proxy
+  float pos[3] = {};
+  if (!ReadFloats(owner + 0xAC, pos, 3)) return false;
+  __try {
+    *reinterpret_cast<volatile float*>(victim + 0x42C) = 1.0f;
+    reinterpret_cast<void(__fastcall*)(uintptr_t, uintptr_t, const float*, uintptr_t, uintptr_t, uint64_t)>(const_cast<uint8_t*>(f))(
+        attacker, victim, pos, rec, 0, 0);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  float now = 1.0f;
+  ReadFloats(victim + 0x42C, &now, 1);
+  return now <= 0.0f;
+}
+
+bool SimIsFollower(uintptr_t owner) {
+  uint8_t f = 0;
+  __try {
+    f = *reinterpret_cast<const volatile uint8_t*>(owner + kFollower);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return f != 0;
+}
+
+bool SimPokeEnemy(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t enemy_owner, uintptr_t attacker_owner, const char* attack_name) {
+  uintptr_t victim = 0, attacker = 0;
+  if (!CharacterHealth(enemy_owner, &victim) || !CharacterHealth(attacker_owner, &attacker)) return false;
+  const uint8_t* hash_fn = Base() + 0x423E70;
+  if (!Head(hash_fn, "0FB60184C074274C8D0D")) return false;
+  const uint32_t id = reinterpret_cast<Hash_t>(const_cast<uint8_t*>(hash_fn))(attack_name, nullptr, 0);
+  const uintptr_t rec = SimAttackRecord(table_rva, id);
+  const uint8_t* f = Base() + hit_rva;
+  if (!rec || (!Head(f, "48895C240848896C24184889742420574156" "4157") && !(f[0] == 0xE9 || f[0] == 0xFF))) return false;
+  float pos[3], hp_before = 0;
+  if (!ReadFloats(enemy_owner + 0xAC, pos, 3) || !ReadFloats(victim + 0x42C, &hp_before, 1) || !(hp_before > 0)) return false;
+  __try {
+    reinterpret_cast<void(__fastcall*)(uintptr_t, uintptr_t, const float*, uintptr_t, uintptr_t, uint64_t)>(const_cast<uint8_t*>(f))(
+        attacker, victim, pos, rec, 0, 0);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  __try {  // what the poke took is given back (a hit that killed it cannot be: left as it is)
+    float now = 0;
+    now = *reinterpret_cast<volatile float*>(victim + 0x42C);
+    if (now > 0 && now < hp_before) *reinterpret_cast<volatile float*>(victim + 0x42C) = hp_before;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return true;
+}
+
 bool SimDespawnNow(uintptr_t fn_rva, uintptr_t character) {
   const uint8_t* f = Base() + fn_rva;
   uintptr_t ai = 0, nav = 0, probe = 0;
@@ -4525,6 +4771,11 @@ uintptr_t SlotTarget(uintptr_t enemy, uintptr_t* slot_out) {
 }  // namespace
 
 uintptr_t SimEnemyTarget(uintptr_t enemy) { return SlotTarget(enemy, nullptr); }
+
+uintptr_t SimLocalPlayer(uintptr_t gameclient_rva) {
+  uintptr_t gc = 0, player = 0;
+  return ReadQ(reinterpret_cast<uintptr_t>(Base()) + gameclient_rva, &gc) && gc && ReadQ(gc + 0x888, &player) ? player : 0;
+}
 
 bool SimRetarget(uintptr_t enemy, uintptr_t target) {
   EnterCriticalSection(&g_lock);

@@ -1007,6 +1007,15 @@ void Init(HMODULE self) {
       const std::wstring capt = IniStr(ini, L"coop_captain_look");
       if (capt == L"off") cc.captain_look = false;
       else if (!capt.empty() && capt != L"on") Fatal(kExitConfig, L"coop_captain_look must be on or off (got %s)", capt.c_str());
+      const std::wstring prm = IniStr(ini, L"coop_proxy_react");
+      if (prm == L"off") cc.proxy_react = false;
+      else if (!prm.empty() && prm != L"on") Fatal(kExitConfig, L"coop_proxy_react must be on or off (got %s)", prm.c_str());
+      const std::wstring ldm = IniStr(ini, L"coop_local_damage");
+      if (ldm == L"off") cc.local_damage_report = false;
+      else if (!ldm.empty() && ldm != L"on") Fatal(kExitConfig, L"coop_local_damage must be on or off (got %s)", ldm.c_str());
+      const std::wstring amir = IniStr(ini, L"coop_anim_mirror");
+      if (amir == L"off") cc.anim_mirror = false;
+      else if (!amir.empty() && amir != L"on") Fatal(kExitConfig, L"coop_anim_mirror must be on or off (got %s)", amir.c_str());
       const std::wstring mdata = IniStr(ini, L"coop_member_data");
       if (mdata == L"off") cc.member_data = false;
       else if (!mdata.empty() && mdata != L"on") Fatal(kExitConfig, L"coop_member_data must be on or off (got %s)", mdata.c_str());
@@ -1015,8 +1024,10 @@ void Init(HMODULE self) {
       else if (!travel.empty() && travel != L"on") Fatal(kExitConfig, L"coop_follow_travel must be on or off (got %s)", travel.c_str());
       const std::wstring decoy = IniStr(ini, L"coop_decoy");
       if (decoy == L"on") cc.decoy = true;
-      else if (!decoy.empty() && decoy != L"off") Fatal(kExitConfig, L"coop_decoy must be on or off (got %s)", decoy.c_str());
+      else if (decoy == L"off") cc.decoy = false;
+      else if (!decoy.empty()) Fatal(kExitConfig, L"coop_decoy must be on or off (got %s)", decoy.c_str());
       cc.decoy_dy = (float)GetPrivateProfileIntW(L"sowguard", L"coop_decoy_dy", 0, ini.c_str());
+      cc.wake_radius = (float)GetPrivateProfileIntW(L"sowguard", L"coop_wake_radius", (INT)cc.wake_radius, ini.c_str());
       cc.enemy_radius = (float)GetPrivateProfileIntW(L"sowguard", L"coop_enemy_radius", (INT)cc.enemy_radius, ini.c_str());
       if (cc.enemy_radius < 500 || cc.enemy_radius > 20000) Fatal(kExitConfig, L"coop_enemy_radius must be 500..20000");
     }

@@ -46,6 +46,7 @@ HANDLE g_loaded = nullptr;      // set when the game reports the world starting
 // Probe "pad": a timed hold of buttons and sticks.
 struct Hold {
   WORD buttons = 0;
+  BYTE lt = 0, rt = 0;  // triggers: bits 16-23 and 24-31 of the probe's buttons value
   SHORT lx = 0, ly = 0, rx = 0, ry = 0;
   ULONGLONG until = 0;
   bool ended = true;
@@ -87,6 +88,8 @@ DWORD WINAPI PadGetState(DWORD user, XINPUT_STATE* state) {
   EnterCriticalSection(&g_hold_lock);
   if (GetTickCount64() < g_hold.until) {
     state->Gamepad.wButtons |= g_hold.buttons;
+    if (g_hold.lt) state->Gamepad.bLeftTrigger = g_hold.lt;
+    if (g_hold.rt) state->Gamepad.bRightTrigger = g_hold.rt;
     if (g_hold.lx || g_hold.ly) {
       state->Gamepad.sThumbLX = g_hold.lx;
       state->Gamepad.sThumbLY = g_hold.ly;
@@ -333,6 +336,8 @@ bool InputHold(unsigned buttons, int lx, int ly, int rx, int ry, unsigned ms, st
   auto stick = [](int v) { return (SHORT)std::max(-32768, std::min(32767, v)); };
   EnterCriticalSection(&g_hold_lock);
   g_hold.buttons = (WORD)buttons;
+  g_hold.lt = (BYTE)((buttons >> 16) & 0xFF);
+  g_hold.rt = (BYTE)((buttons >> 24) & 0xFF);
   g_hold.lx = stick(lx);
   g_hold.ly = stick(ly);
   g_hold.rx = stick(rx);

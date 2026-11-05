@@ -68,10 +68,22 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
   Nemesis record (made from the host's if it has none), the way the game builds its own captains. What was checked: the same Nemesis record, seed and faction on both sides, and a screenshot of him on the client.
 - The game's slow motion (combat finishers, wraith aiming, domination scenes) is switched off on both sides, so neither player slows the other's world.
 - A client that quits or crashes can rejoin; the host forgets a lost client after a minute.
+- Enemies on the client play the host's enemies' actions and attack moves; an enemy that dies on the host dies on the
+  client the game's way (death animation, body). Enemies near the client are pointed at it (the nearer player) and idle
+  ones near it are woken.
+- The counter prompt shows on the client for many (not all) attacks aimed at it.
+- The client's arrows count on the host (an arrow kill on the client becomes strikes on the host's enemy).
 
 ## Known problems
 
 - **Not tried on two PCs.** Only tested on one PC.
+- **Enemies sometimes stop attacking the client.** In the last three test sessions the host's enemies went after the
+  client's place but stayed 100-250 units away and never struck; earlier sessions on the same build were fine. Not
+  understood yet.
+- The counter prompt is missing for some attacks aimed at the client. Whether the client's counters and finishers now
+  show the enemy's animation was not confirmed (a change for it is in this build: `coop_proxy_react`).
+- A finisher by the client on an enemy is buggy (the enemy can vanish). A downed client is not attacked with a kill move.
+- An arrow's damage is sent as a few sword strikes, so the amount is approximate.
 - If the host's game stops (the death screen, a loading screen, its pause menu), the client gets no news from it: after
   5 seconds the host's enemies disappear from the client's screen, and they come back when the host plays on. (The
   host's death screen itself was not tried; a stop of the host's game was.) If the client dies, the game's own death
@@ -108,9 +120,16 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 ## Settings (`sowguard.ini`, written by `setup-copy.ps1`)
 
 `coop_role=host|client`, `coop_port` (host, default 47011), `coop_host=<address>:<port>` (client), `coop_password`,
-`coop_enemies=on|off`, `coop_decoy=on|off` (host), `coop_follow_travel=on|off` (client), `coop_slowmo=on` (keeps the game's slow motion; off by default in co-op), `coop_enemy_radius`
+`coop_enemies=on|off`, `coop_decoy=on|off` (host), `coop_anim_mirror=on|off`, `coop_wake_radius` (host, default 600, 0: off),
+`coop_proxy_react=on|off` and `coop_local_damage=on|off` (client), `coop_follow_travel=on|off` (client), `coop_slowmo=on` (keeps the game's slow motion, ended after 4 s on a client; off by default in co-op), `coop_enemy_radius`
 (default 3500), `coop_join=off`, `coop_join_timeout_sec` (default 20), `autoload_max_presses` (how many times the mod
 presses Continue for you at the menus; 0: none, you click). The full list is in `README.md`.
+
+## Sending logs
+
+The log is `<CopyDir>\profile\sowguard.log` (both players). It contains file paths, which include your Windows user
+name: replace it (for example with `USER`) before you send the file. Say which player (host or client) it is from, what
+you did and roughly when the problem happened.
 
 ## If something goes wrong
 

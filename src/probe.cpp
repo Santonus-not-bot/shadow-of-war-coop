@@ -650,6 +650,14 @@ void WatchArgs(std::istringstream& in, bool* player, std::string* then) {
   }
 }
 
+static void ReadTwoFloats(uintptr_t at, float* v) {
+  __try {
+    v[0] = *reinterpret_cast<const float*>(at);
+    v[1] = *reinterpret_cast<const float*>(at + 4);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
 std::string Handle(const std::string& line) {
   std::istringstream in(line);
   std::string cmd;
@@ -1115,6 +1123,17 @@ std::string Handle(const std::string& line) {
     return *result + "\n";
   } else if (cmd == "enemies") {
     out << CoopEnemyStatus();
+  } else if (cmd == "proxies") {
+    uintptr_t o[32], hh[32];
+    const size_t n = SimProxyOwners(o, hh, 32);
+    out << "ok proxies=" << n << "\n";
+    for (size_t i = 0; i < n; ++i) {
+      float v[2] = {-1, -1};
+      if (hh[i]) ReadTwoFloats(hh[i] + 0x428, v);
+      char pline[160];
+      snprintf(pline, sizeof pline, "owner=abs:%llX health=abs:%llX hp=%.1f/%.1f\n", (unsigned long long)o[i], (unsigned long long)hh[i], v[0], v[1]);
+      out << pline;
+    }
   } else if (cmd == "adopt") {
     // Experiment: make a character a proxy (its behavior tree skipped, a follower) / release it; "registry" starts the
     // enemy registry (needed for the skip).
@@ -1156,6 +1175,14 @@ std::string Handle(const std::string& line) {
     in >> a >> id;
     if (!ParseAddr(a, &who) || !who || id.empty()) return "err usage: damage abs:<proxy character> <attack id, hex>\n";
     out << CoopTestDamage(who, (uint32_t)strtoul(id.c_str(), nullptr, 16));
+  } else if (cmd == "kill") {
+    // Experiment: kill a character through the game's hit function (health 1, then a hit from this copy's player).
+    if (!g_cfg.write) return "err kill disabled (probe_write=0)" "\n";
+    std::string a;
+    uintptr_t who = 0;
+    in >> a;
+    if (!ParseAddr(a, &who) || !who) return "err usage: kill abs:<character>" "\n";
+    return CoopTestKill(who);
   } else if (cmd == "despawn") {
     if (!g_cfg.write) return "err despawn disabled (probe_write=0)\n";
     std::string a, r;

@@ -161,6 +161,27 @@ uintptr_t SimFindMember(uint32_t faction_hash, uint32_t id, char name[40]);
 // its faction's member table (replacing the member there). Simulation thread only (SimCall).
 // A member's random seed (+0x168): what tells two members of one slot apart. 0 if unreadable.
 uint64_t SimMemberSeed(uintptr_t member);
+// The character a member points to (member+0x48, what the game's presentations aim the camera at) and where it stands.
+// False if the member is not here; character 0 if it points at none.
+bool SimMemberCharacter(uint32_t faction_hash, uint32_t id, uintptr_t* member, uintptr_t* character, float pos[3]);
+// Makes a member's character (member+0x48) the given one, or, with character 0 (unlink), clears it if it is `only`. The
+// game's presentations (a captain's speech) aim the camera at the member's character; a proxy built from a member is not
+// linked by the spawn, so the client links it.
+void SimMemberLink(uint32_t faction_hash, uint32_t id, uintptr_t character, uintptr_t only);
+// Slow motion on the client (coop_slowmo=on) must not outlast the host's: the game's slow-motion requests (a captain's identify
+// pause, a finisher) that have been active for more than max_ms are ended through the request function (request_rva, bytes
+// checked; the manager is the global at RVA 2A86888). Simulation thread, every frame.
+void SimSlowMoCap(uintptr_t request_rva, unsigned max_ms);
+// The graph actions the game starts on any character (the animation state machine's: "WalkForward", an attack's animation): a stub
+// at the start-action function 195988 (bytes checked) records each start's graph and action definition in a ring on the animation
+// threads. Drain (simulation thread) gives, for each start since the last call, the character it is for and the action's name.
+// Not usable together with the probe's graphwatch (they hook the same function).
+bool SimActionTapInstall(uintptr_t fn_rva, std::string* err);
+struct SimActionStart {
+  uintptr_t character;
+  char name[32];
+};
+size_t SimActionTapDrain(SimActionStart* out, size_t max);
 bool SimMemberExport(uintptr_t member, std::string* text, std::string* err);
 bool SimMemberImport(uint32_t faction_hash, uint32_t id, const std::string& text, std::string* err);
 // Runs fn on the simulation thread at its next frame and waits (false: it had not run in time; fn then still runs later,
@@ -174,16 +195,29 @@ size_t SimEnemyList(uintptr_t* out, size_t max);  // the characters whose tree r
 bool SimEnemyRead(uintptr_t owner, SimEnemyInfo* out);
 // Proxies: characters the client spawned to show a host's enemy. Their behavior tree is skipped and they are
 // marked as the player's followers (out of the player's combat).
-bool SimProxyAdopt(uintptr_t owner);
+// follower: also mark it as the player's follower (an ally: out of the player's combat). A captain's proxy is not marked: the
+// player must be able to hit him, and the game shows an ally's level in blue.
+bool SimProxyAdopt(uintptr_t owner, bool follower = true);
 // A proxy made from a Nemesis member (SimSpawn's member) is let go of it: the character's member id becomes -1, so that what
 // happens to the character (its death) is an ordinary character's and does not touch the member.
 void SimProxyDetachMember(uintptr_t owner);
 void SimProxyDrop(uintptr_t owner);
 bool SimProxyValid(uintptr_t owner);
+// The characters taken as proxies now (owner, its health object) - for the probe.
+// The character's current and maximum health; false if it has no health object.
+bool SimHealthNow(uintptr_t owner, float* cur, float* max);
+// The id of an attack record by its name (the game's hash); 0 if the hash function is not the known one.
+uint32_t SimAttackIdByName(const char* name);
+size_t SimProxyOwners(uintptr_t* owners, uintptr_t* healths, size_t max);
 bool SimProxyMove(uintptr_t teleport_rva, uintptr_t owner, const float pos[3], const float rot[4], bool direct);
 bool SimProxyPlay(uintptr_t fn_rva, uintptr_t owner, const char* name);
 // Starts attack record `id` on the proxy; returns the record (0: none or failed) so it can be stopped later.
-uintptr_t SimProxyAttack(uintptr_t thunk_rva, uintptr_t stop_rva, uintptr_t table_rva, uintptr_t owner, uint32_t id);
+// at_player: the attack is started with this copy's own player as its target (the way the AI's own start does), so that the
+// game shows what it shows for an attack aimed at the player (the counter prompt); it does no damage by itself.
+uintptr_t SimProxyAttack(uintptr_t thunk_rva, uintptr_t stop_rva, uintptr_t table_rva, uintptr_t owner, uint32_t id, bool at_player = false,
+                         uintptr_t gameclient_rva = 0);
+long SimProxyMovesOk();      // attack moves played on proxies' controllers
+long SimProxyMovesFailed();
 void SimProxyStopAttack(uintptr_t owner, uintptr_t record);
 void SimProxyHealth(uintptr_t owner, float frac);
 // Tells an AI character to despawn once it is offscreen, now (the caller is the simulation thread).
@@ -238,10 +272,15 @@ struct SimHitReport {
   float pos[3];
 };
 void SimHitWatch(uintptr_t gameclient_rva, bool on);
+// A hit of this copy's player on a proxy is reported (SimHitReports) and also let through, so the game plays its reaction (a hit, a
+// counter, a finisher) on the proxy; the host's health is written over the damage every frame.
+void SimProxyReact(bool on);
 size_t SimHitReports(SimHitReport* out, size_t max);
 long SimProxyHits();
 // Redirecting an enemy's target (the character it attacks) to another character, kept up every frame: STAGE2-DESIGN.md.
 uintptr_t SimEnemyTarget(uintptr_t enemy);              // the character an AI character is after (0: none)
+// This copy's own player character (0 if none).
+uintptr_t SimLocalPlayer(uintptr_t gameclient_rva);
 bool SimRetarget(uintptr_t enemy, uintptr_t target);    // target 0: stop
 void SimApplyRetargets();                               // once a frame, on the simulation thread
 long SimRetargeted();
@@ -256,6 +295,17 @@ bool SimHitStandin(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t attacker_ow
 // The client: applies such a swing to this copy's own player; the attacker is the enemy's proxy.
 bool SimApplyDamage(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t attacker_owner, const float pos[3], uint32_t attack_id,
                     uintptr_t gameclient_rva);
+// The host: wakes an idle enemy by a hit from `attacker_owner` (the client's decoy): the game's hit function with the attack record
+// named `attack_name` (hash found by the game's own name hash, 423E70), then the enemy's health is put back to what it was: the
+// enemy keeps the decoy as the one that hit it (its target), at no cost. False if anything is not as known.
+bool SimPokeEnemy(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t enemy_owner, uintptr_t attacker_owner, const char* attack_name);
+// Kills a character the way the game does: its health put at 1, then a hit from this copy's own player with the attack record
+// `attack_name` through the game's hit function, so that the game's own death runs (the animation, the ragdoll, the removal of the
+// body later), not a health of 0 that the game never notices. The character is let go as a proxy first (its hits are otherwise
+// dropped). False if the call could not be made.
+bool SimKillCharacter(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t owner, uintptr_t gameclient_rva, const char* attack_name);
+// True if the character is marked as the player's follower (an ally).
+bool SimIsFollower(uintptr_t owner);
 // The host: applies a client's hit to the enemy `victim_owner` (attacker: the stand-in of the client).
 bool SimApplyHit(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t victim_owner, const float pos[3], uint32_t attack_id,
                  uintptr_t gameclient_rva);
