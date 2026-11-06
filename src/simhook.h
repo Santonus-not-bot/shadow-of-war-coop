@@ -284,11 +284,18 @@ uintptr_t SimLocalPlayer(uintptr_t gameclient_rva);
 bool SimRetarget(uintptr_t enemy, uintptr_t target);    // target 0: stop
 void SimApplyRetargets();                               // once a frame, on the simulation thread
 long SimRetargeted();
+// The only current targets a redirect replaces (the host's player and the decoy; 0, 0: any, as before session cg); an enemy that
+// took another target is left to it (counted).
+void SimRetargetFrom(uintptr_t a, uintptr_t b);
+long SimRetargetLeft();
+long SimRetargetSkipped();  // redirects not made: the enemy dead, or its target not a character
 // The host: swings of enemies that reach the stand-in are reported (and not taken) instead of skipped, so the client can
 // take them (SimDamageReports; the owner is the attacking enemy). Call before SimKeepPuppetUntargeted runs.
 void SimStandinHurt(bool on);
 // The decoy: an allied character the enemies attack where the stand-in is; hits on it are reported like the stand-in's.
 void SimSetDecoy(uintptr_t owner);
+// Diagnostic: the next n hits that reach the game's hit function are logged (types, health, roles of both characters).
+void SimHitLog(long n);
 void SimHideCharacter(uintptr_t owner);
 size_t SimDamageReports(SimHitReport* out, size_t max);
 bool SimHitStandin(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t attacker_owner, uint32_t attack_id);
@@ -306,9 +313,14 @@ bool SimPokeEnemy(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t enemy_owner,
 bool SimKillCharacter(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t owner, uintptr_t gameclient_rva, const char* attack_name);
 // True if the character is marked as the player's follower (an ally).
 bool SimIsFollower(uintptr_t owner);
-// The host: applies a client's hit to the enemy `victim_owner` (attacker: the stand-in of the client).
+// The host: applies a client's hit to the enemy `victim_owner`; the attacker is `attacker_owner` (the decoy), or this copy's own
+// player when that is 0 or not a character.
 bool SimApplyHit(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t victim_owner, const float pos[3], uint32_t attack_id,
-                 uintptr_t gameclient_rva);
+                 uintptr_t gameclient_rva, uintptr_t attacker_owner = 0);
+// The stand-in's own swings (it plays the other player's attacks) are dropped in the hit function when on: what the other player hits
+// is told by that player, and the stand-in's copy of the swing hurt the host's enemies a second time (session cg).
+void SimDropStandinHits(bool on);
+long SimStandinHitDrops();
 
 long SimTargetRejects();
 long SimHitDrops();

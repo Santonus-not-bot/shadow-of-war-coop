@@ -72,16 +72,22 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
   client the game's way (death animation, body). Enemies near the client are pointed at it (the nearer player) and idle
   ones near it are woken.
 - The counter prompt shows on the client for many (not all) attacks aimed at it.
+- The client's strikes make the enemy react on the client's screen (staggered, knocked back) and a killed enemy leaves its
+  body there (`coop_proxy_react`, on by default; checked in frames). A counter by the client was seen once: the prompt, the
+  counter move and the enemy thrown.
 - The client's arrows count on the host (an arrow kill on the client becomes strikes on the host's enemy).
 
 ## Known problems
 
 - **Not tried on two PCs.** Only tested on one PC.
-- **Enemies sometimes stop attacking the client.** In the last three test sessions the host's enemies went after the
-  client's place but stayed 100-250 units away and never struck; earlier sessions on the same build were fine. Not
-  understood yet.
-- The counter prompt is missing for some attacks aimed at the client. Whether the client's counters and finishers now
-  show the enemy's animation was not confirmed (a change for it is in this build: `coop_proxy_react`).
+- **Enemies sometimes stop attacking the client.** The host's enemies go after the client's place but stay 100-450 units
+  away and never strike. Seen after the client fought them, in places where orcs also fight each other; not seen in
+  runs where they did not. Not understood yet. This build changes how the client's hits are applied (`coop_hit_by`,
+  `coop_standin_hits`) and nudges an enemy that has not swung at the client for 20 s (`coop_stuck_sec`); in tests neither
+  made fights worse, but the stuck state did not come up, so whether the nudge frees it is not known. If it happens, the
+  host's log has `coop: stuck:` lines: please send them.
+- **The host's archers do not hurt the client.** Their arrows never land on the client's place on the host.
+- The counter prompt is missing for some attacks aimed at the client. Counters were tried once only.
 - A finisher by the client on an enemy is buggy (the enemy can vanish). A downed client is not attacked with a kill move.
 - An arrow's damage is sent as a few sword strikes, so the amount is approximate.
 - If the host's game stops (the death screen, a loading screen, its pause menu), the client gets no news from it: after
@@ -121,7 +127,11 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 
 `coop_role=host|client`, `coop_port` (host, default 47011), `coop_host=<address>:<port>` (client), `coop_password`,
 `coop_enemies=on|off`, `coop_decoy=on|off` (host), `coop_anim_mirror=on|off`, `coop_wake_radius` (host, default 600, 0: off),
-`coop_proxy_react=on|off` and `coop_local_damage=on|off` (client), `coop_follow_travel=on|off` (client), `coop_slowmo=on` (keeps the game's slow motion, ended after 4 s on a client; off by default in co-op), `coop_enemy_radius`
+`coop_proxy_react=on|off` and `coop_local_damage=on|off` (client), `coop_hit_by=poke|player|decoy` (host: how the client's
+hits are applied; `player` is the way builds before 2026-11-05 did it), `coop_standin_hits=off|on` (`on`: the other player's
+picture also hurts enemies with its copied swings, as before 2026-11-05), `coop_stuck_sec` (host, default 20, 0: off: an enemy
+that goes after the client but has not swung at it for this long is nudged; each time is logged as `coop: stuck:`, which helps
+with the problem below), `coop_follow_travel=on|off` (client), `coop_slowmo=on` (keeps the game's slow motion, ended after 4 s on a client; off by default in co-op), `coop_enemy_radius`
 (default 3500), `coop_join=off`, `coop_join_timeout_sec` (default 20), `autoload_max_presses` (how many times the mod
 presses Continue for you at the menus; 0: none, you click). The full list is in `README.md`.
 

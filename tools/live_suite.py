@@ -124,6 +124,16 @@ def flat(p):
     return (p[0], p[2])
 
 
+def host_own(a):
+    """The host's characters a test must never kill: its proxies (the decoy, a 300-health Gondorian_Soldier like an Orc_Infantry)
+    and its stand-in of the client. Probe `kill` drops a proxy from the proxy table first, so a cleanup that killed the decoy left it
+    unregistered (session cg)."""
+    own = {int(m, 16) for m in re.findall(r'owner=abs:([0-9A-F]+)', a.ask('proxies'))}
+    own.add(a.standin()[0])
+    own.discard(0)
+    return own
+
+
 def watch_spot(s, r):
     """For someone watching the receiver's window: its player at VIEW, in front of the sender's
     start (the sender's strikes lunge toward it), turned toward the sender, and its camera aimed

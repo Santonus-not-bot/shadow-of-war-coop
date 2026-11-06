@@ -1123,6 +1123,10 @@ std::string Handle(const std::string& line) {
     return *result + "\n";
   } else if (cmd == "enemies") {
     out << CoopEnemyStatus();
+  } else if (cmd == "coopset") {
+    std::string k, v;
+    in >> k >> v;
+    return CoopSet(k, v);
   } else if (cmd == "proxies") {
     uintptr_t o[32], hh[32];
     const size_t n = SimProxyOwners(o, hh, 32);

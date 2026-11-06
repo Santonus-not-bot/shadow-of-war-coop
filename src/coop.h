@@ -34,11 +34,19 @@ struct CoopConfig {
   bool captain_look = true;            // coop_captain_look=off: the host's captains are shown as the type's generic orc
   bool member_data = true;             // coop_member_data=off: the host does not send the members the client may lack
   bool follow_travel = true;          // coop_follow_travel=off: a client does not follow the host's long jumps (fast travel)
+  int stuck_sec = 20;                  // coop_stuck_sec: an enemy after the decoy, near it, without a swing at it this long is let go and poked (0: not)
   float wake_radius = 600.0f;          // coop_wake_radius: idle hostile enemies this near the client's decoy are woken (0: not)
   bool anim_mirror = true;             // coop_anim_mirror=off: the client guesses its proxies' animations from their speed
   uintptr_t action_start_rva = 0x195988;  // the animation state machine's start-action function
   bool local_damage_report = true;     // coop_local_damage=off: damage done to a proxy here by an arrow is not told to the host
   bool proxy_react = true;             // coop_proxy_react=off: the client's strikes on proxies are only reported (no reaction shown)
+  bool hunt_retarget = true;           // coop_hunt=off: the host does not point engaged enemies at the nearer player
+  bool hunt_strict = false;            // coop_hunt_strict=on: the pointing replaces only the host's player or the decoy as a target
+  // coop_hit_by: who the host's game is told made the client's hits. poke (2): the host's own player, then a harmless poke from
+  // the decoy so the enemy turns to it; decoy (1): the decoy (its hits did no damage in session cg, so it falls back to poke);
+  // player (0): the host's player only (before session cg).
+  int hit_by = 2;
+  bool standin_hits = false;           // coop_standin_hits=on: the stand-in's copies of the other player's swings hurt too
   bool decoy = true;                   // coop_decoy=on: enemies attack an invisible-ish ally where the stand-in stands
   float decoy_dy = 0.0f;               // coop_decoy_dy: its height above the stand-in
   bool enemy_direct = true;            // proxies are placed by writing their transform (not the game's teleport)
@@ -111,6 +119,8 @@ std::string CoopEnemyStatus();
 std::string CoopTestDamage(uintptr_t proxy, uint32_t attack_id);
 // Experiment: kills a character through the game's hit function (on the simulation thread).
 std::string CoopTestKill(uintptr_t who);
+// Experiment: changes a co-op setting while the game runs (decoy on|off, hunt on|off, wake <radius>).
+std::string CoopSet(const std::string& key, const std::string& value);
 // Probe "standinhit abs:<enemy> <attack id hex>" (host): that enemy swings at the stand-in of the client.
 std::string CoopTestStandinHit(uintptr_t enemy, uint32_t attack_id);
 

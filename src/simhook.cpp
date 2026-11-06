@@ -2240,9 +2240,47 @@ HitReportSlot g_dmg_ring[kHitRing];  // swings of enemies that reached the stand
 volatile LONG g_dmg_count = 0;
 LONG g_dmg_taken = 0;
 
+// Diagnostic (probe "coopset hitlog <n>"): the next n hits that reach the hit function are logged with both characters' types,
+// health and roles (who hits whom among the enemies near the decoy, session cg).
+volatile LONG g_hit_log_left = 0;
+volatile LONG g_drop_standin_hits = 0, g_standin_hit_drops = 0;
+
+void LogHitSeen(uintptr_t attacker, uintptr_t victim_owner, uintptr_t rec) {
+  uintptr_t att_owner = 0, gc = 0, pl = 0;
+  if (attacker) ReadQ(attacker + 0x28, &att_owner);
+  ReadQ(g_hit_gc, &gc);
+  if (gc) ReadQ(gc + 0x888, &pl);
+  SimEnemyInfo a{}, v{};
+  if (!att_owner || !SimEnemyRead(att_owner, &a)) strcpy_s(a.type, "?");
+  if (!SimEnemyRead(victim_owner, &v)) strcpy_s(v.type, "?");
+  uint32_t id = 0;
+  __try {
+    if (rec && *reinterpret_cast<const uint32_t*>(rec) == 0xA15) id = *reinterpret_cast<const uint32_t*>(rec + 4);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  auto role = [&](uintptr_t o) -> const char* {
+    if (!o) return "";
+    if (o == pl) return " [this player]";
+    if (o == g_decoy) return " [decoy]";
+    if (o == g_unhit) return " [stand-in]";
+    if (ProxyHas(o)) return " [proxy]";
+    return "";
+  };
+  SowLog(L"sim: hit seen: %S%S abs:%llX %.0f/%.0f <- %S%S abs:%llX %.0f/%.0f, attack %08X", v.type, role(victim_owner),
+         (unsigned long long)victim_owner, v.hp, v.max_hp, a.type, role(att_owner), (unsigned long long)att_owner, a.hp, a.max_hp, id);
+}
+
 bool __fastcall HitFilter(uintptr_t attacker, uintptr_t victim, const float* pos, uintptr_t rec) {
   uintptr_t owner = 0;
   if (!victim || !ReadQ(victim + 0x28, &owner) || !owner) return false;
+  if (g_hit_log_left > 0 && InterlockedDecrement(&g_hit_log_left) >= 0) LogHitSeen(attacker, owner, rec);
+  if (g_drop_standin_hits && g_unhit && attacker) {
+    uintptr_t att_owner = 0;
+    if (ReadQ(attacker + 0x28, &att_owner) && att_owner == g_unhit) {
+      InterlockedIncrement(&g_standin_hit_drops);
+      return true;
+    }
+  }
   if (owner == g_unhit || (g_decoy && owner == g_decoy)) {
     InterlockedIncrement(&g_hit_drops);
     if (g_standin_hurt) {
@@ -2408,6 +2446,9 @@ void SimProxyReact(bool on) { InterlockedExchange(&g_proxy_react, on ? 1 : 0); }
 void SimStandinHurt(bool on) { InterlockedExchange(&g_standin_hurt, on ? 1 : 0); }
 
 void SimSetDecoy(uintptr_t owner) { g_decoy = owner; }
+void SimHitLog(long n) { InterlockedExchange(&g_hit_log_left, n); }
+void SimDropStandinHits(bool on) { InterlockedExchange(&g_drop_standin_hits, on ? 1 : 0); }
+long SimStandinHitDrops() { return g_standin_hit_drops; }
 
 size_t SimDamageReports(SimHitReport* out, size_t max) {
   size_t n = 0;
@@ -4568,15 +4609,18 @@ void SimProxyHealth(uintptr_t owner, float frac) {
   }
 }
 
-// The host applies a hit of the client's: the game's own hit function, with this copy's stand-in of the client as the
-// attacker (the host's own player when there is none) and the enemy's health object as the victim.
+// The host applies a hit of the client's: the game's own hit function, with attacker_owner (the decoy) as the attacker, or
+// the host's own player when it is 0, and the enemy's health object as the victim.
 bool SimApplyHit(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t victim_owner, const float pos[3], uint32_t attack_id,
-                 uintptr_t gameclient_rva) {
+                 uintptr_t gameclient_rva, uintptr_t attacker_owner) {
   uintptr_t victim = 0, attacker = 0;
   if (!CharacterHealth(victim_owner, &victim)) return false;
   // The stand-in's health object as the attacker faulted inside the hit (a character without the player's links,
-  // session bm): the host's own player is the attacker.
-  {
+  // session bm). The decoy (an ordinary soldier) does not: the wake-up poke has used it since session cc. An enemy hit by the
+  // host's player turns to the host's player, and one the hunt then pointed back at the decoy stood still (session cg).
+  if (attacker_owner && !CharacterHealth(attacker_owner, &attacker)) attacker = 0;
+  const bool given = attacker != 0;  // the hit is attacker_owner's (not this copy's player's)
+  if (!attacker) {
     uintptr_t gc = 0, player = 0;
     if (!ReadQ(reinterpret_cast<uintptr_t>(Base()) + gameclient_rva, &gc) || !gc || !ReadQ(gc + 0x888, &player) || !player ||
         !ReadQ(player + 0x26A8, &attacker) || !attacker)
@@ -4587,12 +4631,25 @@ bool SimApplyHit(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t victim_owner,
   if (!Head(f, "48895C240848896C24184889742420574156" "4157") && !(f[0] == 0xE9 || f[0] == 0xFF)) return false;  // known entry, or our stub's jump
   float p[3];
   memcpy(p, pos, sizeof p);
+  // The decoy is marked as the player's follower; its hit through a player's attack record did no damage with the mark on
+  // (session cg): the mark is off for the length of the call, as for a proxy's swing at the client's player.
+  volatile uint8_t* mark = given ? reinterpret_cast<volatile uint8_t*>(attacker_owner + kFollower) : nullptr;
+  uint8_t was = 0;
   __try {
+    if (mark) {
+      was = *mark;
+      *mark = 0;
+    }
     // Six arguments: the fifth and sixth are on the stack and the hit reads them (the AI's own calls pass 0 and 0;
     // with them left to chance the call faulted, session bm).
     reinterpret_cast<void(__fastcall*)(uintptr_t, uintptr_t, const float*, uintptr_t, uintptr_t, uint64_t)>(
         const_cast<uint8_t*>(f))(attacker, victim, p, rec, 0, 0);
+    if (mark) *mark = was;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
+    __try {
+      if (mark) *mark = was;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
     return false;
   }
   return true;
@@ -4747,7 +4804,11 @@ struct Retarget {
   uintptr_t enemy, target;
 };
 Retarget g_retarget[kMaxRetarget];
-volatile LONG g_retargeted = 0;
+volatile LONG g_retargeted = 0, g_retarget_left = 0, g_retarget_skipped = 0;
+// The only targets a redirect replaces (SimRetargetFrom): the host's player and the decoy. Before session cg it replaced whatever
+// the enemy had taken: an enemy that turned on another (an orc that hit it) had that orc overwritten by the decoy every frame, and
+// one such orc stood still with "the decoy" as its target for 50 s.
+volatile uintptr_t g_retarget_from[2] = {0, 0};
 const uintptr_t kSlots[] = {0x118, 0x170, 0x1C8, 0x220, 0x2D0, 0x328};
 
 uintptr_t SlotTarget(uintptr_t enemy, uintptr_t* slot_out) {
@@ -4805,8 +4866,20 @@ void SimApplyRetargets() {
     if (!CharacterHealth(r.enemy, &eh) || !CharacterHealth(r.target, &th) || !ReadQ(r.enemy + 0x2CE8, &ai) || !ai) continue;
     cur = SlotTarget(r.enemy, nullptr);
     if (!cur || cur == r.target) continue;
+    const uintptr_t f0 = g_retarget_from[0], f1 = g_retarget_from[1];
+    if ((f0 || f1) && cur != f0 && cur != f1) {  // it chose someone else: left to it
+      InterlockedIncrement(&g_retarget_left);
+      continue;
+    }
+    // Only a living enemy, and only when what it is after is a character (its health object pointing back at it). The host crashed
+    // in the AI's goal code (rva 11AA3A, reading 0x28) 4 s after orcs were spawned at addresses of orcs just killed (session cg):
+    // a swap of a qword that only looked like a target, in an AI that was dead or still being set up, would write the decoy there.
     uintptr_t cur_h = 0;
-    ReadQ(cur + 0x26A8, &cur_h);
+    float alive = 0;
+    if (!CharacterHealth(cur, &cur_h) || !ReadFloats(eh + 0x42C, &alive, 1) || !(alive > 0)) {
+      InterlockedIncrement(&g_retarget_skipped);
+      continue;
+    }
     auto swap_in = [&](uintptr_t base, size_t size) {
       __try {
         for (size_t off = 0; off < size; off += 8) {
@@ -4825,6 +4898,12 @@ void SimApplyRetargets() {
 }
 
 long SimRetargeted() { return g_retargeted; }
+long SimRetargetLeft() { return g_retarget_left; }
+long SimRetargetSkipped() { return g_retarget_skipped; }
+void SimRetargetFrom(uintptr_t a, uintptr_t b) {
+  g_retarget_from[0] = a;
+  g_retarget_from[1] = b;
+}
 
 // Hiding a character: its scale (character+0x10AC, three floats) to a hundredth, every frame (the game puts it back,
 // so this is tried, not known to work).
