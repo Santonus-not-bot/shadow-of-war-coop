@@ -674,6 +674,12 @@ ULONGLONG g_decoy_next = 0;
 volatile LONG g_decoy_spawned = 0;
 volatile LONG g_decoy_hurt = 0, g_decoy_hurt_amount = 0;  // health the decoy lost outside the hit function (times, total)
 volatile LONG g_decoy_hide = 1;                            // probe "coopset decoyhide off": the decoy shown at full size (a test)
+// Where the decoy was last put by the game's own teleport (or spawned). Writing its transform moves what is drawn, not where the
+// game's navigation and physics have it: in session cj orcs 700 units from a decoy that had been moved from the tower to the test
+// arena that way never reached it (0 swings in 60 s), and a decoy spawned in the arena drew 22 in 50 s.
+float g_decoy_anchor[3] = {};
+bool g_decoy_anchored = false;
+volatile LONG g_decoy_reanchors = 0;
 
 void DecoyRemove() {
   if (!g_decoy_owner) return;
@@ -711,6 +717,8 @@ void DecoyFrame() {
     uintptr_t obj = 0;
     if (SimSpawn(rv, "Gondorian_Soldier", at, nullptr, &report, &obj, true) && obj && SimProxyAdopt(obj)) {
       g_decoy_owner = obj;
+      memcpy(g_decoy_anchor, at, sizeof g_decoy_anchor);
+      g_decoy_anchored = true;
       SimSetDecoy(obj);
       InterlockedIncrement(&g_decoy_spawned);
       SowLog(L"coop: a decoy ally stands where the stand-in stands (enemies attack it for the stand-in)");
@@ -721,7 +729,16 @@ void DecoyFrame() {
     return;
   }
   float where[3] = {at[0], at[1] + g_cfg.decoy_dy, at[2]};
-  SimProxyMove(g_cfg.teleport_rva, g_decoy_owner, where, rot, true);
+  // Far from where the game last put it: the game's teleport (navigation and physics follow); otherwise the transform written.
+  const bool reanchor = g_cfg.decoy_reanchor > 0 && (!g_decoy_anchored || DistXZ(where, g_decoy_anchor) > g_cfg.decoy_reanchor ||
+                                                   std::fabs(where[1] - g_decoy_anchor[1]) > 200.0f);
+  if (reanchor && SimProxyMove(g_cfg.teleport_rva, g_decoy_owner, where, rot, false)) {
+    memcpy(g_decoy_anchor, where, sizeof g_decoy_anchor);
+    g_decoy_anchored = true;
+    InterlockedIncrement(&g_decoy_reanchors);
+  } else {
+    SimProxyMove(g_cfg.teleport_rva, g_decoy_owner, where, rot, true);
+  }
   // Hits through the hit function on the decoy are dropped (and told to the client), so health it lost since the last frame came
   // another way: arrows do not go through the hit function (session cf). Counted, to learn whether the host's archers reach it.
   float cur = 0, top = 0;
@@ -2205,6 +2222,7 @@ std::string CoopSet(const std::string& key, const std::string& value) {
   else if (key == "wake") g_cfg.wake_radius = (float)atof(value.c_str());
   else if (key == "hitlog") SimHitLog(atol(value.c_str()));
   else if (key == "stuck") g_cfg.stuck_sec = atoi(value.c_str());
+  else if (key == "reanchor") g_cfg.decoy_reanchor = (float)atof(value.c_str());
   else if (key == "huntstrict" && (value == "on" || value == "off")) g_cfg.hunt_strict = value == "on";
   else if (key == "decoyhide" && (value == "on" || value == "off")) InterlockedExchange(&g_decoy_hide, value == "on" ? 1 : 0);
   else if (key == "keephealth" && (value == "on" || value == "off")) InterlockedExchange(&g_keep_health, value == "on" ? 1 : 0);
@@ -2219,7 +2237,7 @@ std::string CoopSet(const std::string& key, const std::string& value) {
     SimDropStandinHits(!g_cfg.standin_hits);
   }
   else
-    return "err usage: coopset decoy|decoyhide|hunt|huntstrict|react|standinhits|keephealth on|off, coopset hitby decoy|poke|player, coopset wake <radius>, coopset stuck <seconds>, "
+    return "err usage: coopset decoy|decoyhide|hunt|huntstrict|react|standinhits|keephealth on|off, coopset hitby decoy|poke|player, coopset wake <radius>, coopset stuck <seconds>, coopset reanchor <units>, "
            "coopset hitlog <hits>" + std::string(1, (char)10);
   return "ok " + key + "=" + value + std::string(1, (char)10);
 }
@@ -2252,13 +2270,13 @@ std::string CoopEnemyStatus() {
     }
   snprintf(b, sizeof b,
            "ok enemies=%s role=%s host_known=%zu host_announced=%ld host_snapshots=%ld client_proxies=%zu with_pos=%zu "
-           "standing=%zu spawned=%ld failed=%ld despawn_asked=%ld hits_sent=%ld hits_on_proxies=%ld hits_applied=%ld hits_failed=%ld hits_stale=%ld travels=%ld hits_unmatched=%ld dmg_sent=%ld dmg_applied=%ld dmg_failed=%ld dmg_stale=%ld away=%ld nemesis_sent=%ld nemesis_got=%ld nemesis_skipped=%ld nemesis_applied=%ld nemesis_failed=%ld captains_sent=%ld captains_built=%ld captains_missing=%ld members_sent=%ld members_got=%ld members_skipped=%ld members_built=%ld members_failed=%ld attacks_ok=%ld attacks_fail=%ld plays_ok=%ld plays_fail=%ld hunt_engaged=%ld hunt_retargets=%ld hunt_woken=%ld hunt_wake_failed=%ld anims_sent=%ld anims_played=%ld anims_refused=%ld killed=%ld kill_failed=%ld local_damage=%ld local_sent=%ld moves_ok=%ld moves_failed=%ld hits_by_decoy=%ld hits_poked=%ld standin_drops=%ld retarget_left=%ld retarget_skipped=%ld hunt_unstuck=%ld decoy_hurt=%ld decoy_hurt_amount=%ld\n",
+           "standing=%zu spawned=%ld failed=%ld despawn_asked=%ld hits_sent=%ld hits_on_proxies=%ld hits_applied=%ld hits_failed=%ld hits_stale=%ld travels=%ld hits_unmatched=%ld dmg_sent=%ld dmg_applied=%ld dmg_failed=%ld dmg_stale=%ld away=%ld nemesis_sent=%ld nemesis_got=%ld nemesis_skipped=%ld nemesis_applied=%ld nemesis_failed=%ld captains_sent=%ld captains_built=%ld captains_missing=%ld members_sent=%ld members_got=%ld members_skipped=%ld members_built=%ld members_failed=%ld attacks_ok=%ld attacks_fail=%ld plays_ok=%ld plays_fail=%ld hunt_engaged=%ld hunt_retargets=%ld hunt_woken=%ld hunt_wake_failed=%ld anims_sent=%ld anims_played=%ld anims_refused=%ld killed=%ld kill_failed=%ld local_damage=%ld local_sent=%ld moves_ok=%ld moves_failed=%ld hits_by_decoy=%ld hits_poked=%ld standin_drops=%ld retarget_left=%ld retarget_skipped=%ld hunt_unstuck=%ld decoy_reanchors=%ld decoy_hurt=%ld decoy_hurt_amount=%ld\n",
            g_cfg.enemies ? "on" : "off", g_cfg.net_role.c_str(), g_enemy_host.known(), g_enemy_announced, g_enemy_sent,
            g_cfg.net_role == "client" ? g_enemy_client.proxies().size() : (size_t)0, with_pos, spawned_now, g_enemy_spawned,
            g_enemy_spawn_failed, g_enemy_despawn_asked, g_enemy_hits_sent, SimProxyHits(), g_enemy_hits_applied, g_enemy_hits_failed,
            g_enemy_hits_stale, g_travels, g_enemy_hits_unmatched, g_enemy_dmg_sent, g_enemy_dmg_applied, g_enemy_dmg_failed, g_enemy_dmg_stale, g_enemy_away, g_nemesis_sent, g_nemesis_got, g_nemesis_skipped, g_nemesis_applied, g_nemesis_failed, g_enemy_members_sent, g_enemy_captains, g_enemy_captains_missing, g_member_sent, g_member_got, g_member_skipped, g_member_built, g_member_failed,
            g_enemy_attack_ok, g_enemy_attack_fail, g_enemy_play_ok, g_enemy_play_fail, g_hunt_engaged, g_hunt_retargets, g_hunt_woken, g_hunt_wake_failed, g_enemy_anims_sent, g_enemy_anims_played, g_enemy_anims_refused, g_enemy_killed, g_enemy_kill_failed, g_enemy_local_damage, g_enemy_local_sent, SimProxyMovesOk(), SimProxyMovesFailed(), g_enemy_hits_by_decoy,
-           g_enemy_hits_poked, SimStandinHitDrops(), SimRetargetLeft(), SimRetargetSkipped(), g_hunt_unstuck, g_decoy_hurt, g_decoy_hurt_amount);
+           g_enemy_hits_poked, SimStandinHitDrops(), SimRetargetLeft(), SimRetargetSkipped(), g_hunt_unstuck, g_decoy_reanchors, g_decoy_hurt, g_decoy_hurt_amount);
   return b;
 }
 

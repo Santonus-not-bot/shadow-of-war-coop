@@ -1,5 +1,5 @@
 """Does the host's decoy survive enemies of a kind, and do they keep fighting the client? Both players kept at 100,000 health;
-the host's leftover 300-health orcs near B are killed; B is put at the north test spot (or left where it is with --stay); <n>
+the host's leftover 300-health orcs near B are killed; B is put at the test arena (or left where it is with --stay); <n>
 characters of <kind> are spawned on A <dist> units around B; for <secs> seconds, every 3 s: the decoy's object and health
 (max/current), the host's damage messages so far, and each spawned enemy's distance to B, its health and its target (D: the decoy,
 A: the host's player, -: none).
@@ -22,7 +22,7 @@ n = int(args[1]) if len(args) > 1 else 3
 dist = float(args[2]) if len(args) > 2 else 700.0
 secs = float(args[3]) if len(args) > 3 else 60.0
 A, B = ls.Copy('a'), ls.Copy('b')
-NORTH = (24113, 43097, 13094)
+NORTH = ls.ARENA  # the test arena (session cj; was the tower ledge 24113, 43097, 13094)
 
 
 def keep():
@@ -71,6 +71,8 @@ def decoy():
 
 keep()
 if not stay:
+    A.teleport(ls.ARENA_HOST)
+    time.sleep(2)
     B.teleport(NORTH)
     time.sleep(4)
 pb = B.player()[0]
@@ -78,7 +80,7 @@ dec = decoy()
 own = ls.host_own(A)  # the decoy and the stand-in: never killed
 for o, h, top, now, _ in characters(pb, 2500):
     if o not in own and top in (300.0, 180.0) and now > 0:
-        A.ask(f'kill abs:{o:X}')  # an orc left from an earlier run
+        ls.remove(A, o)  # an orc left from an earlier run (health 0: no kill for the Nazgul set to raise)
 time.sleep(2)
 before = {o for o, *_ in characters(pb, 3000)}
 for i in range(n):

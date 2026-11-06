@@ -1042,6 +1042,7 @@ void Init(HMODULE self) {
       cc.decoy_dy = (float)GetPrivateProfileIntW(L"sowguard", L"coop_decoy_dy", 0, ini.c_str());
       cc.wake_radius = (float)GetPrivateProfileIntW(L"sowguard", L"coop_wake_radius", (INT)cc.wake_radius, ini.c_str());
       cc.stuck_sec = (int)GetPrivateProfileIntW(L"sowguard", L"coop_stuck_sec", cc.stuck_sec, ini.c_str());
+      cc.decoy_reanchor = (float)GetPrivateProfileIntW(L"sowguard", L"coop_decoy_reanchor", (INT)cc.decoy_reanchor, ini.c_str());
       cc.enemy_radius = (float)GetPrivateProfileIntW(L"sowguard", L"coop_enemy_radius", (INT)cc.enemy_radius, ini.c_str());
       if (cc.enemy_radius < 500 || cc.enemy_radius > 20000) Fatal(kExitConfig, L"coop_enemy_radius must be 500..20000");
     }

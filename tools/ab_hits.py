@@ -20,7 +20,7 @@ for i in range(pairs):
         A.ask(f'coopset standinhits {standin}')
         B.ask(f'coopset standinhits {standin}')
         del A, B  # the probe serves one client: closed before the run opens its own
-        r = subprocess.run([sys.executable, '-I', os.path.join(here, 'place_measure.py'), '24113', '43097', '13094', '90', '4', '4'],
+        r = subprocess.run([sys.executable, '-I', os.path.join(here, 'place_measure.py'), 'arena', '90', '4', '4'],
                            capture_output=True, text=True, errors='replace')
         rows = [ln for ln in r.stdout.splitlines() if ln.strip()]
         for ln in rows:

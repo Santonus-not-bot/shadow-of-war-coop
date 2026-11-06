@@ -5,8 +5,8 @@ target (D: the decoy, A: the host's player) are printed. With [strike every, sec
 living orc and strikes it twice (X) that often, the way a player fights back.
 --fresh-decoy: the host's decoy is replaced first (coopset decoy off, on). The decoy and the stand-in are never killed.
 --air: B's strikes go the other way (turned away from the nearest orc): its attack moves without hits.
---keep-orcs: the orcs left at the end are not killed. Rows: distance to B, target, health, [current attack id's high half @ stamp].
-Usage: place_measure.py x y z [secs, default 60] [orcs, default 4] [strike every, default 0] [--fresh-decoy]
+--keep-orcs: the orcs left at the end are not killed. --host-dist=<d> (with arena): A put d units west of B. Rows: distance to B, target, health, [current attack id's high half @ stamp].
+Usage: place_measure.py x y z|arena [secs, default 60] [orcs, default 4] [strike every, default 0] [--fresh-decoy]
 (B needs coop_follow_travel=off to stay put)"""
 import math
 import os
@@ -22,6 +22,10 @@ import live_suite as ls  # noqa: E402
 fresh = '--fresh-decoy' in sys.argv
 air = '--air' in sys.argv  # B strikes away from the orcs (its attack moves without hits)
 argv = [a for a in sys.argv if not a.startswith('--')]
+host_at = next((float(a.split('=')[1]) for a in sys.argv if a.startswith('--host-dist=')), None)  # A this far west of B
+arena = argv[1] == 'arena'  # the test arena (live_suite.ARENA) in place of x y z: both players put there first
+if arena:
+    argv = argv[:1] + [str(v) for v in ls.ARENA] + argv[2:]
 x, y, z = (float(v) for v in argv[1:4])
 secs = float(argv[4]) if len(argv) > 4 else 60.0
 n = int(argv[5]) if len(argv) > 5 else 4
@@ -70,6 +74,12 @@ def dmg():
 
 
 keep()
+if arena:
+    import goto_arena  # noqa: E402
+    goto_arena.go(A, B, aim=False)
+    if host_at is not None:
+        A.teleport((ls.ARENA[0] - host_at, ls.ARENA[1] + 50, ls.ARENA[2]))
+        time.sleep(3)
 B.teleport((x, y, z))
 time.sleep(4)
 pb = B.player()[0]
@@ -85,7 +95,7 @@ for o, _, p in hostiles(pb, 3000):
     if o in skip:
         continue
     if A.read(A.q(o + 0x26A8) + 0x428, 4) in (struct.pack('<f', 300.0), struct.pack('<f', 180.0)):
-        A.ask(f'kill abs:{o:X}')  # an orc (300) or archer (180) left from an earlier run
+        ls.remove(A, o)  # an orc (300) or archer (180) left from an earlier run
 time.sleep(2)
 for i in range(n):
     ang = 2 * math.pi * i / n
@@ -154,10 +164,7 @@ if '--keep-orcs' not in sys.argv:
     for o, _, p in hostiles(B.player()[0], 3000) + hostiles(A.player()[0], 3000):
         h = A.q(o + 0x26A8)
         if o not in skip and A.read(h + 0x428, 4) in (struct.pack('<f', 300.0), struct.pack('<f', 180.0)):
-            gone += A.ask(f'kill abs:{o:X}').startswith('ok')
-            time.sleep(0.2)
-            left = A.read(h + 0x42C, 4)
-            # A kill sometimes leaves the orc at 1 health, standing in a stagger for good (session cg): it is taken away instead.
-            if left and struct.unpack('<f', left)[0] > 0:
-                despawned += A.ask(f'despawn abs:{o:X}').startswith('ok')
-    print(f'killed {gone} orcs left ({despawned} that lived on despawned)', flush=True)
+            how = ls.remove(A, o)  # despawned, not killed (the Nazgul set raises some of the dead)
+            gone += how == 'stopped'
+            despawned += how == 'left'
+    print(f'orcs left at the end: {gone} stopped (health 0, no attacker), {despawned} left', flush=True)

@@ -46,7 +46,7 @@ def clean(centre, radius=1500):
         top, now = struct.unpack('<2f', hp)
         x, _, z = struct.unpack('<3f', p)
         if top == 300.0 and now > 0 and math.dist((x, z), (centre[0], centre[2])) < radius:
-            killed += A.ask(f'kill abs:{o:X}').startswith('ok')
+            killed += ls.remove(A, o) == 'stopped'  # health 0: no kill for the Nazgul set to raise
     return killed
 
 

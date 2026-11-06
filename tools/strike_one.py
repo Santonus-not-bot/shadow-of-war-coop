@@ -1,4 +1,4 @@
-"""Does an orc stop fighting the client once the client has hit it? A fresh decoy; the host's leftover orcs near the north test spot
+"""Does an orc stop fighting the client once the client has hit it? A fresh decoy; the host's leftover orcs near the test arena
 killed (never the decoy or the stand-in); B at the north spot; <n> Orc_Infantry spawned 420 units around B; both players kept at
 100,000 health. Phase 1 (<secs> s): every 0.4 s each orc's distance to the decoy is read; an approach is a move from beyond 170 units
 to within 130 (an orc that swings comes in to ~100). Then B turns to the orc nearest it and strikes (X) until that orc's health drops
@@ -19,7 +19,7 @@ import live_suite as ls  # noqa: E402
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 secs = float(sys.argv[2]) if len(sys.argv) > 2 else 40.0
 A, B = ls.Copy('a'), ls.Copy('b')
-NORTH = (24113, 43097, 13094)
+NORTH = ls.ARENA  # the test arena (session cj; was the tower ledge 24113, 43097, 13094)
 
 
 def keep():
@@ -97,6 +97,8 @@ def phase(orcs, dec, seconds):
 
 
 keep()
+A.teleport(ls.ARENA_HOST)
+time.sleep(2)
 B.teleport(NORTH)
 time.sleep(3)
 print('fresh decoy:', A.ask('coopset decoy off').strip(), end=' ')
@@ -107,7 +109,7 @@ own = ls.host_own(A)
 pb = B.player()[0]
 for o, h, top, now, _ in chars(pb, 3000):
     if o not in own and top in (300.0, 180.0) and now > 0:
-        A.ask(f'kill abs:{o:X}')
+        ls.remove(A, o)  # health 0: no kill for the Nazgul set to raise
 time.sleep(2)
 dec_m = re.search(r'owner=abs:([0-9A-F]+)', A.ask('proxies'))
 if not dec_m:

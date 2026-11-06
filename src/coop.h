@@ -48,6 +48,7 @@ struct CoopConfig {
   int hit_by = 2;
   bool standin_hits = false;           // coop_standin_hits=on: the stand-in's copies of the other player's swings hurt too
   bool decoy = true;                   // coop_decoy=on: enemies attack an invisible-ish ally where the stand-in stands
+  float decoy_reanchor = 150.0f;       // coop_decoy_reanchor: the decoy is put by the game's teleport when this far from the last (0: never)
   float decoy_dy = 0.0f;               // coop_decoy_dy: its height above the stand-in
   bool enemy_direct = true;            // proxies are placed by writing their transform (not the game's teleport)
   uintptr_t play_rva = 0x664CA4;       // starts a named graph action

@@ -80,13 +80,15 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 ## Known problems
 
 - **Not tried on two PCs.** Only tested on one PC.
-- **Enemies sometimes stop attacking the client.** The host's enemies go after the client's place but stay 100-450 units
-  away and never strike. Seen after the client fought them, in places where orcs also fight each other; not seen in
-  runs where they did not. Not understood yet. This build changes how the client's hits are applied (`coop_hit_by`,
-  `coop_standin_hits`) and nudges an enemy that has not swung at the client for 20 s (`coop_stuck_sec`); in tests neither
-  made fights worse, but the stuck state did not come up, so whether the nudge frees it is not known. If it happens, the
-  host's log has `coop: stuck:` lines: please send them.
-- **The host's archers do not hurt the client.** Their arrows never land on the client's place on the host.
+- **Enemies stopping their attacks on the client: likely fixed in this build, not yet confirmed in play.** In earlier
+  builds the host's enemies went after the client but stood off and never struck once the client had moved away from
+  where it joined: the invisible ally the host keeps at the client's place stayed, for the game, where it was made. It is
+  now moved with the game's own teleport (`coop_decoy_reanchor`). In tests far from the join point: 0 enemy swings in 60 s
+  before, 17-36 in 50 s after. If enemies still stand off, the host's log has `coop: stuck:` lines: please send them.
+- **The host's archers do not hurt the client.** Their arrows never landed on the client's place on the host; the fix
+  above may change that (not tried).
+- With the Nazgul gear set, some enemies you kill rise as undead allies and fight the other orcs: orcs fighting orcs
+  near you can be that (the game), not the mod.
 - The counter prompt is missing for some attacks aimed at the client. Counters were tried once only.
 - A finisher by the client on an enemy is buggy (the enemy can vanish). A downed client is not attacked with a kill move.
 - An arrow's damage is sent as a few sword strikes, so the amount is approximate.
@@ -129,7 +131,8 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 `coop_enemies=on|off`, `coop_decoy=on|off` (host), `coop_anim_mirror=on|off`, `coop_wake_radius` (host, default 600, 0: off),
 `coop_proxy_react=on|off` and `coop_local_damage=on|off` (client), `coop_hit_by=poke|player|decoy` (host: how the client's
 hits are applied; `player` is the way builds before 2026-11-05 did it), `coop_standin_hits=off|on` (`on`: the other player's
-picture also hurts enemies with its copied swings, as before 2026-11-05), `coop_stuck_sec` (host, default 20, 0: off: an enemy
+picture also hurts enemies with its copied swings, as before 2026-11-05), `coop_decoy_reanchor` (host, default 150, 0: off: how far the client's place may move before the host's game is told
+where it is), `coop_stuck_sec` (host, default 20, 0: off: an enemy
 that goes after the client but has not swung at it for this long is nudged; each time is logged as `coop: stuck:`, which helps
 with the problem below), `coop_follow_travel=on|off` (client), `coop_slowmo=on` (keeps the game's slow motion, ended after 4 s on a client; off by default in co-op), `coop_enemy_radius`
 (default 3500), `coop_join=off`, `coop_join_timeout_sec` (default 20), `autoload_max_presses` (how many times the mod

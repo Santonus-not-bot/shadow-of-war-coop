@@ -1,4 +1,4 @@
-"""Does the stuck-enemy watch catch an orc that stands frozen? Spawns <n> Orc_Infantry 300 units around B (at the north test spot),
+"""Does the stuck-enemy watch catch an orc that stands frozen? Spawns <n> Orc_Infantry 300 units around B (at the test arena),
 waits 12 s (they engage the decoy), then tries probe `kill` on each: a kill sometimes leaves an orc at 1 health, frozen in one attack
 record (session cg). Then for <secs> s prints each orc's health, distance to the decoy, target and attack stamp every 5 s, and the
 host's hunt_unstuck count. Usage: frozen_orcs.py [n, default 4] [secs, default 45]"""
@@ -16,7 +16,9 @@ import live_suite as ls  # noqa: E402
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 secs = float(sys.argv[2]) if len(sys.argv) > 2 else 45.0
 A, B = ls.Copy('a'), ls.Copy('b')
-B.teleport((24113, 43097, 13094))
+A.teleport(ls.ARENA_HOST)
+time.sleep(2)
+B.teleport(ls.ARENA)
 time.sleep(3)
 pb = B.player()[0]
 orcs = []

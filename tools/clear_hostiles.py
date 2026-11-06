@@ -31,9 +31,7 @@ for line in A.ask(f'findq {ls.HEALTH_VT:X} 8192').splitlines()[1:]:
     pos = struct.unpack('<3f', p)
     if now <= 0 or top not in (300.0, 180.0) or min(math.dist((pos[0], pos[2]), (c[0], c[2])) for c in centres) > radius:
         continue
-    killed += A.ask(f'kill abs:{o:X}').startswith('ok')
-    time.sleep(0.2)
-    left = A.read(h + 0x42C, 4)
-    if left and struct.unpack('<f', left)[0] > 0:
-        despawned += A.ask(f'despawn abs:{o:X}').startswith('ok')
-print(f'killed {killed}, despawned {despawned} that lived on')
+    how = ls.remove(A, o)  # despawned, not killed: the Nazgul set raises some of the dead as undead allies
+    killed += how == 'stopped'
+    despawned += how == 'left'
+print(f'stopped {killed} (health 0, no attacker), {despawned} left')

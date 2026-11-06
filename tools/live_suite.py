@@ -27,6 +27,13 @@ START = (23987.9, 43092.5, 12789.8)  # the test save's tower ledge (NOTES sessio
 PARK = (23787.9, 43092.5, 12989.8)   # 280 units from the start, off every test path
 VIEW = (24000.0, 43092.5, 12420.0)   # 370 units in front of the start: A's strikes lunge toward it
 FLAT = (0.71, -0.71)                 # from the start: a flat path, no ledge within ~800 units
+# The test arena (session cj): open flat ground below the tower, x 23250..25250, z 9250..11250 within 30 units of height,
+# found with tools/height_map.py; the camp's walls are south of it (z ~8500), the tower's cliff north. B (the client) fights
+# at ARENA; A (the host) waits at ARENA_HOST, 1500 units west (enemies near B choose the decoy, the nearer). A first, then B:
+# B's move is under 2500 units from A, so it is never a long jump (taken back to the host when coop_follow_travel is on).
+ARENA = (24000.0, 37325.0, 10700.0)
+ARENA_HOST = (22500.0, 37400.0, 10500.0)
+
 
 
 class Copy:
@@ -122,6 +129,20 @@ class Copy:
 
 def flat(p):
     return (p[0], p[2])
+
+
+def remove(a, owner):
+    """Takes a character of the host's world out of a test without the host's player killing it: its health is written to 0 (it
+    stops; no attacker). The test save's Talion wears the Nazgul gear set, which raises some enemies he kills as undead allies that
+    then fight the hostile orcs (owner's note, session cj), and probe `kill` is a hit from the host's player; the game's despawn
+    took no living orc near the players (with or without the orc first written 40000 units away). Returns 'stopped' or 'left'."""
+    h = a.q(owner + 0x26A8)
+    if not h:
+        return 'left'
+    a.ask(f'write abs:{h + 0x42C:X} 00 00 00 00')
+    time.sleep(0.2)
+    hp = a.read(h + 0x42C, 4)
+    return 'stopped' if hp and not struct.unpack('<f', hp)[0] > 0 else 'left'
 
 
 def host_own(a):
