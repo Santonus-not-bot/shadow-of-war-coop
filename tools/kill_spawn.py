@@ -4,7 +4,10 @@ cycles: the host spawns <n> orcs (default 3) 250 units around the client, waits 
 (live_suite.remove: the game's own death), and at once spawns the next ones at the same spots. Stops at the first cycle where the
 host's probe stops answering, and prints the host's log lines about crashes since the start.
 With --host-only (a single copy, co-op off: the control) the orcs are spawned around the host's own player, at the arena.
-With --near the client stands 400 units from the host (the hunt then often prefers the host's player; session cm).
+With --near the client stands 400 units from the host (the hunt then often prefers the host's player; session cm). With --swing
+(implies --near) the client also jumps between 450 east and 450 west of the host every 3 s during each fight, and the orcs are
+spawned around the host, so the nearer of the decoy and the host's player keeps changing. --hunt-to-player=on|off sets the
+host's coopset hunttoplayer first.
 Usage: kill_spawn.py [cycles, default 30] [n, default 3] [fight secs, default 12] [--host-only] [--near]"""
 import math
 import os
@@ -35,11 +38,18 @@ else:
     goto_arena.go(A, B, aim=False)
     for c in (A, B):
         c.ask('coopset keephealth on')
-    if '--near' in sys.argv:
+    if '--near' in sys.argv or '--swing' in sys.argv:
         pa = A.player()[0]
         B.teleport((pa[0] + 400, pa[1] + 40, pa[2]))
         time.sleep(3)
     pb = B.player()[0]
+swing = '--swing' in sys.argv
+for a in sys.argv[1:]:
+    if a.startswith('--hunt-to-player='):
+        print(A.ask('coopset hunttoplayer ' + a.split('=', 1)[1]).strip(), flush=True)
+if swing:
+    pb = A.player()[0]
+pa0 = A.player()[0]
 spots = [(pb[0] + 250 * math.sin(2 * math.pi * k / n), pb[1] + 60, pb[2] + 250 * math.cos(2 * math.pi * k / n)) for k in range(n)]
 alive = True
 for cyc in range(cycles):
@@ -49,7 +59,14 @@ for cyc in range(cycles):
             m = re.search(r'as abs:([0-9A-F]+)', A.ask('spawn Orc_Infantry %.1f %.1f %.1f' % s))
             if m:
                 orcs.append(int(m.group(1), 16))
-        time.sleep(fight)
+        if swing:
+            t_end, side = time.time() + fight, 1
+            while time.time() < t_end:
+                B.teleport((pa0[0] + 450 * side, pa0[1] + 40, pa0[2] + 150))
+                side = -side
+                time.sleep(3)
+        else:
+            time.sleep(fight)
         for o in orcs:
             ls.remove(A, o)
         hp = A.player()[3]

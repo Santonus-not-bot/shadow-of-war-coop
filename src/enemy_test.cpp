@@ -5,6 +5,7 @@
 #include <random>
 
 #include "enemy_proto.h"
+#include "coop_rules.h"
 #include "listfix.h"
 
 using namespace sowenemy;
@@ -413,6 +414,66 @@ int main() {
           "a reference with no target whose neighbours do not point back at it is not touched");
   }
 
+  printf("[exact losses (session cm)]\n");
+  {
+    const float at[3] = {1, 2, 3};
+    const std::vector<uint8_t> e = LossEvent(42, 60.5f, at);
+    uint32_t id = 0;
+    float amount = 0, pos[3] = {};
+    Check(e.size() == sizeof(HitMsg) && e[0] == kOpLoss, "a loss event has a hit's size and its own op");
+    Check(ParseLoss(e.data(), e.size(), &id, &amount, pos) && id == 42 && amount == 60.5f && pos[2] == 3,
+          "a loss event reads back: enemy, amount, place");
+    HitMsg h;
+    Check(!ParseHit(e.data(), e.size(), &h), "a loss event is not taken for a hit");
+    Check(!ParseLoss(HitEvent(42, 7, at).data(), sizeof(HitMsg), &id, &amount, pos), "a hit is not taken for a loss");
+    const std::vector<uint8_t> neg = LossEvent(42, -5.0f, at), huge = LossEvent(42, 1e9f, at);
+    Check(!ParseLoss(neg.data(), neg.size(), &id, &amount, pos) && !ParseLoss(huge.data(), huge.size(), &id, &amount, pos),
+          "a negative or absurd loss is refused");
+  }
+  printf("[co-op rules (coop_rules.h, session cm)]\n");
+  {
+    using namespace cooprules;
+    SwingSeen last;
+    const uintptr_t orc = 0x1000, other = 0x2000, standin = 0x3000, decoy = 0x4000;
+    Check(!SameSwingAgain(&last, orc, 7, standin, 1000), "a first report of a swing is sent");
+    Check(SameSwingAgain(&last, orc, 7, decoy, 1040), "the same attacker and attack on the other victim 40 ms later is the same swing");
+    Check(!SameSwingAgain(&last, orc, 7, decoy, 1400), "the same swing reaching it again 400 ms after the first report is sent");
+    Check(!SameSwingAgain(&last, orc, 7, decoy, 1450), "a second hit on the same victim is not dropped as a duplicate");
+    Check(!SameSwingAgain(&last, other, 7, standin, 1460), "another attacker's swing a moment later is sent");
+    Check(!SameSwingAgain(&last, other, 8, decoy, 1470), "another attack of that attacker is sent");
+    Check(BystanderKind("Warg_Tamed", 10), "a tamed warg is a bystander");
+    Check(BystanderKind("Orc_Prisoner", 12), "a prisoner is a bystander");
+    Check(!BystanderKind("Orc_Infantry", 12), "a grunt is not a bystander");
+    char full[24];
+    memcpy(full, "Orc_Slave_Without_A_Zero", sizeof full);  // a type that fills its field, no terminating zero
+    Check(BystanderKind(full, sizeof full), "a type without a terminating zero is read safely");
+    Check(LocalLossReported(10000, 0, false), "a loss with no strike before it is reported");
+    Check(!LocalLossReported(10000, 8000, false), "a loss 2 s after a reported strike is not (a counter kill lands late)");
+    Check(LocalLossReported(10000, 7000, false), "a loss 3 s after a strike is reported");
+    Check(!LocalLossReported(10000, 0, true), "a bystander's loss is never reported");
+    {
+      float peak = 0;
+      uint64_t peak_ms = 0;
+      TrackPeak(&peak, &peak_ms, 500.0f, 1000);
+      TrackPeak(&peak, &peak_ms, 480.0f, 1500);
+      Check(!RecentFall(peak, peak_ms, 480.0f), "a proxy 20 units below its peak has not fallen");
+      Check(RecentFall(peak, peak_ms, 340.0f), "a proxy 160 units below its peak a moment later has fallen");
+      TrackPeak(&peak, &peak_ms, 340.0f, 3600);
+      Check(!RecentFall(peak, peak_ms, 340.0f), "after two seconds the peak is where it stands now");
+      Check(!RecentFall(0.0f, 0, -500.0f), "no peak yet: no fall");
+    }
+    Check(StockStrikes(50.0f) == 1 && StockStrikes(181.0f) == 3 && StockStrikes(5000.0f) == 6, "stock strikes: one per 90, 1 to 6");
+    int no_land = 0;
+    for (int i = 0; i < kNoLandFrames; ++i) no_land = NoLandStep(no_land, true, 2000 + 16 * i, 1990 + 16 * i, 0.0f);
+    Check(no_land == kNoLandFrames, "put-backs that leave the stand-in in place count up to the direct writes");
+    Check(NoLandStep(no_land, true, 3000, 2990, 25.0f) == 0, "a put-back that moved it starts the count again");
+    Check(NoLandStep(no_land, false, 3000, 2990, 0.0f) == 0, "a stand-in close enough clears the count");
+    Check(NoLandStep(5, true, 5000, 3000, 0.0f) == 0, "a put-back older than a second does not count");
+    Check(CounterGivesBack(10000, 9200, 400.0f, 300.0f), "a counter 0.8 s after the swing gives the health back");
+    Check(!CounterGivesBack(10000, 8000, 400.0f, 300.0f), "a counter 2 s after the swing does not");
+    Check(!CounterGivesBack(10000, 9200, 400.0f, 400.0f), "nothing is given back when nothing was lost");
+    Check(!CounterGivesBack(10000, 0, 400.0f, 300.0f), "nor without a swing of that enemy");
+  }
   printf("\nRESULT: %s (%d of %d checks passed)\n", g_bad == 0 ? "PASS" : "FAIL", g_ok, g_ok + g_bad);
   return g_bad == 0 ? 0 : 1;
 }

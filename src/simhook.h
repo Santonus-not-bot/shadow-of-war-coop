@@ -230,6 +230,9 @@ bool SimUnlinkFixInstall(std::string* err);
 // Session cm: the call at 11A4C5 goes through a guard that answers a non-AI attacker (the host crashed at 11AA3A) as no target.
 bool SimAiParamGuardInstall(std::string* err);
 void SimAiParamStats(long* installed, long* guarded);
+// Session cm: the call at 4990D8 goes through a guard that skips it for a component whose owner has no AI component (190F7C).
+bool SimAiTickGuardInstall(std::string* err);
+void SimAiTickStats(long* installed, long* skipped);
 // The retarget swap moves a target that sits in a game reference with the game's assign (on by default; off: the qword alone).
 void SimRetargetRefs(bool on);
 void SimRetargetRefStats(long* refs, long* raw);
@@ -315,6 +318,10 @@ void SimSetDecoy(uintptr_t owner);
 void SimHitLog(long n);
 void SimHideCharacter(uintptr_t owner);
 size_t SimDamageReports(SimHitReport* out, size_t max);
+// Is this attack one of the player's counter strikes (its name holds _Cntr_; the table is read once)?
+bool SimIsCounterAttack(uintptr_t table_rva, uint32_t attack_id);
+// Second reports of one swing that reached both the stand-in and the decoy, not reported (session cm).
+long SimDamageDups();
 bool SimHitStandin(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t attacker_owner, uint32_t attack_id);
 // The client: applies such a swing to this copy's own player; the attacker is the enemy's proxy.
 bool SimApplyDamage(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t attacker_owner, const float pos[3], uint32_t attack_id,

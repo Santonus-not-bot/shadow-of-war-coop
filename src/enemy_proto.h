@@ -20,7 +20,8 @@ constexpr size_t kMaxEnemies = 16;
 constexpr size_t kTypeBytes = 32;
 constexpr size_t kNameBytes = 40;
 constexpr uint32_t kNoMember = 0xFFFFFFFFu;
-enum Op : uint8_t { kOpNew = 1, kOpGone = 2, kOpHit = 3, kOpDamage = 4, kOpNemesis = 5, kOpMember = 6, kOpMemberData = 7, kOpAnim = 8 };
+enum Op : uint8_t { kOpNew = 1, kOpGone = 2, kOpHit = 3, kOpDamage = 4, kOpNemesis = 5, kOpMember = 6, kOpMemberData = 7, kOpAnim = 8,
+                    kOpLoss = 9 };
 enum Loco : uint8_t { kIdle = 0, kWalk = 1, kRun = 2 };
 enum Flag : uint8_t { kAlive = 1, kTargetsClient = 2 };  // kTargetsClient: the host's enemy is after the client's stand-in
 
@@ -86,6 +87,28 @@ inline bool ParseHitOp(const uint8_t* p, size_t n, uint8_t op, HitMsg* out) {
 }
 
 inline bool ParseHit(const uint8_t* p, size_t n, HitMsg* out) { return ParseHitOp(p, n, kOpHit, out); }
+
+// Health a proxy lost on the client outside the hit function (the client's arrows, its gear's effects), to the host (reliable,
+// client to host; session cm): the enemy's id, the amount (in the attack field, as float bits) and where. The host takes exactly
+// that from its enemy, where stock strikes (about 96 each) had over- or undershot it.
+inline std::vector<uint8_t> LossEvent(uint32_t id, float amount, const float pos[3]) {
+  uint32_t bits = 0;
+  memcpy(&bits, &amount, sizeof bits);
+  std::vector<uint8_t> e = HitEvent(id, bits, pos);
+  e[0] = kOpLoss;
+  return e;
+}
+inline bool ParseLoss(const uint8_t* p, size_t n, uint32_t* id, float* amount, float pos[3]) {
+  HitMsg m;
+  if (!ParseHitOp(p, n, kOpLoss, &m)) return false;
+  float a = 0;
+  memcpy(&a, &m.attack_id, sizeof a);
+  if (!std::isfinite(a) || !(a > 0.0f) || a > 100000.0f) return false;
+  *id = m.id;
+  *amount = a;
+  memcpy(pos, m.pos, sizeof m.pos);
+  return true;
+}
 inline bool ParseDamage(const uint8_t* p, size_t n, HitMsg* out) { return ParseHitOp(p, n, kOpDamage, out); }
 
 // A Nemesis event the host's game applied (HandleFactionEventAction), to the client (reliable, host to client): the two
@@ -412,6 +435,9 @@ struct Proxy {
   uint32_t anim_seq = 0, applied_anim_seq = 0;
   uint64_t anim_ms = 0;
   uint64_t hit_ms = 0;                // when this player last struck it (or an arrow did)
+  uint64_t strike_ms = 0;             // when a strike of this player on it was last reported (not an arrow)
+  float peak_y = 0;                   // its highest point over the last two seconds (a fall since then: coop_rules.h)
+  uint64_t peak_ms = 0;
   float hp_written = -1.0f;            // the health this copy wrote last frame (anything below it was done here: an arrow)
   bool killed = false;                // the proxy has been killed the game's way (its enemy died on the host)
   bool member_failed = false;         // this copy has no such member: the proxy is the type's generic orc

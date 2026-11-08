@@ -40,6 +40,8 @@ struct CoopConfig {
   bool retarget_refs = true;          // coop_retarget_refs=off: the retarget swap writes a target that sits in a game reference alone
   bool unlink_fix = true;             // coop_unlink_fix=off: the game's list destructor (rva 4DD18C) is left as it is (it can hang)
   bool ai_param_guard = true;         // coop_ai_param_guard=off: the AI's attack-parameter lookup (rva 11A4C5) is left unguarded
+  bool exact_losses = true;           // coop_exact_losses=off: a proxy's loss outside hits goes to the host as stock strikes
+  bool counter_heal = false;          // coop_counter_heal=on (experiment): a client's counter gives back that enemy's last swing (within 1.5 s)
   bool follow_travel = true;          // coop_follow_travel=off: a client does not follow the host's long jumps (fast travel)
   int decoy_stall = 0;                 // coop_decoy_stall: enemies near the decoy after it, no swing reaching it this long: the decoy is made again (0: not)
   int stuck_sec = 20;                  // coop_stuck_sec: an enemy after the decoy, near it, without a swing at it this long is let go and poked (0: not)

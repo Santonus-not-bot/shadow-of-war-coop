@@ -122,13 +122,18 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
   near you can be that (the game), not the mod.
 - The counter prompt is missing for some attacks aimed at the client. Counters were tried once only.
 - A finisher by the client on an enemy is buggy (the enemy can vanish). A downed client is not attacked with a kill move.
-- An arrow's damage is sent as a few sword strikes, so the amount is approximate.
+- Since this build the damage of the client's arrows (and other damage its enemies' pictures take outside sword hits) reaches the
+  host's enemy exactly; before, it was sent as stock sword strikes (`coop_exact_losses=off` keeps that).
+- Since this build an enemy swing that reached both the host's picture of the client and the invisible ally is sent once (it
+  was sent twice, so the client took some swings twice).
 - If the host's game stops sending (a loading screen, its pause menu), the client gets no news from it: after 5 seconds the
   host's enemies disappear from the client's screen, and they come back when the host plays on.
 - If the host dies, the client is taken to the host's respawn point a few seconds later (6-22 s in tests), while the host is
   still on its death screens; any fight the client was in is left behind. The host's world stands still until the host plays
   on; then both continue together. If the client dies, the game's own death flow runs on its copy; it respawns at its own
   respawn point and is taken back to the host about 3 s later. Both were checked with bots on one PC.
+- When a captain ambushes the host, the client's game plays the host's Nemesis events too (the captain's introduction, his
+  showdown, his kill of the host's player) and may show a screen the client has to press through.
 - After a death, a player's picture of the other once stood still far away and would not follow (seen on one PC, cause not
   known). Since this build such a picture is moved straight to the other player whenever the game does not move it.
 - The client cannot fast-travel by itself: if it does (or respawns far away), it is taken back to the host about 3 s after it arrives. Fortress
@@ -172,7 +177,7 @@ invisible ally again there), `coop_decoy_stall` (host, default 0: off; seconds: 
 it for this long it is made again; not tested), `coop_unlink_fix=on|off` (both; default on: the guard in the game's clean-up
 described under "Known problems"), `coop_retarget_refs=on|off` and `coop_decoy_limbo=on|off` (host; default on), `coop_decoy_follow=remote|standin` (host; default remote), `coop_proxy_table_max` (client; default 200), `coop_decoy_hurt_send=on|off` (host; default on: an arrow that hits the ally is sent to the client as an archer's shot),
 `coop_decoy_still` (host; default 25: the ally is not moved while within that many units of its place; 0:
-moved every frame), `coop_audio_keys_fatal=off|on` (both; default off), `coop_ai_param_guard=on|off` (both; default on: a guard where the host's game crashed twice in its AI), `coop_hunt_to_player=off|on` (host; default off: enemies are pointed only at the client's place, never back at the host's player; `on` is the older behavior, which may have caused those crashes), `coop_dmg_borrow=on|off` (client; default on: an
+moved every frame), `coop_audio_keys_fatal=off|on` (both; default off), `coop_ai_param_guard=on|off` (both; default on: a guard where the host's game crashed twice in its AI), `coop_counter_heal=off|on` (client; default off, an experiment: when the client counters an enemy, the health its last swing took within 1.5 s is given back), `coop_hunt_to_player=off|on` (host; default off: enemies are pointed only at the client's place, never back at the host's player; `on` is the older behavior, which may have caused those crashes), `coop_dmg_borrow=on|off` (client; default on: an
 enemy's hit that arrives while the client has no picture of that enemy is applied with the nearest picture instead of being
 dropped), `coop_stuck_sec` (host, default 20, 0: off: an enemy
 that goes after the client but has not swung at it for this long is nudged; each time is logged as `coop: stuck:`, which helps

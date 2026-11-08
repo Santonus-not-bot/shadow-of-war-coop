@@ -1056,6 +1056,12 @@ void Init(HMODULE self) {
       const std::wstring huntp = IniStr(ini, L"coop_hunt_to_player");
       if (huntp == L"on") cc.hunt_to_player = true;
       else if (!huntp.empty() && huntp != L"off") Fatal(kExitConfig, L"coop_hunt_to_player must be on or off (got %s)", huntp.c_str());
+      const std::wstring exact = IniStr(ini, L"coop_exact_losses");
+      if (exact == L"off") cc.exact_losses = false;
+      else if (!exact.empty() && exact != L"on") Fatal(kExitConfig, L"coop_exact_losses must be on or off (got %s)", exact.c_str());
+      const std::wstring cheal = IniStr(ini, L"coop_counter_heal");
+      if (cheal == L"on") cc.counter_heal = true;
+      else if (!cheal.empty() && cheal != L"off") Fatal(kExitConfig, L"coop_counter_heal must be on or off (got %s)", cheal.c_str());
       const std::wstring aiguard = IniStr(ini, L"coop_ai_param_guard");
       if (aiguard == L"off") cc.ai_param_guard = false;
       else if (!aiguard.empty() && aiguard != L"on") Fatal(kExitConfig, L"coop_ai_param_guard must be on or off (got %s)", aiguard.c_str());

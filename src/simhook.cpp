@@ -11,9 +11,11 @@
 #include <cstdio>
 #include <cstring>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 
 #include "input.h"
+#include "coop_rules.h"
 #include "listfix.h"
 #include "probe.h"
 #include "simhook.h"
@@ -645,7 +647,7 @@ std::string SimPuppetStatus() {
 
 namespace {
 
-uint8_t* g_near[7] = {};
+uint8_t* g_near[8] = {};
 // The game's reference assign (listfix.h): unlink the reference, then link it into the new target's list and set the target.
 constexpr uintptr_t kRefAssign = 0x3F52B8;
 const char kRefAssignHead[] = "4883EC284C8BC24C8BD1483B5120";  // checked with Head (inside the image only)
@@ -2271,6 +2273,7 @@ volatile uintptr_t g_unhit = 0;       // the character the hit stub skips (0: no
 volatile uintptr_t g_aoe_skip = 0;    // the character the area filter leaves out of an area attack (0: none)
 volatile uintptr_t g_decoy = 0;       // the decoy ally that enemies attack in the stand-in's place (hits on it are reported like the stand-in's)
 volatile LONG g_standin_hurt = 0;     // swings that reach the stand-in are reported (SimDamageReports) instead of skipped
+volatile LONG g_dmg_dups = 0;         // second reports of one swing that reached both the stand-in and the decoy (not sent)
 volatile LONG g_target_rejects = 0;   // candidates the check stub rejected
 volatile LONG g_hit_drops = 0;        // hits the hit stub dropped
 // Area attacks (fire, explosions, auras) do not go through either: a large enemy's fire took a
@@ -2402,9 +2405,17 @@ bool __fastcall HitFilter(uintptr_t attacker, uintptr_t victim, const float* pos
           if (pos) memcpy(s.pos, pos, sizeof s.pos);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
+        // The decoy stands where the stand-in stands, so one swing can reach both: two reports, and the client took the swing
+        // twice (session cm: 12 of 31 swings came in pairs 15-63 ms apart, the same attacker and attack). A swing of the same
+        // attacker and attack that reaches the other of the two within 300 ms is not reported again.
+        static cooprules::SwingSeen last;
         EnterCriticalSection(&g_lock);
-        g_dmg_ring[g_dmg_count % kHitRing] = s;
-        InterlockedIncrement(&g_dmg_count);
+        if (cooprules::SameSwingAgain(&last, att_owner, s.attack_id, owner, GetTickCount64())) {
+          InterlockedIncrement(&g_dmg_dups);
+        } else {
+          g_dmg_ring[g_dmg_count % kHitRing] = s;
+          InterlockedIncrement(&g_dmg_count);
+        }
         LeaveCriticalSection(&g_lock);
       }
     }
@@ -2555,6 +2566,7 @@ void SimSetDecoy(uintptr_t owner) { g_decoy = owner; }
 void SimHitLog(long n) { InterlockedExchange(&g_hit_log_left, n); }
 void SimDropStandinHits(bool on) { InterlockedExchange(&g_drop_standin_hits, on ? 1 : 0); }
 long SimStandinHitDrops() { return g_standin_hit_drops; }
+long SimDamageDups() { return g_dmg_dups; }
 
 size_t SimDamageReports(SimHitReport* out, size_t max) {
   size_t n = 0;
@@ -4935,6 +4947,44 @@ bool SimIsFollower(uintptr_t owner) {
   return f != 0;
 }
 
+// Counter attacks (session cm): the player's counter strikes in the game's attack table are named ..._Cntr_... (seen:
+// PC_Bip_Sync_Cntr_TimedKill_F/B, PC_Bip_Sync_Cntr_Knockback_B). The table ([table_rva]: count +0x28, array +0x38 of 40-byte
+// records, type 0xA15 at +0, id +4, name pointer +0x20; tools/attack_table.py) is read once.
+namespace {
+// The ids of the counter attacks, raw (no C++ objects here: __try).
+size_t ScanCounterIds(uintptr_t table_rva, uint32_t* out, size_t max) {
+  size_t n = 0;
+  __try {
+    const uintptr_t table = *reinterpret_cast<const uintptr_t*>(Base() + table_rva);
+    const uint32_t count = table ? *reinterpret_cast<const uint32_t*>(table + 0x28) : 0;
+    const uintptr_t array = table ? *reinterpret_cast<const uintptr_t*>(table + 0x38) : 0;
+    for (uint32_t i = 0; array && i < count && i < 200000 && n < max; ++i) {
+      const uintptr_t r = array + 40ull * i;
+      if (*reinterpret_cast<const uint32_t*>(r) != 0xA15) continue;
+      const char* name = *reinterpret_cast<const char* const*>(r + 0x20);
+      if (name && strstr(name, "_Cntr_")) out[n++] = *reinterpret_cast<const uint32_t*>(r + 4);
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return n;
+}
+}  // namespace
+
+bool SimIsCounterAttack(uintptr_t table_rva, uint32_t attack_id) {
+  static SRWLOCK lock = SRWLOCK_INIT;
+  static std::unordered_set<uint32_t>* ids = nullptr;
+  AcquireSRWLockExclusive(&lock);
+  if (!ids) {
+    static uint32_t raw[4096];
+    const size_t n = ScanCounterIds(table_rva, raw, 4096);
+    ids = new std::unordered_set<uint32_t>(raw, raw + n);
+    SowLog(L"sim: %zu counter attacks found in the attack table", ids->size());
+  }
+  const bool yes = ids->count(attack_id) != 0;
+  ReleaseSRWLockExclusive(&lock);
+  return yes;
+}
+
 uint32_t SimAttackId(const char* attack_name) {
   const uint8_t* hash_fn = Base() + 0x423E70;
   if (!Head(hash_fn, "0FB60184C074274C8D0D")) return 0;
@@ -5231,6 +5281,76 @@ bool SimAiParamGuardInstall(std::string* err) {
   InterlockedExchange(&g_aiparam_installed, 1);
   SowLog(L"sim: the AI's attack-parameter lookup (rva:11A4C5) passes through a guard");
   return true;
+}
+
+// ---- A guard for an AI tick's look at a component's owner (session cm) ----
+// In an orc's AI tick (2F7ABB ... 499084) the call at 4990D8 hands 499724 the orc's component at +0x2CF0; 499724 reads the
+// component's owner ([rcx]) and that owner's +0x2D18 (a component pointer on an AI character). The host crashed at 190F7C reading
+// 0x1: the component's owner was the host's player, whose +0x2D18 holds 1 (session cm, after the hunt had swapped the player into
+// an enemy's AI data). The call's result is not used there, so for an owner without a component pointer the call is skipped.
+namespace {
+volatile LONG g_aitick_installed = 0, g_aitick_skipped = 0;
+constexpr uintptr_t kTickLook = 0x499724;
+const char kTickLookHead[] = "488BC4555356574154415541564157";
+const char kTickLookSite[] = "488B8BF02C0000E8";  // 4990D1: mov rcx,[rbx+2CF0]; call 499724 (the E8 at 4990D8)
+
+uintptr_t __fastcall TickLookGuard(uintptr_t self, uintptr_t a2, uintptr_t a3, uintptr_t a4) {
+  uintptr_t owner = 0, comp = 0;
+  if (!ReadQ(self, &owner) || owner < 0x10000 || !ReadQ(owner + 0x2D18, &comp) || comp < 0x10000) {
+    if (InterlockedIncrement(&g_aitick_skipped) <= 10)
+      SowLog(L"sim: an AI tick's look at abs:%llX skipped: its owner abs:%llX has no component at +0x2D18 (%llX)",
+             (unsigned long long)self, (unsigned long long)owner, (unsigned long long)comp);
+    return 0;
+  }
+  return reinterpret_cast<uintptr_t(__fastcall*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t)>(
+      const_cast<uint8_t*>(Base() + kTickLook))(self, a2, a3, a4);
+}
+}  // namespace
+
+bool SimAiTickGuardInstall(std::string* err) {
+  if (g_aitick_installed) return true;
+  uint8_t* b = const_cast<uint8_t*>(Base());
+  uint8_t* site = b + 0x4990D1;
+  uint8_t* call = site + 7;  // the E8 at 4990D8
+  if (!Head(site, kTickLookSite) || !Head(b + kTickLook, kTickLookHead)) {
+    *err = "the AI tick's call (rva 4990D8) or its target (rva 499724) is not this build's";
+    return false;
+  }
+  int32_t rel = 0;
+  memcpy(&rel, call + 1, 4);
+  if (call + 5 + rel != b + kTickLook) {
+    *err = "rva 4990D8 does not call 499724";
+    return false;
+  }
+  uint8_t* page = SimNearPage(7);
+  const int64_t reach = page ? reinterpret_cast<intptr_t>(page) - reinterpret_cast<intptr_t>(call + 5) : 0;
+  DWORD old = 0;
+  if (!page || reach < INT32_MIN || reach > INT32_MAX || !VirtualProtect(page, 4096, PAGE_READWRITE, &old)) {
+    *err = "no code page near the image";
+    return false;
+  }
+  const uint8_t jmp[6] = {0xFF, 0x25, 0, 0, 0, 0};  // jmp [rip+0]
+  memcpy(page, jmp, sizeof jmp);
+  void* fn = reinterpret_cast<void*>(&TickLookGuard);
+  memcpy(page + 6, &fn, 8);
+  VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+  FlushInstructionCache(GetCurrentProcess(), page, 16);
+  if (!VirtualProtect(call + 1, 4, PAGE_EXECUTE_READWRITE, &old)) {
+    *err = "cannot make the game's code writable";
+    return false;
+  }
+  const int32_t rel32 = (int32_t)reach;
+  memcpy(call + 1, &rel32, 4);
+  VirtualProtect(call + 1, 4, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), call, 5);
+  InterlockedExchange(&g_aitick_installed, 1);
+  SowLog(L"sim: the AI tick's look at a component's owner (rva:4990D8) passes through a guard");
+  return true;
+}
+
+void SimAiTickStats(long* installed, long* skipped) {
+  *installed = g_aitick_installed;
+  *skipped = g_aitick_skipped;
 }
 
 void SimAiParamStats(long* installed, long* guarded) {
