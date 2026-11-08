@@ -225,6 +225,18 @@ quaternion `+0xB8`, and health/max/fraction on `[player+0x26A8]` (`+0x42C`, `+0x
 handler (bytes checked) from the next pad read once the world has started; the game
 saves ~0.5 s later.
 
+`dmglog` (session cm) lists the last 32 damage reports: on the host each enemy swing that reached the decoy (attacker, attack
+id, the attacker's distance from the hit: an arrow hits from afar), on the client what it did with each damage message
+(`a` applied, `f` failed, `x` no proxy). The `enemies` status line also counts the game-reference work of session cm:
+`unlink_fix`/`unlink_repaired`/`unlink_left`/`unlink_faults` (the repair in the game's reference-list destructor `4DD18C`,
+`src/listfix.h`; `coop_unlink_fix=off` turns it off), `retarget_refs`/`retarget_raw` (host: targets the retarget swap moved
+with the game's assign `3F52B8` / wrote alone; `coop_retarget_refs=off` or `coopset retargetrefs off` writes them alone) and
+`member_links`/`member_links_raw` (client: a captain's member linked to its proxy with the game's assign / written alone),
+`decoy_limbo`/`decoy_limbo_gone` (host: removed decoys kept in the proxy set, their AI off, until the game deletes them;
+`coop_decoy_limbo=off` or `coopset decoylimbo off` drops them at once, the old way). `kill abs:<character> [abs:<attacker>]`
+takes an optional attacker (default: this copy's player). `injectdmg <enemy id> <attack hex>` (client, `probe_write=1`) queues a host damage message for that
+enemy id at this player's place (a test of `coop_dmg_borrow`).
+
 Also: `findq <hex value> [max]` lists heap qwords equal to a value (resident pages only);
 `remote` shows what the co-op receiver has; `puppet` shows the stand-in. With
 `probe_write=1`: `write <addr> <hex bytes>`, `lkp <x> <y> <z>` (the effect, from the
@@ -312,6 +324,11 @@ build.cmd
 build\test_guard.exe run <scratch dir> <abs path>\build\bink2w64.dll <original bink2w64.dll, i.e. bink2w64_.dll once staged> <ShadowOfWar.exe>
 build\test_guard.exe mutant <scratch dir> <abs path>\build\mutant\bink2w64.dll <original bink2w64.dll>
 ```
+
+The scratch dir must not be inside `%LOCALAPPDATA%` (the guard refuses a test owner tree inside the real one; every case then
+fails with `0xC0DE0001`). The four `coop_peer` cases listen on this PC's real address, and Windows' firewall asks about each
+case's copy of `test_guard.exe` (a new folder every run); `set SOWGUARD_TEST_NO_PEER=1` skips them (52 cases) for runs that do
+not touch the network code.
 
 `run` builds a fake owner tree per case and must print `RESULT: PASS (53 of 53 cases
 passed)` (a case name as a sixth argument runs only that case). `mutant` runs a build

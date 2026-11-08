@@ -5,6 +5,7 @@
 #include <random>
 
 #include "enemy_proto.h"
+#include "listfix.h"
 
 using namespace sowenemy;
 
@@ -342,6 +343,74 @@ int main() {
               NemesisShared("Promote") && NemesisShared("ActiveGeneric_Death"),
           "the events a world load fires are not shared; promotions and deaths are");
     Check(!ClientTrackerAcceptsNemesis(), "a Nemesis message is not an enemy message (the enemy tracker ignores it)");
+  }
+
+  printf("[the game's reference lists: the destructor's unlink and its repair (listfix.h)]\n");
+  {
+    // A target object (its list head at +8) and n references { vtable, next, prev, self, target, pad }, linked at the tail
+    // the way the game's attach (18D80C) does.
+    struct Ref {
+      uintptr_t vt, next, prev, self, target, pad;
+    };
+    struct Target {
+      uintptr_t vt, next, prev;
+    };
+    auto make = [](Target* t, Ref* refs, int n) {
+      const uintptr_t head = reinterpret_cast<uintptr_t>(&t->next);
+      t->next = t->prev = head;
+      for (int i = 0; i < n; ++i) {
+        Ref& r = refs[i];
+        const uintptr_t node = reinterpret_cast<uintptr_t>(&r.next);
+        r.self = reinterpret_cast<uintptr_t>(&r);
+        r.next = head;
+        r.prev = t->prev;
+        *reinterpret_cast<uintptr_t*>(t->prev) = node;  // old tail's next (or the head's)
+        t->prev = node;
+        r.target = reinterpret_cast<uintptr_t>(t);
+      }
+    };
+    // The destructor loop (4DD1AC): the last node's owner is unlinked until the list is empty; `fixed` picks the repair or the
+    // game's rule (unlink only with the target set). Returns the rounds taken (cap: did not end).
+    auto drain = [](Target* t, bool fixed, int cap) {
+      const uintptr_t head = reinterpret_cast<uintptr_t>(&t->next);
+      int rounds = 0;
+      while (t->next != head && rounds < cap) {
+        const uintptr_t ref = *reinterpret_cast<uintptr_t*>(t->prev + 0x10);
+        if (fixed) {
+          listfix::ReferenceUnlink(ref);
+        } else if (*reinterpret_cast<uintptr_t*>(ref + 0x20)) {
+          listfix::ReferenceUnlink(ref);  // the same as 18D264 when the target is set
+        }
+        ++rounds;
+      }
+      return rounds;
+    };
+    Target t{};
+    Ref refs[10]{};
+    make(&t, refs, 10);
+    Check(listfix::ReferenceUnlink(reinterpret_cast<uintptr_t>(&refs[4])) == listfix::Unlink::kNormal && refs[4].target == 0 &&
+              refs[4].next == reinterpret_cast<uintptr_t>(&refs[4].next) && refs[3].next == reinterpret_cast<uintptr_t>(&refs[5].next) &&
+              refs[5].prev == reinterpret_cast<uintptr_t>(&refs[3].next),
+          "a reference with its target set is unlinked and its target cleared (what 18D264 does)");
+    Check(listfix::ReferenceUnlink(reinterpret_cast<uintptr_t>(&refs[4])) == listfix::Unlink::kLeft &&
+              refs[4].next == reinterpret_cast<uintptr_t>(&refs[4].next),
+          "an unlinked reference with no target is left as it is");
+    make(&t, refs, 10);
+    refs[9].target = 0;  // the hung client's list (session cm): the last of ten linked with no target
+    Check(drain(&t, false, 1000) == 1000 && t.next != reinterpret_cast<uintptr_t>(&t.next),
+          "negative control: with the game's rule the loop never empties that list");
+    make(&t, refs, 10);
+    refs[9].target = 0;
+    Check(drain(&t, true, 1000) == 10 && t.next == reinterpret_cast<uintptr_t>(&t.next) && t.prev == t.next &&
+              refs[9].next == reinterpret_cast<uintptr_t>(&refs[9].next) && refs[9].prev == refs[9].next,
+          "with the repair the loop ends after ten rounds, the stuck reference linked to itself");
+    make(&t, refs, 10);
+    refs[3].target = 0;
+    refs[2].next = reinterpret_cast<uintptr_t>(&refs[5].next);  // its neighbour does not point back at it
+    const uintptr_t before[2] = {refs[3].next, refs[3].prev};
+    Check(listfix::ReferenceUnlink(reinterpret_cast<uintptr_t>(&refs[3])) == listfix::Unlink::kLeft && refs[3].next == before[0] &&
+              refs[3].prev == before[1] && refs[4].prev == reinterpret_cast<uintptr_t>(&refs[3].next),
+          "a reference with no target whose neighbours do not point back at it is not touched");
   }
 
   printf("\nRESULT: %s (%d of %d checks passed)\n", g_bad == 0 ? "PASS" : "FAIL", g_ok, g_ok + g_bad);

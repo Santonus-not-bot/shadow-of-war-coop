@@ -860,6 +860,19 @@ std::string Handle(const std::string& line) {
     out << "ok queued for the simulation thread\n";
   } else if (cmd == "watch") {
     return SimWatchReport();
+  } else if (cmd == "watchw") {
+    // watchw <len 1|2|4|8> <addr> [addr ...] (up to four; none: clear): write watches on every thread; "watch" reports the hits.
+    if (!g_cfg.write) return "err watchw disabled (probe_write=0)\n";
+    int len = 0;
+    std::vector<uintptr_t> addrs;
+    std::string a;
+    if (!(in >> len) || (len != 1 && len != 2 && len != 4 && len != 8)) return "err usage: watchw <1|2|4|8> [addr ...]\n";
+    while (in >> a) {
+      uintptr_t v = 0;
+      if (!ParseAddr(a, &v) || !v || v % len) return "err bad or unaligned address " + a + "\n";
+      addrs.push_back(v);
+    }
+    return SimWatchWrites(addrs, len);
   } else if (cmd == "look") {
     if (!g_cfg.write) return "err look disabled (probe_write=0)\n";
     std::string base, donor, tok;
@@ -1123,6 +1136,8 @@ std::string Handle(const std::string& line) {
     return *result + "\n";
   } else if (cmd == "enemies") {
     out << CoopEnemyStatus();
+  } else if (cmd == "dmglog") {
+    out << CoopDamageLog();
   } else if (cmd == "coopset") {
     std::string k, v;
     in >> k >> v;
@@ -1179,14 +1194,20 @@ std::string Handle(const std::string& line) {
     in >> a >> id;
     if (!ParseAddr(a, &who) || !who || id.empty()) return "err usage: damage abs:<proxy character> <attack id, hex>\n";
     out << CoopTestDamage(who, (uint32_t)strtoul(id.c_str(), nullptr, 16));
+  } else if (cmd == "injectdmg") {
+    if (!g_cfg.write) return "err injectdmg disabled (probe_write=0)\n";
+    std::string id, attack;
+    in >> id >> attack;
+    if (id.empty() || attack.empty()) return "err usage: injectdmg <enemy id> <attack id, hex>\n";
+    out << CoopTestInjectDamage((uint32_t)strtoul(id.c_str(), nullptr, 10), (uint32_t)strtoul(attack.c_str(), nullptr, 16));
   } else if (cmd == "kill") {
     // Experiment: kill a character through the game's hit function (health 1, then a hit from this copy's player).
     if (!g_cfg.write) return "err kill disabled (probe_write=0)" "\n";
-    std::string a;
-    uintptr_t who = 0;
-    in >> a;
-    if (!ParseAddr(a, &who) || !who) return "err usage: kill abs:<character>" "\n";
-    return CoopTestKill(who);
+    std::string a, b;
+    uintptr_t who = 0, by = 0;
+    in >> a >> b;
+    if (!ParseAddr(a, &who) || !who || (!b.empty() && !ParseAddr(b, &by))) return "err usage: kill abs:<character> [abs:<attacker>]" "\n";
+    return CoopTestKill(who, by);
   } else if (cmd == "despawn") {
     if (!g_cfg.write) return "err despawn disabled (probe_write=0)\n";
     std::string a, r;

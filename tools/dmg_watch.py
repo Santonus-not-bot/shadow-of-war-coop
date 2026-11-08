@@ -28,8 +28,8 @@ def num(name):
 
 
 def decoy():
-    m = re.search(r'owner=abs:([0-9A-F]+)', A.ask('proxies'))
-    return m.group(1) if m else '-'
+    d = ls.live_decoy(A)  # old decoys (health 0) stay in the proxy list since session cm
+    return f'{d:X}' if d else '-'
 
 
 if '--respawn' in sys.argv:

@@ -66,6 +66,22 @@ def near(A, centre, radius=3000.0):
     return sorted(out)
 
 
+def stopped_count(A):
+    """Characters of the host left at health 0 (live_suite.remove "stops" an orc; the game never removes it: 253 had piled up
+    after a day of tests in session cl, the host's game then created no new orc, and fights late in a long session had fewer
+    and fewer swings). Restart the copies when this grows."""
+    n = 0
+    for line in A.ask(f'findq {ls.HEALTH_VT:X} 8192').splitlines()[1:]:
+        m = re.search(r'abs:([0-9A-F]+)', line)
+        if not m:
+            continue
+        h = int(m.group(1), 16)
+        o = A.q(h + 0x28)
+        hp = A.read(h + 0x42C, 4) if o and A.q(o + 0x26A8) == h else None
+        n += bool(hp) and not struct.unpack('<f', hp)[0] > 0
+    return n
+
+
 def go(A, B, keep_orcs=False, aim=True):
     for c in (A, B):
         c.ask('coopset keephealth on')
@@ -74,6 +90,14 @@ def go(A, B, keep_orcs=False, aim=True):
     B.teleport(ls.ARENA)
     time.sleep(3)
     killed = 0 if keep_orcs else clear(A, B, ls.ARENA)
+    if not keep_orcs:  # the Nazgul gear's undead (orc followers) near the arena fight the test's orcs: killed, else stopped
+        for o in ls.raised(A, ls.ARENA):
+            ls.remove(A, o)
+            killed += 1
+    left = stopped_count(A)
+    if left > 80:
+        print(f'WARNING: the host holds {left} stopped characters (health 0, never removed); new orcs may not spawn and '
+              'fights thin out: restart both copies', flush=True)
     if aim:
         for c, other in ((A, B), (B, A)):
             try:

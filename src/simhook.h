@@ -222,11 +222,27 @@ void SimProxyStopAttack(uintptr_t owner, uintptr_t record);
 void SimProxyHealth(uintptr_t owner, float frac);
 // Tells an AI character to despawn once it is offscreen, now (the caller is the simulation thread).
 bool SimDespawnNow(uintptr_t fn_rva, uintptr_t character);
+void SimDespawnOnce(bool on);  // a character is asked to go once (default); off: every time again (the old way)
+void SimDespawnStats(long* calls, long* repeats, long* skipped, long* faults, long* repeat_faults, long* refused);
+// The game's reference-list destructor (rva 4DD18C) unlinks through a repair (listfix.h): a reference linked with no target is
+// unlinked instead of looping for ever (the client's hang). Call on the simulation thread.
+bool SimUnlinkFixInstall(std::string* err);
+// Session cm: the call at 11A4C5 goes through a guard that answers a non-AI attacker (the host crashed at 11AA3A) as no target.
+bool SimAiParamGuardInstall(std::string* err);
+void SimAiParamStats(long* installed, long* guarded);
+// The retarget swap moves a target that sits in a game reference with the game's assign (on by default; off: the qword alone).
+void SimRetargetRefs(bool on);
+void SimRetargetRefStats(long* refs, long* raw);
+// How SimMemberLink set a member's character: through the game's reference assign, or written alone (not a reference).
+void SimMemberLinkStats(long* assigned, long* raw);
+void SimUnlinkStats(long* installed, long* repaired, long* left, long* faults);
 
 // Asks the game to despawn an AI character once it is offscreen ("AI told to despawn offscreen").
 bool SimDespawnOffscreen(uintptr_t fn_rva, uintptr_t character, std::string* err);
 bool SimAmbientHookInstall(uintptr_t fn_rva, std::string* err);
 void SimAmbientBlock(bool on);
+// The audio manager's crash on a full future-key queue is turned off (its convar GameAudioManager.FatalErrorOnFutureKeyFull).
+bool SimAudioKeysNonFatal(std::string* err);
 bool SimAmbushEnable(uintptr_t flag_rva, bool on, std::string* err);
 std::string SimAmbientReport();
 
@@ -287,6 +303,7 @@ long SimRetargeted();
 // The only current targets a redirect replaces (the host's player and the decoy; 0, 0: any, as before session cg); an enemy that
 // took another target is left to it (counted).
 void SimRetargetFrom(uintptr_t a, uintptr_t b);
+void SimRetargetDropTarget(uintptr_t target);  // every redirect to target ended (the decoy removed)
 long SimRetargetLeft();
 long SimRetargetSkipped();  // redirects not made: the enemy dead, or its target not a character
 // The host: swings of enemies that reach the stand-in are reported (and not taken) instead of skipped, so the client can
@@ -305,12 +322,16 @@ bool SimApplyDamage(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t attacker_o
 // The host: wakes an idle enemy by a hit from `attacker_owner` (the client's decoy): the game's hit function with the attack record
 // named `attack_name` (hash found by the game's own name hash, 423E70), then the enemy's health is put back to what it was: the
 // enemy keeps the decoy as the one that hit it (its target), at no cost. False if anything is not as known.
+// An attack's id from its name (the game's name hash 423E70), 0 if the hash function is not this build's.
+uint32_t SimAttackId(const char* attack_name);
 bool SimPokeEnemy(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t enemy_owner, uintptr_t attacker_owner, const char* attack_name);
 // Kills a character the way the game does: its health put at 1, then a hit from this copy's own player with the attack record
 // `attack_name` through the game's hit function, so that the game's own death runs (the animation, the ragdoll, the removal of the
 // body later), not a health of 0 that the game never notices. The character is let go as a proxy first (its hits are otherwise
 // dropped). False if the call could not be made.
-bool SimKillCharacter(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t owner, uintptr_t gameclient_rva, const char* attack_name);
+// `by`: the attacking character (0: this copy's player; the player's hit does not hurt an ally such as the host's decoy).
+bool SimKillCharacter(uintptr_t hit_rva, uintptr_t table_rva, uintptr_t owner, uintptr_t gameclient_rva, const char* attack_name,
+                      uintptr_t by = 0);
 // True if the character is marked as the player's follower (an ally).
 bool SimIsFollower(uintptr_t owner);
 // The host: applies a client's hit to the enemy `victim_owner`; the attacker is `attacker_owner` (the decoy), or this copy's own
@@ -327,6 +348,9 @@ long SimHitDrops();
 // A puppet the game unloaded, freed or killed is dropped (logged), so a new one is picked or
 // spawned. True when it dropped one.
 bool SimForgetGonePuppet();
+// The stand-in (0: none), and letting it go so that a new one is made (returns the old one, now hidden, health 0, tree skipped).
+uintptr_t SimPuppetOwner();
+uintptr_t SimRetirePuppet();
 
 // Probe "trace": for ms, count the return addresses of calls to fn (any address; an
 // execute breakpoint on the simulation thread) whose rcx is `rcx` (0: all).
@@ -417,6 +441,7 @@ bool SimSpawnPuppet(const SimSpawnRvas& r, const char* type, const float pos[3],
 // Probe "watch": what the write watch armed by "spawn <type> x y z watch" caught (the
 // writes to the new character's +0x19A8, with their call stacks).
 std::string SimWatchReport();
+std::string SimWatchWrites(const std::vector<uintptr_t>& addrs, int len);  // probe "watchw": up to 4 addresses, every thread
 
 // Probe "animres": give a character's animation object a behavior resource (459474, bytes
 // checked) at the next frame; with both its animation and behavior resources set, the game

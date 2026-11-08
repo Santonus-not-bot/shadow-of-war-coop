@@ -3189,7 +3189,12 @@ std::vector<Case> AllCases(const Env& env) {
     // network=coop_peer: the co-op socket may reach its peer on a real address; nothing else may.
     std::wstring ip;
     const unsigned pp = 47600 + (GetCurrentProcessId() % 40) * 10 + 9;
-    if (!LocalIPv4(&ip)) {
+    wchar_t no_peer[8] = {};
+    if (GetEnvironmentVariableW(L"SOWGUARD_TEST_NO_PEER", no_peer, 8) && no_peer[0] == L'1') {
+      // The host cases listen on this PC's real address, and Windows' firewall asks about each case's copy of this exe (a new
+      // folder every run; the owner saw the prompts in session cl). Runs that do not touch the network code skip them.
+      printf("(SOWGUARD_TEST_NO_PEER=1: the coop_peer cases, which listen on this PC's real address, are skipped)\n");
+    } else if (!LocalIPv4(&ip)) {
       printf("(this PC has no non-loopback IPv4 address: the coop_peer cases are skipped)\n");
     } else {
       const std::wstring hostport = ip + L":" + std::to_wstring(pp);

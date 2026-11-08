@@ -111,11 +111,10 @@ for o, h, top, now, _ in chars(pb, 3000):
     if o not in own and top in (300.0, 180.0) and now > 0:
         ls.remove(A, o)  # health 0: no kill for the Nazgul set to raise
 time.sleep(2)
-dec_m = re.search(r'owner=abs:([0-9A-F]+)', A.ask('proxies'))
-if not dec_m:
+dec = ls.live_decoy(A)  # old decoys (health 0) stay in the proxy list since session cm
+if not dec:
     print('no decoy on the host')
     sys.exit(1)
-dec = int(dec_m.group(1), 16)
 before = {c[0] for c in chars(pb, 4000)}
 for i in range(n):
     ang = 2 * math.pi * i / n

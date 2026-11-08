@@ -80,22 +80,57 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 ## Known problems
 
 - **Not tried on two PCs.** Only tested on one PC.
-- **Enemies stopping their attacks on the client: likely fixed in this build, not yet confirmed in play.** In earlier
-  builds the host's enemies went after the client but stood off and never struck once the client had moved away from
-  where it joined: the invisible ally the host keeps at the client's place stayed, for the game, where it was made. It is
-  now moved with the game's own teleport (`coop_decoy_reanchor`). In tests far from the join point: 0 enemy swings in 60 s
-  before, 17-36 in 50 s after. If enemies still stand off, the host's log has `coop: stuck:` lines: please send them.
-- **The host's archers do not hurt the client.** Their arrows never landed on the client's place on the host; the fix
-  above may change that (not tried).
+- **Enemies can still stop attacking the client.** The host keeps an invisible ally at the client's place for its enemies to
+  attack. Moved by the game's teleport it kept working over short moves, but not after a long jump (the way down from where the
+  client joins, a respawn): in tests 0 enemy swings in 120 s. This build makes the ally again after a jump of more than 1000
+  units (`coop_decoy_remake`), and in a 5-minute bot fight the client took 57 swings instead of 13. In that fight the swings
+  still stopped after about 90 seconds, with wild wargs, an olog and camp orcs joining in; with only ordinary orcs around, three
+  4-minute tests had no stop. If it happens, the host's log has `coop: stuck:` lines: please send them.
+- **The client's game could freeze** ("Not Responding"; four times in bot tests). Found and fixed in this build: when a captain's
+  picture on the client was removed, the mod cleared the captain's link to it the wrong way, and the game's own clean-up then
+  looped for ever when that character went. The mod now uses the game's own function for that link, and the game's clean-up is
+  also guarded: a link left that way is undone instead of looping (logged as `a reference linked with no target was unlinked`;
+  `coop_unlink_fix=off` turns the guard off). In bot tests since: no freeze, and the guard never had to act. If the client still
+  freezes, close it and join again, and please send both logs.
+- **The host's picture of the client can fall behind** (it moves by small jumps and got stuck 300-1,700 units back while the
+  client ran over rough ground). The host's invisible ally, which its enemies attack, now stands where the client says it is
+  instead of where that picture is (`coop_decoy_follow=standin` in the host's `sowguard.ini`: the old way): in a 10-minute bot
+  run it stayed within 21 units of the client the whole time, where the old way lost the client after 90 seconds on the same
+  route. The picture itself can still lag behind on the host's screen.
+- **The host's game could crash after it made its invisible ally again** (each time the client makes a long jump: joining, a
+  respawn, a fast travel). Found and fixed in this build: the old ally's own AI was switched back on while the game was taking it
+  apart. A bot test that remade the ally ~4 times a minute crashed the host after 6-9 minutes before the fix and ran 16 minutes
+  (61 remakes) without a crash after it. The mod also points enemies at the ally through the game's own links now
+  (`coop_retarget_refs=off` and `coop_decoy_limbo=off` in the host's `sowguard.ini` go back to the old ways). Old allies are not
+  deleted by the game: after about 40 remakes in one session the enemies stopped attacking in that test; restarting both games
+  clears them.
+- **The client's game could crash on a full audio queue** (the game's own check: "m_vFutureKeys is at capacity ... Game will
+  crash"; seen 3 times in tests, each right after the client arrived among the host's enemies). The game has a setting to drop
+  sounds instead of crashing there (`GameAudioManager.FatalErrorOnFutureKeyFull`); the mod turns it on in co-op
+  (`coop_audio_keys_fatal=on` in `sowguard.ini` keeps the crash). Some sounds may be lost when it happens.
+- **The client's game could crash in long fights** on another of the game's own checks (a 256-entry table in its AI; three times
+  in tests, after 2-13 minutes of fighting). Found: the client's pictures of the host's enemies have their own AI switched off,
+  and the game counts on that AI to empty the table. The client now makes a picture again (it blinks out and back) before its
+  table fills (`coop_proxy_table_max`, default 200; 0 turns this off). Each player's picture of the other is made again the same
+  way when its table fills (it disappears for a few seconds). Since this build the mod also counts the table's list itself:
+  after the client died, the client's picture of the host kept a list that grew about 2 entries a second while the host fought,
+  and the game never counted it. That picture is now made again about every 2 minutes of the host fighting.
+- **The host's archers hurt the client** since this build: their arrows hit the host's picture of the client (it stands where
+  the invisible ally does), and that damage is now sent to the client as an archer's shot (`coop_decoy_hurt_send=off` stops it).
+  Archers often keep their distance and shoot less than at the host's player.
 - With the Nazgul gear set, some enemies you kill rise as undead allies and fight the other orcs: orcs fighting orcs
   near you can be that (the game), not the mod.
 - The counter prompt is missing for some attacks aimed at the client. Counters were tried once only.
 - A finisher by the client on an enemy is buggy (the enemy can vanish). A downed client is not attacked with a kill move.
 - An arrow's damage is sent as a few sword strikes, so the amount is approximate.
-- If the host's game stops (the death screen, a loading screen, its pause menu), the client gets no news from it: after
-  5 seconds the host's enemies disappear from the client's screen, and they come back when the host plays on. (The
-  host's death screen itself was not tried; a stop of the host's game was.) If the client dies, the game's own death
-  flow runs on its copy.
+- If the host's game stops sending (a loading screen, its pause menu), the client gets no news from it: after 5 seconds the
+  host's enemies disappear from the client's screen, and they come back when the host plays on.
+- If the host dies, the client is taken to the host's respawn point a few seconds later (6-22 s in tests), while the host is
+  still on its death screens; any fight the client was in is left behind. The host's world stands still until the host plays
+  on; then both continue together. If the client dies, the game's own death flow runs on its copy; it respawns at its own
+  respawn point and is taken back to the host about 3 s later. Both were checked with bots on one PC.
+- After a death, a player's picture of the other once stood still far away and would not follow (seen on one PC, cause not
+  known). Since this build such a picture is moved straight to the other player whenever the game does not move it.
 - The client cannot fast-travel by itself: if it does (or respawns far away), it is taken back to the host about 3 s after it arrives. Fortress
   sieges and other world events are the host's only. Setting `coop_nemesis=share` in the client's `sowguard.ini`
   turns off the client running the host's Nemesis events (it only logs them).
@@ -132,7 +167,14 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
 `coop_proxy_react=on|off` and `coop_local_damage=on|off` (client), `coop_hit_by=poke|player|decoy` (host: how the client's
 hits are applied; `player` is the way builds before 2026-11-05 did it), `coop_standin_hits=off|on` (`on`: the other player's
 picture also hurts enemies with its copied swings, as before 2026-11-05), `coop_decoy_reanchor` (host, default 150, 0: off: how far the client's place may move before the host's game is told
-where it is), `coop_stuck_sec` (host, default 20, 0: off: an enemy
+where it is), `coop_decoy_remake` (host, default 1000, 0: off: a jump of the client's place this long makes the host's
+invisible ally again there), `coop_decoy_stall` (host, default 0: off; seconds: when enemies near that ally have not hit
+it for this long it is made again; not tested), `coop_unlink_fix=on|off` (both; default on: the guard in the game's clean-up
+described under "Known problems"), `coop_retarget_refs=on|off` and `coop_decoy_limbo=on|off` (host; default on), `coop_decoy_follow=remote|standin` (host; default remote), `coop_proxy_table_max` (client; default 200), `coop_decoy_hurt_send=on|off` (host; default on: an arrow that hits the ally is sent to the client as an archer's shot),
+`coop_decoy_still` (host; default 25: the ally is not moved while within that many units of its place; 0:
+moved every frame), `coop_audio_keys_fatal=off|on` (both; default off), `coop_ai_param_guard=on|off` (both; default on: a guard where the host's game crashed twice in its AI), `coop_hunt_to_player=off|on` (host; default off: enemies are pointed only at the client's place, never back at the host's player; `on` is the older behavior, which may have caused those crashes), `coop_dmg_borrow=on|off` (client; default on: an
+enemy's hit that arrives while the client has no picture of that enemy is applied with the nearest picture instead of being
+dropped), `coop_stuck_sec` (host, default 20, 0: off: an enemy
 that goes after the client but has not swung at it for this long is nudged; each time is logged as `coop: stuck:`, which helps
 with the problem below), `coop_follow_travel=on|off` (client), `coop_slowmo=on` (keeps the game's slow motion, ended after 4 s on a client; off by default in co-op), `coop_enemy_radius`
 (default 3500), `coop_join=off`, `coop_join_timeout_sec` (default 20), `autoload_max_presses` (how many times the mod

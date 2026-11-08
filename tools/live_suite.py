@@ -113,6 +113,17 @@ class Copy:
             time.sleep(1.5)
         return False
 
+    def can_move(self, min_units=20.0):
+        """True when this copy's player walks under the left stick (1 s forward along the camera). After the player's death the
+        camera answers the stick on screens where the player cannot move yet (session cm), so ensure_world alone is not enough."""
+        p0 = self.player()[0]
+        for _ in range(4):
+            self.ask('pad 0 0 32767 0 0 250')
+            time.sleep(0.25)
+        time.sleep(0.8)
+        p1 = self.player()[0]
+        return math.hypot(p1[0] - p0[0], p1[2] - p0[2]) > min_units
+
     def face(self, target):
         """Turns this copy's player toward target with a short, slow tap of the left stick (it
         steps a few units that way)."""
@@ -132,17 +143,98 @@ def flat(p):
 
 
 def remove(a, owner):
-    """Takes a character of the host's world out of a test without the host's player killing it: its health is written to 0 (it
-    stops; no attacker). The test save's Talion wears the Nazgul gear set, which raises some enemies he kills as undead allies that
-    then fight the hostile orcs (owner's note, session cj), and probe `kill` is a hit from the host's player; the game's despawn
-    took no living orc near the players (with or without the orc first written 40000 units away). Returns 'stopped' or 'left'."""
+    """Takes a character of the host's world out of a test: killed by probe `kill` (a hit from the host's player), so it dies the
+    game's way and the game removes the body; if the kill does not take, its health is written to 0 (it stops, no attacker).
+    Until session cl only the health write was used (so that the test save's Nazgul gear raised none), but the game never removes
+    a character stopped that way: 253 had piled up on the host after a day of tests, and its game then created no new orc. Real
+    kills are removed (of ~130 in session cl, 10 bodies were left); with the Nazgul set some came back as undead followers
+    (follower byte +0x23B8 set), which `raised` finds. Since 2026-11-06 the test save has no Nazgul set bonus (the owner swapped
+    gear; backups\2026-11-06-no-nazgul-set): no raise in 79 kills. Returns 'stopped' (dead either way) or 'left'."""
     h = a.q(owner + 0x26A8)
     if not h:
         return 'left'
+    if a.ask(f'kill abs:{owner:X}').strip().startswith('ok killed'):
+        return 'stopped'
     a.ask(f'write abs:{h + 0x42C:X} 00 00 00 00')
     time.sleep(0.2)
     hp = a.read(h + 0x42C, 4)
     return 'stopped' if hp and not struct.unpack('<f', hp)[0] > 0 else 'left'
+
+
+RAISED_KINDS = ('Orc_', 'Uruk', 'OlogHai')  # what the Nazgul gear raises (not a tamed beast: Warg_Tamed, Caragor_Tamed)
+
+
+def attack_names(c):
+    """{attack id: name} from the game's attack table ([27008F8]: count +0x28, array +0x38 of 40-byte records, type 0xA15 at +0,
+    id at +4, name pointer at +0x20; tools/attack_table.py)."""
+    table = c.q(0x140000000 + 0x27008F8)
+    count = struct.unpack('<I', c.read(table + 0x28, 4))[0]
+    array = c.q(table + 0x38)
+    raw = b''
+    while len(raw) < 40 * count:
+        raw += c.read(array + len(raw), min(4096, 40 * count - len(raw))) or b''
+    pages = {}
+
+    def name_at(addr):
+        out = b''
+        while len(out) < 128:
+            page = addr & ~0xFFF
+            if page not in pages:
+                pages[page] = c.read(page, 4096) or b''
+            chunk = pages[page][addr - page:]
+            if not chunk:
+                return '?'
+            z = chunk.find(b'\0')
+            if z >= 0:
+                return (out + chunk[:z]).decode('ascii', 'replace')
+            out += chunk
+            addr = page + 4096
+        return out.decode('ascii', 'replace')
+
+    out = {}
+    for i in range(count):
+        typ, rid = struct.unpack_from('<II', raw, 40 * i)
+        if typ == 0xA15:
+            out[rid] = name_at(struct.unpack_from('<Q', raw, 40 * i + 0x20)[0])
+    return out
+
+
+def live_decoy(a):
+    """The host's decoy now: its proxy with health above 0. Since session cm removed decoys stay in the host's proxy set (AI off,
+    health 0) until the game deletes them, so the first proxy listed is not always the decoy."""
+    m = re.search(r'decoy=abs:([0-9A-F]+)', a.ask('enemies'))  # the host names its decoy (since session cm)
+    if m:
+        return int(m.group(1), 16)
+    best = 0  # an older build: the last proxy with health above 0 (an old decoy's health can come back: not reliable)
+    for o, cur in re.findall(r'owner=abs:([0-9A-F]+) health=abs:[0-9A-F]+ hp=[-0-9.]+/([-0-9.]+)', a.ask('proxies')):
+        if float(cur) > 0:
+            best = int(o, 16)
+    return best
+
+
+def raised(a, centre=None, radius=3000.0):
+    """The host's living orcs that are followers of its player (+0x23B8 set): the Nazgul gear's undead, or branded orcs."""
+    out = []
+    for line in a.ask(f'findq {HEALTH_VT:X} 8192').splitlines()[1:]:
+        m = re.search(r'abs:([0-9A-F]+)', line)
+        if not m:
+            continue
+        h = int(m.group(1), 16)
+        o = a.q(h + 0x28)
+        if not o or a.q(o + 0x26A8) != h:
+            continue
+        hp, fol, p = a.read(h + 0x42C, 4), a.read(o + kFOLLOWER, 1), a.read(o + 0xAC, 12)
+        if not hp or not fol or not p or not fol[0] or not struct.unpack('<f', hp)[0] > 0:
+            continue
+        if not name_of(a, a.q(o + 0x2E68)).startswith(RAISED_KINDS):
+            continue
+        q = struct.unpack('<3f', p)
+        if centre is None or math.dist((q[0], q[2]), (centre[0], centre[2])) < radius:
+            out.append(o)
+    return out
+
+
+kFOLLOWER = 0x23B8
 
 
 def host_own(a):

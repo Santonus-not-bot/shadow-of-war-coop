@@ -65,8 +65,7 @@ def num(name, s):
 
 def decoy():
     """The host's only proxy is the decoy (a Gondorian_Soldier, 300 health, like an Orc_Infantry)."""
-    m = re.search(r'owner=abs:([0-9A-F]+)', A.ask('proxies'))
-    return int(m.group(1), 16) if m else 0
+    return ls.live_decoy(A)  # old decoys (health 0) stay in the proxy list since session cm
 
 
 keep()
