@@ -4,6 +4,13 @@ Work toward online co-op for Middle-earth: Shadow of War (Steam app 356190, buil
 3095001, `ShadowOfWar.exe` SHA-256 `ed0d95ca…0bdaef`). Write-up and research notes:
 `games/shadow-of-war/` in [coop-anything](https://github.com/cranebeaker/coop-anything).
 
+**Status (2026-11-11): alpha, up for adoption.** One host and one client play the host's world: the client sees and fights
+the host's enemies, runs the host's Nemesis events, follows fast travel and respawns. Tested with two copies of the game on one
+PC (bot fights up to 90 minutes without a crash, both players' deaths, simulated bad networks); never on two PCs. The author
+has stopped: players start with [release/README-PLAYERS.md](release/README-PLAYERS.md) and
+[release/TWO-PC-TEST.md](release/TWO-PC-TEST.md); whoever carries it on starts with "Picking this up", "Known issues" and
+"Next steps" in the write-up linked above.
+
 No game files are in this repo.
 
 ## sowguard (`src/sowguard.cpp`)
