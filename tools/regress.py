@@ -72,12 +72,15 @@ def check_client_death():
 
 
 def check_dup_damage():
+    t0 = time.time()
     out = run(['counter_log.py', '45', '3'], 400)
+    # Only this check's own sends: the host's log keeps 128 entries, and pairs from an earlier fight failed this check (session cm).
+    window_ms = (time.time() - t0) * 1000 + 1000
     A = ls.Copy('a')
     log = []
     for line in A.ask('dmglog').splitlines()[1:]:
         m = re.match(r'(\w) ago=(\d+) owner=abs:([0-9A-F]+) id=(\d+) attack=([0-9A-F]+)', line)
-        if m and m.group(1) == 's':
+        if m and m.group(1) == 's' and int(m.group(2)) <= window_ms:
             log.append((-int(m.group(2)), m.group(3), m.group(5)))
     log.sort()
     pairs = sum(1 for a, b in zip(log, log[1:]) if a[1] == b[1] and a[2] == b[2] and b[0] - a[0] < 300)

@@ -309,6 +309,9 @@ void SimRetargetFrom(uintptr_t a, uintptr_t b);
 void SimRetargetDropTarget(uintptr_t target);  // every redirect to target ended (the decoy removed)
 long SimRetargetLeft();
 long SimRetargetSkipped();  // redirects not made: the enemy dead, or its target not a character
+// Redirect slots in use (of 32), and of those, held by an enemy whose health is 0 or unreadable (session cm: the hunt never
+// let a dead enemy's slot go while its AI still named the decoy).
+int SimRetargetSlotsUsed(int* dead);
 // The host: swings of enemies that reach the stand-in are reported (and not taken) instead of skipped, so the client can
 // take them (SimDamageReports; the owner is the attacking enemy). Call before SimKeepPuppetUntargeted runs.
 void SimStandinHurt(bool on);
@@ -316,6 +319,13 @@ void SimStandinHurt(bool on);
 void SimSetDecoy(uintptr_t owner);
 // Diagnostic: the next n hits that reach the game's hit function are logged (types, health, roles of both characters).
 void SimHitLog(long n);
+// The combat manager's presentation flag (byte +0x1810 of [exe+26FFB70], written by F0F44: on during the death cinematic and a
+// captain's or the killer's presentation, off on the death screens and in play; session cm, tools/presentation_flag.py).
+bool SimPresentationActive();
+// Hits of the host's allies (bystander kinds: tamed wargs, followers) on the stand-in or the decoy are not sent to the client
+// (on by default, session cm); the count of those dropped.
+void SimDropAllyHits(bool on);
+long SimAllyHitDrops();
 void SimHideCharacter(uintptr_t owner);
 size_t SimDamageReports(SimHitReport* out, size_t max);
 // Is this attack one of the player's counter strikes (its name holds _Cntr_; the table is read once)?

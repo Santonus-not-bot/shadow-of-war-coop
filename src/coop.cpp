@@ -622,6 +622,10 @@ sowenemy::ClientTracker g_enemy_client;
 std::vector<std::vector<uint8_t>> g_enemy_events_in;  // from the net thread, taken by the frame
 std::vector<uint8_t> g_enemy_snap_in;
 uint64_t g_enemy_snap_ms = 0;
+bool g_host_presentation = false;  // the host's last snapshot said a presentation plays there (guarded by g_lock)
+// The last time the peer's player was seen dead, and whether the host's world has stopped since (its death screens); g_lock.
+ULONGLONG g_peer_dead_ms = 0, g_peer_dead_seen_ms = 0;  // the second is not cleared by a followed jump (the log below)
+float g_peer_walked = 0.0f;  // how far the peer's player walked (steps under 300 units) since its last long jump
 uint32_t g_enemy_session = 0;
 volatile LONG64 g_test_dmg_owner = 0;  // probe "damage": a swing of this proxy hits this copy's player, on the next frame
 volatile LONG g_test_dmg_attack = 0;
@@ -655,6 +659,7 @@ void QueueEnemySnapshot(const uint8_t* p, size_t n) {
   EnterCriticalSection(&g_lock);
   g_enemy_snap_in.assign(p, p + n);
   g_enemy_snap_ms = NowUs() / 1000;
+  g_host_presentation = (sowenemy::SnapshotHostFlags(p, n) & sowenemy::kHostPresentation) != 0;
   LeaveCriticalSection(&g_lock);
 }
 
@@ -945,6 +950,7 @@ void DecoyFrame() {
 // decoy) as their target are touched: an idle enemy wakes when something hits it (the client's strikes, the host's player).
 volatile LONG g_hunt_retargets = 0, g_hunt_engaged = 0, g_hunt_woken = 0, g_hunt_wake_failed = 0, g_hunt_unstuck = 0;
 volatile LONG g_hunt_player_left = 0;  // redirects to the host's player dropped (coop_hunt_to_player=off)
+volatile LONG g_hunt_dead_released = 0;  // dead enemies whose redirect slot was let go (coop_hunt_release_dead)
 // The last time each enemy's swing reached the decoy (EnemyHostDamage; simulation thread): the stuck-enemy watch below.
 std::unordered_map<uintptr_t, ULONGLONG> g_swing_at;
 ULONGLONG g_last_swing_at = 0;  // the last swing of any enemy that reached the decoy
@@ -984,6 +990,13 @@ void HuntFrame() {
     if (target != me && target != g_decoy_owner) continue;
     SimEnemyInfo info;
     if (!SimEnemyRead(e, &info)) continue;
+    // A dead enemy whose AI still names the player or the decoy held its redirect slot for good (it stayed "engaged" every frame);
+    // the slots are 32, so a long fight could run out of them (session cm). Its slot is let go.
+    if (g_cfg.hunt_release_dead && !(info.hp > 0)) {
+      if (engaged.erase(e)) InterlockedIncrement(&g_hunt_dead_released);
+      SimRetarget(e, 0);
+      continue;
+    }
     ++now_engaged;
     engaged[e] = now;
     const float to_me = DistXZ(info.pos, mine), to_dec = DistXZ(info.pos, dec);
@@ -1358,6 +1371,7 @@ void EnemyHostFrame() {
     hurt_set = true;
     SimStandinHurt(true);  // before the puppet code sets what the stubs skip
     SimDropStandinHits(!g_cfg.standin_hits);
+    SimDropAllyHits(!g_cfg.ally_hits);
     std::string e;
     if (!SimAttackHooksInstall(g_cfg.target_check_rva, g_cfg.hit_rva, g_cfg.aoe_rva, &e))
       SowLog(L"coop: enemy swings cannot be carried to the client: %S", e.c_str());
@@ -1442,6 +1456,7 @@ void EnemyHostFrame() {
   });
   std::vector<sowenemy::Seen> chosen;
   for (size_t i = 0; i < cand.size() && i < sowenemy::kMaxEnemies; ++i) chosen.push_back(cand[i].s);
+  g_enemy_host.host_flags = SimPresentationActive() ? sowenemy::kHostPresentation : 0;
   const sowenemy::HostTracker::Out out = g_enemy_host.update(chosen, now);
   // Events are kept until the transport can take them (the lock may be busy: see SendSample); a snapshot is not.
   static std::vector<std::vector<uint8_t>> pending;
@@ -1506,6 +1521,9 @@ void FreeProxy(sowenemy::Proxy& p) {
 constexpr uintptr_t kAiTableVt = 0x1FF9F50;
 std::vector<uintptr_t> g_ai_tables;  // found by AiTableScan (the table objects); guarded by g_lock
 volatile LONG g_ai_table_scans = 0, g_proxy_recycled = 0, g_ai_table_max_seen = 0, g_puppet_recycled = 0, g_ai_list_max_seen = 0;
+volatile LONG g_ai_uncounted = 0, g_ai_uncounted_inactive = 0;  // tables seen with an uncounted list / of those, agent byte 0
+volatile LONG g_puppet_agent_off = 0;  // stand-ins made again because their agent stayed switched off
+volatile LONG g_proxy_handle_reused = 0;  // proxy records that let go because a new proxy got their address
 
 DWORD WINAPI AiTableScan(void*) {
   std::vector<uintptr_t> hits(1024);
@@ -1525,11 +1543,15 @@ DWORD WINAPI AiTableScan(void*) {
 // the game walks the list (112354, then the 256 check in 1123CC); the client's stand-in of the host was seen with count 0 and 407
 // entries, growing 1.75 a second while the host fought (session cm), so the next walk would have stopped the game. The list is
 // circular with its head at table+8 (next at +8); the walk here stops at kAiListCap.
+// *active: the byte the agent update (2FF268) checks before it updates an agent, at +0x285 of the agent 0x140 before the table;
+// the update is what prunes the list and counts it. Set by 1141FC (after a 16-byte value is copied to +0x1E0) and by the agent's
+// file binding 193704; cleared by the agent reset 1960C4 (static reading, session cm).
 constexpr uint32_t kAiListCap = 512;
-bool AiTableRead(uintptr_t t, uint32_t* count, uint32_t* list, uintptr_t* character) {
+bool AiTableRead(uintptr_t t, uint32_t* count, uint32_t* list, uintptr_t* character, uint8_t* active = nullptr) {
   const uintptr_t vt = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + kAiTableVt;
   __try {
     if (*reinterpret_cast<const uintptr_t*>(t) != vt) return false;
+    if (active) *active = *reinterpret_cast<const uint8_t*>(t - 0x140 + 0x285);
     *count = *reinterpret_cast<const uint32_t*>(t + 0x70);
     const uintptr_t obj = *reinterpret_cast<const uintptr_t*>(t + 0x60);
     *character = obj ? *reinterpret_cast<const uintptr_t*>(obj + 0x40) : 0;
@@ -1549,7 +1571,7 @@ void FreeProxy(sowenemy::Proxy& p);  // below
 void ProxyTableFrame(ULONGLONG now) {
   static ULONGLONG next = 0;
   static bool thread = false;
-  if (g_cfg.proxy_table_max <= 0 || now < next) return;
+  if ((g_cfg.proxy_table_max <= 0 && g_cfg.standin_agent_off_secs <= 0) || now < next) return;
   next = now + 2000;
   if (!thread) {
     thread = true;
@@ -1563,21 +1585,57 @@ void ProxyTableFrame(ULONGLONG now) {
   LeaveCriticalSection(&g_lock);
   auto& proxies = g_enemy_client.proxies();
   const uintptr_t puppet = SimPuppetOwner();
+  static uintptr_t uncounted_logged[32] = {};
+  static size_t uncounted_n = 0;
   for (uintptr_t t : tables) {
     uint32_t count = 0, list = 0;
     uintptr_t ch = 0;
-    if (!AiTableRead(t, &count, &list, &ch) || !ch) continue;
+    uint8_t active = 0xFF;
+    if (!AiTableRead(t, &count, &list, &ch, &active) || !ch) continue;
     if ((LONG)count > g_ai_table_max_seen) InterlockedExchange(&g_ai_table_max_seen, (LONG)count);
-    if ((LONG)list > g_ai_list_max_seen && (ch == puppet || g_cfg.net_role == "client"))
-      InterlockedExchange(&g_ai_list_max_seen, (LONG)list);
-    if ((int)std::max(count, list) < g_cfg.proxy_table_max) continue;
+    const bool ours = ch == puppet || g_cfg.net_role == "client";
+    if ((LONG)list > g_ai_list_max_seen && ours) InterlockedExchange(&g_ai_list_max_seen, (LONG)list);
+    // A stand-in's list well past its count: the game's walk did not run for its agent (the state seen after client deaths).
+    // Logged once per table with the agent's active byte (open, session cm). 64 past it: a healthy stand-in often lists 17-20
+    // entries with count 0; the bad state reached 400. Not for proxies: their lists run ahead of their
+    // counts with the byte at 1 all the time (17-26 entries, count 0-6), and they are made again at coop_proxy_table_max.
+    if (ch == puppet && list > count + 64 && std::find(uncounted_logged, uncounted_logged + uncounted_n, t) == uncounted_logged + uncounted_n) {
+      if (uncounted_n < 32) uncounted_logged[uncounted_n++] = t;
+      InterlockedIncrement(&g_ai_uncounted);
+      if (!active) InterlockedIncrement(&g_ai_uncounted_inactive);
+      SowLog(L"coop: AI table of abs:%llX (%s) lists %u entries but counts %u; its agent's active byte is %u",
+             (unsigned long long)ch, L"the stand-in", list, count, active);
+    }
+    // A stand-in whose agent is switched off (byte 0: the agent update skips it, so its list is never pruned and, seen in session
+    // cm, the game's put-backs no longer move it) is made again once it stays off for coop_standin_agent_off seconds.
+    if (ch == puppet && g_cfg.standin_agent_off_secs > 0) {
+      static uintptr_t off_puppet = 0;
+      static ULONGLONG off_since = 0;
+      if (active != 0) {
+        if (off_puppet == ch) off_puppet = 0;
+      } else if (off_puppet != ch) {
+        off_puppet = ch;
+        off_since = now;
+      } else if (now - off_since >= (ULONGLONG)g_cfg.standin_agent_off_secs * 1000) {
+        off_puppet = 0;
+        const uintptr_t old = SimRetirePuppet();
+        if (old) {
+          SimDespawnNow(g_cfg.despawn_rva, old);
+          InterlockedIncrement(&g_puppet_agent_off);
+          SowLog(L"coop: the stand-in's AI agent was switched off for %llu ms (list %u, count %u); a new stand-in is made",
+                 (unsigned long long)(now - off_since), list, count);
+        }
+        continue;
+      }
+    }
+    if (g_cfg.proxy_table_max <= 0 || (int)std::max(count, list) < g_cfg.proxy_table_max) continue;
     count = std::max(count, list);
     if (ch == puppet) {  // the stand-in's table grows too (~77 on the client after 7 minutes of fighting, session cm)
       const uintptr_t old = SimRetirePuppet();
       if (old) {
         SimDespawnNow(g_cfg.despawn_rva, old);
         InterlockedIncrement(&g_puppet_recycled);
-        SowLog(L"coop: the stand-in's AI table held %u entries; a new stand-in is made", count);
+        SowLog(L"coop: the stand-in's AI table held %u entries (agent active byte %u); a new stand-in is made", count, active);
       }
       continue;
     }
@@ -1595,7 +1653,8 @@ void ProxyTableFrame(ULONGLONG now) {
       p.shown_set = false;
       p.next_spawn_ms = now;
       if (InterlockedIncrement(&g_proxy_recycled) <= 20)
-        SowLog(L"coop: enemy %u (%S): its proxy's AI table held %u entries; made again", p.id, p.type, count);
+        SowLog(L"coop: enemy %u (%S): its proxy's AI table held %u entries (agent active byte %u); made again", p.id, p.type,
+               count, active);
       break;
     }
   }
@@ -1827,6 +1886,17 @@ void EnemyClientFrame() {
         made = SimSpawn(rv, p.type, p.cur.pos, nullptr, &report, &obj, true) && obj && SimProxyAdopt(obj);
       }
       if (made) {
+        // The game reuses a freed character's address (session cm: one proxy address served three enemies in turn). A record
+        // still holding it would drive the new proxy too (moves, health writes that hide a loss): it lets go without freeing.
+        for (auto& other : proxies) {
+          if (&other.second == &p || other.second.handle != obj) continue;
+          other.second.handle = 0;
+          other.second.applied_record = 0;
+          other.second.shown_set = false;
+          if (InterlockedIncrement(&g_proxy_handle_reused) <= 10)
+            SowLog(L"coop: enemy %u's proxy address abs:%llX was reused by the game for enemy %u's proxy; the old record lets go",
+                   other.first, (unsigned long long)obj, kv.first);
+        }
         p.handle = obj;
         p.shown_set = false;
         p.built_member = member ? p.member_id : sowenemy::kNoMember;
@@ -2018,6 +2088,10 @@ ULONGLONG g_travel_at = 0;
 volatile LONG g_travels = 0;
 
 // The client: the host jumped (fast travel): this copy's player goes to where the host is, beside it.
+bool g_travel_waiting = false;
+volatile LONG g_travel_waits = 0;
+volatile LONG g_travel_presentation_waits = 0;  // TravelFrame ticks spent waiting for a host presentation  // host jumps followed only once the host's world ran again
+
 void TravelFrame() {
   bool due = false;
   float to[3];
@@ -2067,10 +2141,56 @@ void TravelFrame() {
     }
   }
   EnterCriticalSection(&g_lock);
+  if (g_peer_dead_seen_ms && GetTickCount64() - g_peer_dead_seen_ms < 120000) {  // the host's death sequence as the client sees it (logged on change, at most 60 lines; session cm)
+    static int was = -1, logged = 0;
+    const int stopped = g_enemy_snap_ms && NowUs() / 1000 - g_enemy_snap_ms > 1500 ? 1 : 0;
+    const int in_world = (g_last.flags & 1) ? 1 : 0, quiet = GetTickCount64() - g_last_at > 1500 ? 1 : 0;
+    const int now_state = stopped | (in_world << 1) | ((g_host_presentation ? 1 : 0) << 2) | (quiet << 3) | ((g_last.health > 0) << 4);
+    if (now_state != was && logged < 60) {
+      ++logged;
+      was = now_state;
+      SowLog(L"coop: host death sequence: snapshots %s, player state %s, in world %d, presentation %d, health %.0f (%llu ms since dead)",
+             stopped ? L"stopped" : L"flow", quiet ? L"quiet" : L"flows", in_world, g_host_presentation ? 1 : 0, g_last.health,
+             (unsigned long long)(GetTickCount64() - g_peer_dead_seen_ms));
+    }
+  }
   if (g_travel_due && GetTickCount64() >= g_travel_at) {
-    due = true;
-    memcpy(to, g_travel_to, sizeof to);
-    g_travel_due = false;
+    // The host's long jump while its world is stopped (its death screens: the game moves the dead player to the respawn point
+    // 6-22 s after the death, session cm) is followed once the host's world runs again, so both arrive together and the
+    // client is not pulled out of its fight early. Stopped: no enemy snapshot for 1.5 s. At most two minutes.
+    // Also while a presentation plays on the host (its flag in the snapshots): the host's world runs again during the killer's
+    // presentation, before its player can walk, and the client arrived then (session cm). Since session cm the host sends a
+    // snapshot every tick even with no enemy near, so a respawn far from enemies does not read as a stopped world.
+    const uint64_t snap_age = NowUs() / 1000 - g_enemy_snap_ms;
+    const bool host_stopped = g_cfg.travel_wait_host && g_cfg.enemies && g_enemy_snap_ms && snap_age > 1500;
+    const bool host_presenting = g_cfg.travel_wait_host && g_cfg.enemies && !host_stopped && g_host_presentation;
+    // After the host's death the game moves its player to the respawn point right after the death cinematic, then shows the
+    // death and Nemesis screens; the host's state and snapshots keep coming the whole time (session cm: logged on the client),
+    // only its player stands still. So a jump within two minutes of the host's death waits until the host's player has walked
+    // 60 units by itself (and no presentation plays): the host is back in control.
+    const ULONGLONG tnow = GetTickCount64();
+    const bool after_death = g_cfg.travel_wait_host && g_cfg.enemies && g_peer_dead_ms && tnow - g_peer_dead_ms < 120000;
+    const bool host_idle = after_death && g_peer_walked < 60.0f;
+    if ((host_stopped || host_presenting || host_idle) && tnow - g_travel_at < 120000) {
+      if (!g_travel_waiting) {
+        g_travel_waiting = true;
+        InterlockedIncrement(&g_travel_waits);
+        if (host_stopped)
+          SowLog(L"coop: the host jumped while its world is stopped (no state for %llu ms): following once it runs again",
+                 (unsigned long long)snap_age);
+        else if (host_presenting)
+          SowLog(L"coop: the host jumped while a presentation plays there: following once it ends");
+        else
+          SowLog(L"coop: the host respawned: following once it walks again");
+      }
+      if (host_presenting) InterlockedIncrement(&g_travel_presentation_waits);
+    } else {
+      due = true;
+      g_travel_waiting = false;
+      memcpy(to, g_travel_to, sizeof to);
+      g_travel_due = false;
+      g_peer_dead_ms = 0;  // this death's jump is followed: later jumps (fast travel) go at once
+    }
   }
   LeaveCriticalSection(&g_lock);
   if (!due) return;
@@ -2293,12 +2413,19 @@ void IngestPacket(const Packet& p, uint64_t recv_us, unsigned from_port) {
       memcpy(g_travel_to, p.pos, sizeof g_travel_to);
       g_travel_at = now + 1500;
       g_travel_due = true;
+      g_peer_walked = 0.0f;
     } else if (g_travel_due) {
+      const float step = std::sqrt(dx * dx + dz * dz);
+      if (step < 300.0f) g_peer_walked += step;
       memcpy(g_travel_to, p.pos, sizeof g_travel_to);  // still settling: follow where it stands now
     }
   }
   if (g_have && p.seq > g_last.seq + 1) g_lost += p.seq - g_last.seq - 1;
   if (!g_have) g_first_at = now;
+  if ((p.flags & 1) && p.max_health > 0 && p.health <= 0.0f) {  // the sender's player is dead (its death sequence: TravelFrame)
+    g_peer_dead_ms = now;
+    g_peer_dead_seen_ms = now;
+  }
   g_last = p;
   g_last_at = now;
   g_have = true;
@@ -2719,10 +2846,16 @@ std::string CoopSet(const std::string& key, const std::string& value) {
   else if (key == "remake") g_cfg.decoy_remake = (float)atof(value.c_str());
   else if (key == "decoystill") g_cfg.decoy_still = (float)atof(value.c_str());
   else if (key == "proxytablemax") g_cfg.proxy_table_max = atoi(value.c_str());
+  else if (key == "standinagentoff") g_cfg.standin_agent_off_secs = atoi(value.c_str());
   else if (key == "huntstrict" && (value == "on" || value == "off")) g_cfg.hunt_strict = value == "on";
   else if (key == "decoyhide" && (value == "on" || value == "off")) InterlockedExchange(&g_decoy_hide, value == "on" ? 1 : 0);
   else if (key == "keephealth" && (value == "on" || value == "off")) InterlockedExchange(&g_keep_health, value == "on" ? 1 : 0);
   else if (key == "hunttoplayer" && (value == "on" || value == "off")) g_cfg.hunt_to_player = value == "on";
+  else if (key == "huntreleasedead" && (value == "on" || value == "off")) g_cfg.hunt_release_dead = value == "on";
+  else if (key == "allyhits" && (value == "on" || value == "off")) {
+    g_cfg.ally_hits = value == "on";
+    SimDropAllyHits(!g_cfg.ally_hits);
+  }
   else if (key == "react" && (value == "on" || value == "off")) {
     g_cfg.proxy_react = value == "on";
     SimProxyReact(g_cfg.proxy_react);
@@ -2788,16 +2921,18 @@ std::string CoopEnemyStatus() {
       if (kv.second.handle) ++spawned_now;
       if (kv.second.have) ++with_pos;
     }
+  int rt_dead = 0;
+  const int rt_used = SimRetargetSlotsUsed(&rt_dead);
   snprintf(b, sizeof b,
            "ok enemies=%s role=%s host_known=%zu host_announced=%ld host_snapshots=%ld client_proxies=%zu with_pos=%zu "
-           "standing=%zu spawned=%ld failed=%ld despawn_asked=%ld hits_sent=%ld hits_on_proxies=%ld hits_applied=%ld hits_failed=%ld hits_stale=%ld travels=%ld hits_unmatched=%ld dmg_sent=%ld dmg_applied=%ld dmg_failed=%ld dmg_stale=%ld away=%ld nemesis_sent=%ld nemesis_got=%ld nemesis_skipped=%ld nemesis_applied=%ld nemesis_failed=%ld captains_sent=%ld captains_built=%ld captains_missing=%ld members_sent=%ld members_got=%ld members_skipped=%ld members_built=%ld members_failed=%ld attacks_ok=%ld attacks_fail=%ld plays_ok=%ld plays_fail=%ld hunt_engaged=%ld hunt_retargets=%ld hunt_woken=%ld hunt_wake_failed=%ld anims_sent=%ld anims_played=%ld anims_refused=%ld killed=%ld kill_failed=%ld local_damage=%ld local_sent=%ld moves_ok=%ld moves_failed=%ld hits_by_decoy=%ld hits_poked=%ld standin_drops=%ld retarget_left=%ld retarget_skipped=%ld hunt_unstuck=%ld decoy_reanchors=%ld decoy_hurt=%ld decoy_hurt_amount=%ld decoy_remade=%ld decoy_stall_remade=%ld despawn_calls=%ld despawn_repeats=%ld despawn_skipped=%ld despawn_faults=%ld despawn_repeat_faults=%ld despawn_refused=%ld unlink_fix=%ld unlink_repaired=%ld unlink_left=%ld unlink_faults=%ld retarget_refs=%ld retarget_raw=%ld member_links=%ld member_links_raw=%ld decoy_limbo=%zu decoy_limbo_gone=%ld decoy_killed=%ld dmg_borrowed=%ld decoy_by_remote=%ld decoy_unwritten=%ld decoy_hurt_sent=%ld standin_hurt=%ld standin_hurt_sent=%ld proxy_recycled=%ld puppet_recycled=%ld ai_table_max=%ld ai_list_max=%ld ai_table_scans=%ld ai_param_guard=%ld/%ld ai_tick_guard=%ld/%ld hunt_player_left=%ld dmg_dups=%ld counter_strikes=%ld counter_heals=%ld local_after_strike=%ld local_bystander=%ld local_fall=%ld losses_applied=%ld losses_killed=%ld losses_stale=%ld decoy=abs:%llX\n",
+           "standing=%zu spawned=%ld failed=%ld despawn_asked=%ld hits_sent=%ld hits_on_proxies=%ld hits_applied=%ld hits_failed=%ld hits_stale=%ld travels=%ld hits_unmatched=%ld dmg_sent=%ld dmg_applied=%ld dmg_failed=%ld dmg_stale=%ld away=%ld nemesis_sent=%ld nemesis_got=%ld nemesis_skipped=%ld nemesis_applied=%ld nemesis_failed=%ld captains_sent=%ld captains_built=%ld captains_missing=%ld members_sent=%ld members_got=%ld members_skipped=%ld members_built=%ld members_failed=%ld attacks_ok=%ld attacks_fail=%ld plays_ok=%ld plays_fail=%ld hunt_engaged=%ld hunt_retargets=%ld hunt_woken=%ld hunt_wake_failed=%ld anims_sent=%ld anims_played=%ld anims_refused=%ld killed=%ld kill_failed=%ld local_damage=%ld local_sent=%ld moves_ok=%ld moves_failed=%ld hits_by_decoy=%ld hits_poked=%ld standin_drops=%ld retarget_left=%ld retarget_skipped=%ld retarget_slots=%d/%d hunt_dead_released=%ld ally_hit_drops=%ld hunt_unstuck=%ld decoy_reanchors=%ld decoy_hurt=%ld decoy_hurt_amount=%ld decoy_remade=%ld decoy_stall_remade=%ld despawn_calls=%ld despawn_repeats=%ld despawn_skipped=%ld despawn_faults=%ld despawn_repeat_faults=%ld despawn_refused=%ld unlink_fix=%ld unlink_repaired=%ld unlink_left=%ld unlink_faults=%ld retarget_refs=%ld retarget_raw=%ld member_links=%ld member_links_raw=%ld decoy_limbo=%zu decoy_limbo_gone=%ld decoy_killed=%ld dmg_borrowed=%ld decoy_by_remote=%ld decoy_unwritten=%ld decoy_hurt_sent=%ld standin_hurt=%ld standin_hurt_sent=%ld proxy_recycled=%ld puppet_recycled=%ld ai_table_max=%ld ai_list_max=%ld ai_uncounted=%ld/%ld puppet_agent_off=%ld proxy_handle_reused=%ld ai_table_scans=%ld ai_param_guard=%ld/%ld ai_tick_guard=%ld/%ld hunt_player_left=%ld dmg_dups=%ld travel_waits=%ld travel_presentation_ticks=%ld host_presentation=%d counter_strikes=%ld counter_heals=%ld local_after_strike=%ld local_bystander=%ld local_fall=%ld losses_applied=%ld losses_killed=%ld losses_stale=%ld decoy=abs:%llX\n",
            g_cfg.enemies ? "on" : "off", g_cfg.net_role.c_str(), g_enemy_host.known(), g_enemy_announced, g_enemy_sent,
            g_cfg.net_role == "client" ? g_enemy_client.proxies().size() : (size_t)0, with_pos, spawned_now, g_enemy_spawned,
            g_enemy_spawn_failed, g_enemy_despawn_asked, g_enemy_hits_sent, SimProxyHits(), g_enemy_hits_applied, g_enemy_hits_failed,
            g_enemy_hits_stale, g_travels, g_enemy_hits_unmatched, g_enemy_dmg_sent, g_enemy_dmg_applied, g_enemy_dmg_failed, g_enemy_dmg_stale, g_enemy_away, g_nemesis_sent, g_nemesis_got, g_nemesis_skipped, g_nemesis_applied, g_nemesis_failed, g_enemy_members_sent, g_enemy_captains, g_enemy_captains_missing, g_member_sent, g_member_got, g_member_skipped, g_member_built, g_member_failed,
            g_enemy_attack_ok, g_enemy_attack_fail, g_enemy_play_ok, g_enemy_play_fail, g_hunt_engaged, g_hunt_retargets, g_hunt_woken, g_hunt_wake_failed, g_enemy_anims_sent, g_enemy_anims_played, g_enemy_anims_refused, g_enemy_killed, g_enemy_kill_failed, g_enemy_local_damage, g_enemy_local_sent, SimProxyMovesOk(), SimProxyMovesFailed(), g_enemy_hits_by_decoy,
-           g_enemy_hits_poked, SimStandinHitDrops(), SimRetargetLeft(), SimRetargetSkipped(), g_hunt_unstuck, g_decoy_reanchors, g_decoy_hurt, g_decoy_hurt_amount, g_decoy_remade, g_decoy_stall_remade, dsp_calls, dsp_repeats, dsp_skipped,
-           dsp_faults, dsp_repeat_faults, dsp_refused, ul_installed, ul_repaired, ul_left, ul_faults, rt_refs, rt_raw, ml_assigned, ml_raw, g_decoy_limbo.size(), g_decoy_limbo_gone, g_decoy_killed, g_enemy_dmg_borrowed, g_decoy_by_remote, g_decoy_unwritten, g_decoy_hurt_sent, g_standin_hurt, g_standin_hurt_sent, g_proxy_recycled, g_puppet_recycled, g_ai_table_max_seen, g_ai_list_max_seen, g_ai_table_scans, ap_installed, ap_guarded, at_installed, at_skipped, g_hunt_player_left, SimDamageDups(), g_counter_strikes, g_counter_heals, g_enemy_local_after_strike, g_enemy_local_bystander, g_enemy_local_fall, g_enemy_losses_applied, g_enemy_losses_killed, g_enemy_losses_stale, (unsigned long long)g_decoy_owner);
+           g_enemy_hits_poked, SimStandinHitDrops(), SimRetargetLeft(), SimRetargetSkipped(), rt_used, rt_dead, g_hunt_dead_released, SimAllyHitDrops(), g_hunt_unstuck, g_decoy_reanchors, g_decoy_hurt, g_decoy_hurt_amount, g_decoy_remade, g_decoy_stall_remade, dsp_calls, dsp_repeats, dsp_skipped,
+           dsp_faults, dsp_repeat_faults, dsp_refused, ul_installed, ul_repaired, ul_left, ul_faults, rt_refs, rt_raw, ml_assigned, ml_raw, g_decoy_limbo.size(), g_decoy_limbo_gone, g_decoy_killed, g_enemy_dmg_borrowed, g_decoy_by_remote, g_decoy_unwritten, g_decoy_hurt_sent, g_standin_hurt, g_standin_hurt_sent, g_proxy_recycled, g_puppet_recycled, g_ai_table_max_seen, g_ai_list_max_seen, g_ai_uncounted, g_ai_uncounted_inactive, g_puppet_agent_off, g_proxy_handle_reused, g_ai_table_scans, ap_installed, ap_guarded, at_installed, at_skipped, g_hunt_player_left, SimDamageDups(), g_travel_waits, g_travel_presentation_waits, g_host_presentation ? 1 : 0, g_counter_strikes, g_counter_heals, g_enemy_local_after_strike, g_enemy_local_bystander, g_enemy_local_fall, g_enemy_losses_applied, g_enemy_losses_killed, g_enemy_losses_stale, (unsigned long long)g_decoy_owner);
   return b;
 }
 

@@ -16,10 +16,30 @@ struct SwingSeen {
   uint32_t attack = 0;
   uint64_t at = 0;
 };
-// True when this report is the second of one swing (not to be sent); otherwise `last` becomes this report.
-inline bool SameSwingAgain(SwingSeen* last, uintptr_t attacker, uint32_t attack, uintptr_t victim, uint64_t now) {
-  if (attacker == last->attacker && attack == last->attack && victim != last->victim && now - last->at < kSameSwingMs) return true;
-  *last = SwingSeen{attacker, victim, attack, now};
+// The last report of each of the most recent attackers. One slot was not enough: two orcs landing the same attack in the same
+// frames reported orc 1 on the stand-in, orc 2 on the stand-in, orc 1 on the decoy, orc 2 on the decoy, and both second reports
+// were sent (session cm: 3 pairs 31-109 ms apart in a regression run).
+constexpr int kSwingSlots = 8;
+struct SwingsSeen {
+  SwingSeen slot[kSwingSlots];
+};
+// True when this report is the second of one swing (not to be sent); otherwise it becomes its attacker's last report (in that
+// attacker's slot, else the oldest).
+inline bool SameSwingAgain(SwingsSeen* seen, uintptr_t attacker, uint32_t attack, uintptr_t victim, uint64_t now) {
+  SwingSeen* mine = nullptr;
+  for (SwingSeen& e : seen->slot) {
+    if (e.at && e.attacker == attacker) {
+      if (attack == e.attack && victim != e.victim && now - e.at < kSameSwingMs) return true;
+      mine = &e;
+      break;
+    }
+  }
+  if (!mine) {
+    mine = &seen->slot[0];
+    for (SwingSeen& e : seen->slot)
+      if (e.at < mine->at) mine = &e;
+  }
+  *mine = SwingSeen{attacker, victim, attack, now};
   return false;
 }
 

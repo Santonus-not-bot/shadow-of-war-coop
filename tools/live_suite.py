@@ -115,14 +115,19 @@ class Copy:
 
     def can_move(self, min_units=20.0):
         """True when this copy's player walks under the left stick (1 s forward along the camera). After the player's death the
-        camera answers the stick on screens where the player cannot move yet (session cm), so ensure_world alone is not enough."""
-        p0 = self.player()[0]
-        for _ in range(4):
-            self.ask('pad 0 0 32767 0 0 250')
-            time.sleep(0.25)
-        time.sleep(0.8)
-        p1 = self.player()[0]
-        return math.hypot(p1[0] - p0[0], p1[2] - p0[2]) > min_units
+        camera answers the stick on screens where the player cannot move yet (session cm), so ensure_world alone is not enough.
+        Forward first, then back, left and right: a player facing a wall does not move forward (a regress run read "cannot walk"
+        for a client standing in the world against a door, session cm)."""
+        for lx, ly in ((0, 32767), (0, -32767), (-32767, 0), (32767, 0)):
+            p0 = self.player()[0]
+            for _ in range(4):
+                self.ask(f'pad 0 {lx} {ly} 0 0 250')
+                time.sleep(0.25)
+            time.sleep(0.8)
+            p1 = self.player()[0]
+            if math.hypot(p1[0] - p0[0], p1[2] - p0[2]) > min_units:
+                return True
+        return False
 
     def face(self, target):
         """Turns this copy's player toward target with a short, slow tap of the left stick (it

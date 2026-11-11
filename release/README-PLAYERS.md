@@ -85,7 +85,9 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
   client joins, a respawn): in tests 0 enemy swings in 120 s. This build makes the ally again after a jump of more than 1000
   units (`coop_decoy_remake`), and in a 5-minute bot fight the client took 57 swings instead of 13. In that fight the swings
   still stopped after about 90 seconds, with wild wargs, an olog and camp orcs joining in; with only ordinary orcs around, three
-  4-minute tests had no stop. If it happens, the host's log has `coop: stuck:` lines: please send them.
+  4-minute tests had no stop. In long bot fights on later builds (60 and 90 minutes, archers included) enemies swung at the
+  client in most 30-second stretches (111 of 119 in the 60-minute run), with pauses of up to a minute. If it happens, the host's
+  log has `coop: stuck:` lines: please send them.
 - **The client's game could freeze** ("Not Responding"; four times in bot tests). Found and fixed in this build: when a captain's
   picture on the client was removed, the mod cleared the captain's link to it the wrong way, and the game's own clean-up then
   looped for ever when that character went. The mod now uses the game's own function for that link, and the game's clean-up is
@@ -115,12 +117,22 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
   way when its table fills (it disappears for a few seconds). Since this build the mod also counts the table's list itself:
   after the client died, the client's picture of the host kept a list that grew about 2 entries a second while the host fought,
   and the game never counted it. That picture is now made again about every 2 minutes of the host fighting.
+- **The host's tamed wargs could hurt the client.** A tamed warg's running lunge passes through the host's picture of the client
+  and was sent to the client as damage. Since this build hits by the host's tamed wargs and followers are not sent
+  (`coop_ally_hits=on` sends them again).
+- **A player's picture of the other could slide and jump instead of walking.** The game has a switch for each character's AI
+  update; when it is off, the picture moves only when the mod puts it back in place (jumps of about 150 units) and its AI table
+  is never emptied. What turns it off in play is not known yet (likely a death). Since this build a picture whose switch stays
+  off for 6 seconds is made again (it disappears for a moment and walks normally after; `coop_standin_agent_off`, seconds,
+  default 6, 0 turns this off).
 - **The host's archers hurt the client** since this build: their arrows hit the host's picture of the client (it stands where
   the invisible ally does), and that damage is now sent to the client as an archer's shot (`coop_decoy_hurt_send=off` stops it).
   Archers often keep their distance and shoot less than at the host's player.
 - With the Nazgul gear set, some enemies you kill rise as undead allies and fight the other orcs: orcs fighting orcs
   near you can be that (the game), not the mod.
-- The counter prompt is missing for some attacks aimed at the client. Counters were tried once only.
+- Counters work for the client and protect it: in bot tests it countered many attacks (some killed the orc on both screens), and
+  a swing it countered did not take its health. The counter prompt can still be missing for some attacks (cause not known; some
+  attacks cannot be countered in the game either).
 - A finisher by the client on an enemy is buggy (the enemy can vanish). A downed client is not attacked with a kill move.
 - Since this build the damage of the client's arrows (and other damage its enemies' pictures take outside sword hits) reaches the
   host's enemy exactly; before, it was sent as stock sword strikes (`coop_exact_losses=off` keeps that).
@@ -128,9 +140,9 @@ To stop, quit the game normally. To remove everything, delete the copy folder (`
   was sent twice, so the client took some swings twice).
 - If the host's game stops sending (a loading screen, its pause menu), the client gets no news from it: after 5 seconds the
   host's enemies disappear from the client's screen, and they come back when the host plays on.
-- If the host dies, the client is taken to the host's respawn point a few seconds later (6-22 s in tests), while the host is
-  still on its death screens; any fight the client was in is left behind. The host's world stands still until the host plays
-  on; then both continue together. If the client dies, the game's own death flow runs on its copy; it respawns at its own
+- If the host dies, the client stays where it is (and keeps fighting) through the host's death scene, death screens and the
+  killer's presentation, and is taken to the host's respawn point once the host walks again (at most 2 minutes;
+  `coop_travel_wait_host=off`: at once). Checked with bots: the client arrived the moment the killer's presentation ended. If the client dies, the game's own death flow runs on its copy; it respawns at its own
   respawn point and is taken back to the host about 3 s later. Both were checked with bots on one PC.
 - When a captain ambushes the host, the client's game plays the host's Nemesis events too (the captain's introduction, his
   showdown, his kill of the host's player) and may show a screen the client has to press through.
@@ -175,9 +187,9 @@ picture also hurts enemies with its copied swings, as before 2026-11-05), `coop_
 where it is), `coop_decoy_remake` (host, default 1000, 0: off: a jump of the client's place this long makes the host's
 invisible ally again there), `coop_decoy_stall` (host, default 0: off; seconds: when enemies near that ally have not hit
 it for this long it is made again; not tested), `coop_unlink_fix=on|off` (both; default on: the guard in the game's clean-up
-described under "Known problems"), `coop_retarget_refs=on|off` and `coop_decoy_limbo=on|off` (host; default on), `coop_decoy_follow=remote|standin` (host; default remote), `coop_proxy_table_max` (client; default 200), `coop_decoy_hurt_send=on|off` (host; default on: an arrow that hits the ally is sent to the client as an archer's shot),
+described under "Known problems"), `coop_retarget_refs=on|off` and `coop_decoy_limbo=on|off` (host; default on), `coop_decoy_follow=remote|standin` (host; default remote), `coop_proxy_table_max` (client; default 200), `coop_standin_agent_off` (both; seconds, default 6, 0 off), `coop_hunt_release_dead=on|off` (host; default on: a dead enemy no longer keeps one of the 32 slots that point enemies at the client), `coop_ally_hits=on|off` (host; default off: hits of the host's tamed wargs and followers on the client's picture are not sent to the client), `coop_decoy_hurt_send=on|off` (host; default on: an arrow that hits the ally is sent to the client as an archer's shot),
 `coop_decoy_still` (host; default 25: the ally is not moved while within that many units of its place; 0:
-moved every frame), `coop_audio_keys_fatal=off|on` (both; default off), `coop_ai_param_guard=on|off` (both; default on: a guard where the host's game crashed twice in its AI), `coop_counter_heal=off|on` (client; default off, an experiment: when the client counters an enemy, the health its last swing took within 1.5 s is given back), `coop_hunt_to_player=off|on` (host; default off: enemies are pointed only at the client's place, never back at the host's player; `on` is the older behavior, which may have caused those crashes), `coop_dmg_borrow=on|off` (client; default on: an
+moved every frame), `coop_audio_keys_fatal=off|on` (both; default off), `coop_ai_param_guard=on|off` (both; default on: a guard where the host's game crashed twice in its AI), `coop_counter_heal=off|on` (client; default off, not needed: a swing the client counters does not hurt it, checked; the option gives back the health an enemy's last swing took when the client counters it within 1.5 s), `coop_hunt_to_player=off|on` (host; default off: enemies are pointed only at the client's place, never back at the host's player; `on` is the older behavior, which may have caused those crashes), `coop_dmg_borrow=on|off` (client; default on: an
 enemy's hit that arrives while the client has no picture of that enemy is applied with the nearest picture instead of being
 dropped), `coop_stuck_sec` (host, default 20, 0: off: an enemy
 that goes after the client but has not swung at it for this long is nudged; each time is logged as `coop: stuck:`, which helps

@@ -6,7 +6,8 @@ probe answers). Then A is pressed back into the world (it respawns somewhere els
 was taken along (B's 'travels' count, B's distance to A) and that the link works again (stand-ins on both sides, the host's
 enemies shown on B again after a fight is started near the players). Prints both copies' log lines about crashes, the decoy,
 travel and the host being away.
-Usage: host_death.py"""
+The client must wait for the host to walk again before following its respawn (coop_travel_wait_host, session cm); --no-wait
+drops that check (for coop_travel_wait_host=off). Usage: host_death.py [--no-wait]"""
 import math
 import os
 import re
@@ -63,9 +64,15 @@ while time.time() - t0 < 120:
 print('A health %s after %.0f s' % (hp, time.time() - t0), flush=True)
 
 # A's world is stopped (death and Nemesis screens): watch B for 30 s.
+wait_expected = '--no-wait' not in sys.argv  # coop_travel_wait_host on (the default since session cm)
+_m0 = re.search(r'travel_waits=(\d+)', B.ask('enemies'))
+waits0 = int(_m0.group(1)) if _m0 else 0
+moved_early = False
 for i in range(15):
     try:
         bp = B.player()
+        if dist(bp[0], b0[0]) > 1000:
+            moved_early = True
         c = counts(B)
         print('  +%2d s: B health %.0f at %s, standing=%d away=%d' % (2 * i, bp[3], [round(v) for v in bp[0]],
               c['standing'], c['away']), flush=True)
@@ -120,7 +127,13 @@ print('after spawning 3 orcs near A: B %s' % cb, flush=True)
 print('A', re.sub(r'\s+', ' ', A.ask('enemies'))[:300], flush=True)
 sa, b2 = A.standin(), B.player()
 off = dist(sa[1], b2[0]) if sa[1] else -1
-ok = back and dist(b2[0], A.player()[0]) < 1500 and 0 <= off < 150 and cb['standing'] > 0
+import re as _re
+waits = int((_re.search(r'travel_waits=(\d+)', B.ask('enemies')) or _re.search('(0)', '0')).group(1))
+# The client waits after the host's death until the host's player walks again and no presentation plays (session cm: it
+# arrived the moment the killer's presentation ended). The check is that it waited.
+ok = back and dist(b2[0], A.player()[0]) < 1500 and 0 <= off < 150 and cb['standing'] > 0 and not (wait_expected and waits - waits0 < 1)
+print("B waited for the host's world: %s (travel_waits +%d); B moved during the sampled 30 s: %s" % (
+    waits - waits0 >= 1, waits - waits0, moved_early), flush=True)
 print('RESULT: %s (A walks %s, B %.0f from A, the stand-in %.0f from B, %d host enemies shown on B)' % (
     'PASS' if ok else 'FAIL', back, dist(b2[0], A.player()[0]), off, cb['standing']), flush=True)
 

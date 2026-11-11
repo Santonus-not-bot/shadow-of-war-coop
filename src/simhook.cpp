@@ -2353,6 +2353,7 @@ LONG g_dmg_taken = 0;
 // health and roles (who hits whom among the enemies near the decoy, session cg).
 volatile LONG g_hit_log_left = 0;
 volatile LONG g_drop_standin_hits = 0, g_standin_hit_drops = 0;
+volatile LONG g_drop_ally_hits = 1, g_ally_hit_drops = 0;  // hits of the host's allies on the stand-in or the decoy
 
 void LogHitSeen(uintptr_t attacker, uintptr_t victim_owner, uintptr_t rec) {
   uintptr_t att_owner = 0, gc = 0, pl = 0;
@@ -2408,15 +2409,23 @@ bool __fastcall HitFilter(uintptr_t attacker, uintptr_t victim, const float* pos
         // The decoy stands where the stand-in stands, so one swing can reach both: two reports, and the client took the swing
         // twice (session cm: 12 of 31 swings came in pairs 15-63 ms apart, the same attacker and attack). A swing of the same
         // attacker and attack that reaches the other of the two within 300 ms is not reported again.
-        static cooprules::SwingSeen last;
-        EnterCriticalSection(&g_lock);
-        if (cooprules::SameSwingAgain(&last, att_owner, s.attack_id, owner, GetTickCount64())) {
-          InterlockedIncrement(&g_dmg_dups);
+        static cooprules::SwingsSeen seen;
+        // The host's own allies reach the stand-in and the decoy too: a tamed warg's running lunge (AI_Warg_WhileMoving) passed
+        // through both and was sent to the client as damage, twice within 125 ms (session cm, coopset hitlog). An attacker of a
+        // bystander kind (tamed, follower, prisoner, slave, captive) is not reported.
+        SimEnemyInfo ai{};
+        if (g_drop_ally_hits && SimEnemyRead(att_owner, &ai) && cooprules::BystanderKind(ai.type, sizeof ai.type)) {
+          InterlockedIncrement(&g_ally_hit_drops);
         } else {
-          g_dmg_ring[g_dmg_count % kHitRing] = s;
-          InterlockedIncrement(&g_dmg_count);
+          EnterCriticalSection(&g_lock);
+          if (cooprules::SameSwingAgain(&seen, att_owner, s.attack_id, owner, GetTickCount64())) {
+            InterlockedIncrement(&g_dmg_dups);
+          } else {
+            g_dmg_ring[g_dmg_count % kHitRing] = s;
+            InterlockedIncrement(&g_dmg_count);
+          }
+          LeaveCriticalSection(&g_lock);
         }
-        LeaveCriticalSection(&g_lock);
       }
     }
     return true;
@@ -2566,6 +2575,16 @@ void SimSetDecoy(uintptr_t owner) { g_decoy = owner; }
 void SimHitLog(long n) { InterlockedExchange(&g_hit_log_left, n); }
 void SimDropStandinHits(bool on) { InterlockedExchange(&g_drop_standin_hits, on ? 1 : 0); }
 long SimStandinHitDrops() { return g_standin_hit_drops; }
+bool SimPresentationActive() {
+  __try {
+    const uintptr_t mgr = *reinterpret_cast<const uintptr_t*>(Base() + 0x26FFB70);
+    return mgr && *reinterpret_cast<const volatile uint8_t*>(mgr + 0x1810) != 0;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+void SimDropAllyHits(bool on) { InterlockedExchange(&g_drop_ally_hits, on ? 1 : 0); }
+long SimAllyHitDrops() { return g_ally_hit_drops; }
 long SimDamageDups() { return g_dmg_dups; }
 
 size_t SimDamageReports(SimHitReport* out, size_t max) {
@@ -3521,7 +3540,7 @@ uintptr_t SimRetirePuppet() {
     WriteXform(owner, x);
   }
   SimProxyHealth(owner, 0.0f);
-  SowLog(L"sim: puppet abs:%llX retired (its AI table is nearly full); a new one is made", (unsigned long long)owner);
+  SowLog(L"sim: puppet abs:%llX retired; a new one is made", (unsigned long long)owner);
   return owner;
 }
 
@@ -5520,6 +5539,22 @@ void SimRetargetRefStats(long* refs, long* raw) {
 }
 long SimRetargetLeft() { return g_retarget_left; }
 long SimRetargetSkipped() { return g_retarget_skipped; }
+int SimRetargetSlotsUsed(int* dead) {
+  Retarget list[kMaxRetarget];
+  EnterCriticalSection(&g_lock);
+  memcpy(list, g_retarget, sizeof list);
+  LeaveCriticalSection(&g_lock);
+  int used = 0, gone = 0;
+  for (const Retarget& r : list) {
+    if (!r.enemy) continue;
+    ++used;
+    uintptr_t eh = 0;
+    float hp = 0;
+    if (!CharacterHealth(r.enemy, &eh) || !ReadFloats(eh + 0x42C, &hp, 1) || !(hp > 0)) ++gone;
+  }
+  if (dead) *dead = gone;
+  return used;
+}
 void SimRetargetDropTarget(uintptr_t target) {
   EnterCriticalSection(&g_lock);
   for (Retarget& r : g_retarget)

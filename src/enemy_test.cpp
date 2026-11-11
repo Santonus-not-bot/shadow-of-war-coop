@@ -209,6 +209,47 @@ int main() {
     Check(!c.onEvent(shortmsg.data(), shortmsg.size(), &gone), "a short one is refused");
   }
 
+  printf("[host: its flags, a snapshot with no enemy (session cm)]\n");
+  {
+    HostTracker h;
+    auto o = h.update({Orc(0x1000, 0, 0), Orc(0x2000, 500, 0)}, 1000);
+    Check(SnapshotHostFlags(o.snapshot.data(), o.snapshot.size()) == 0, "no host flag by default");
+    h.host_flags = kHostPresentation;
+    o = h.update({}, 1066);
+    Check(o.snapshot.size() == SnapshotBytes(0) && AsSnap(o.snapshot)->count == 0 && o.events.size() == 2,
+          "no enemy near: GONE for both and still a snapshot, a header alone (the client's respawn wait reads it)");
+    Check(SnapshotHostFlags(o.snapshot.data(), o.snapshot.size()) == kHostPresentation, "it carries the host's presentation flag");
+    ClientTracker c;
+    Check(c.onSnapshot(o.snapshot.data(), o.snapshot.size(), 1070) == 0, "a client takes no record from it");
+    h.host_flags = 0;
+    o = h.update({Orc(0x3000, 0, 0)}, 1132);
+    Check(SnapshotHostFlags(o.snapshot.data(), o.snapshot.size()) == 0 && AsSnap(o.snapshot)->count == 1, "the flag goes off again");
+    const uint8_t junk[12] = {'X', 'X', 'X', 'X', 0, 0, 0, 0, 0, 1, 0, 0};
+    Check(SnapshotHostFlags(junk, sizeof junk) == 0 && SnapshotHostFlags(o.snapshot.data(), 8) == 0,
+          "no flag read from a body that is not a snapshot or is too short");
+  }
+
+  printf("[host: a dead enemy's address reused by the same type (session cm)]\n");
+  {
+    HostTracker h;
+    auto o = h.update({Orc(0x5000, 0, 0)}, 1000);
+    const uint32_t first = AsSnap(o.snapshot)->rec[0].id;
+    Seen dead = Orc(0x5000, 0, 0);
+    dead.alive = false;
+    o = h.update({dead}, 1066);
+    Check(o.events.empty() && AsSnap(o.snapshot)->rec[0].id == first && !(AsSnap(o.snapshot)->rec[0].flags & kAlive),
+          "the enemy dies: same id, not alive");
+    o = h.update({dead}, 1132);
+    Check(o.events.empty() && AsSnap(o.snapshot)->rec[0].id == first, "its body stays: same id");
+    o = h.update({Orc(0x5000, 300, 0)}, 1198);
+    Check(o.events.size() == 2 && o.events[0][0] == kOpGone && o.events[1][0] == kOpNew && AsSnap(o.snapshot)->rec[0].id != first,
+          "a living orc of the same type at that address is a new enemy: GONE for the dead one, NEW with another id");
+    const uint32_t second = AsSnap(o.snapshot)->rec[0].id;
+    Check(h.keyOf(second) == 0x5000 && h.keyOf(first) == 0, "the host knows only the new id for that address");
+    o = h.update({Orc(0x5000, 310, 0)}, 1264);
+    Check(o.events.empty() && AsSnap(o.snapshot)->rec[0].id == second, "and keeps it while it lives");
+  }
+
   printf("[client: events, snapshots, bad input]\n");
   {
     HostTracker h;
@@ -433,7 +474,7 @@ int main() {
   printf("[co-op rules (coop_rules.h, session cm)]\n");
   {
     using namespace cooprules;
-    SwingSeen last;
+    SwingsSeen last;
     const uintptr_t orc = 0x1000, other = 0x2000, standin = 0x3000, decoy = 0x4000;
     Check(!SameSwingAgain(&last, orc, 7, standin, 1000), "a first report of a swing is sent");
     Check(SameSwingAgain(&last, orc, 7, decoy, 1040), "the same attacker and attack on the other victim 40 ms later is the same swing");
@@ -441,6 +482,17 @@ int main() {
     Check(!SameSwingAgain(&last, orc, 7, decoy, 1450), "a second hit on the same victim is not dropped as a duplicate");
     Check(!SameSwingAgain(&last, other, 7, standin, 1460), "another attacker's swing a moment later is sent");
     Check(!SameSwingAgain(&last, other, 8, decoy, 1470), "another attack of that attacker is sent");
+    // Two orcs landing the same attack at once, their reports interleaved (session cm: both second reports were sent with one slot).
+    SwingsSeen two;
+    Check(!SameSwingAgain(&two, orc, 9, standin, 5000) && !SameSwingAgain(&two, other, 9, standin, 5000),
+          "two orcs' swings on the stand-in in the same frame are both sent");
+    Check(SameSwingAgain(&two, orc, 9, decoy, 5031) && SameSwingAgain(&two, other, 9, decoy, 5031),
+          "and each one's report on the decoy 31 ms later is its same swing");
+    // More attackers than slots: the oldest attacker's slot is reused; the newest are still remembered.
+    SwingsSeen many;
+    for (uintptr_t k = 1; k <= kSwingSlots + 2; ++k) SameSwingAgain(&many, 0x10000 * k, 3, standin, 6000 + k);
+    Check(SameSwingAgain(&many, 0x10000 * (kSwingSlots + 2), 3, decoy, 6100), "the newest of ten attackers is still remembered");
+    Check(!SameSwingAgain(&many, 0x10000, 3, decoy, 6100), "the oldest of ten attackers was forgotten (its slot reused): sent");
     Check(BystanderKind("Warg_Tamed", 10), "a tamed warg is a bystander");
     Check(BystanderKind("Orc_Prisoner", 12), "a prisoner is a bystander");
     Check(!BystanderKind("Orc_Infantry", 12), "a grunt is not a bystander");

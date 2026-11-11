@@ -42,6 +42,8 @@ struct CoopConfig {
   bool ai_param_guard = true;         // coop_ai_param_guard=off: the AI's attack-parameter lookup (rva 11A4C5) is left unguarded
   bool exact_losses = true;           // coop_exact_losses=off: a proxy's loss outside hits goes to the host as stock strikes
   bool counter_heal = false;          // coop_counter_heal=on (experiment): a client's counter gives back that enemy's last swing (within 1.5 s)
+  bool travel_wait_host = true;       // coop_travel_wait_host=off: follow the host's long jump at once (its respawn included: the
+                                      // wait lasts until the host walks again and no presentation plays there; session cm)
   bool follow_travel = true;          // coop_follow_travel=off: a client does not follow the host's long jumps (fast travel)
   int decoy_stall = 0;                 // coop_decoy_stall: enemies near the decoy after it, no swing reaching it this long: the decoy is made again (0: not)
   int stuck_sec = 20;                  // coop_stuck_sec: an enemy after the decoy, near it, without a swing at it this long is let go and poked (0: not)
@@ -52,6 +54,8 @@ struct CoopConfig {
   bool proxy_react = true;             // coop_proxy_react=off: the client's strikes on proxies are only reported (no reaction shown)
   bool hunt_retarget = true;           // coop_hunt=off: the host does not point engaged enemies at the nearer player
   bool hunt_strict = false;            // coop_hunt_strict=on: the pointing replaces only the host's player or the decoy as a target
+  bool ally_hits = false;             // coop_ally_hits=on: hits of the host's tamed wargs and followers on the client's picture are sent (before session cm)
+  bool hunt_release_dead = true;      // coop_hunt_release_dead=off: a dead enemy keeps its redirect slot (before session cm)
   bool hunt_to_player = false;        // coop_hunt_to_player=on: the hunt may also redirect an enemy to the host's player (crashed the host)
   // coop_hit_by: who the host's game is told made the client's hits. poke (2): the host's own player, then a harmless poke from
   // the decoy so the enemy turns to it; decoy (1): the decoy (its hits did no damage in session cg, so it falls back to poke);
@@ -60,6 +64,7 @@ struct CoopConfig {
   bool standin_hits = false;           // coop_standin_hits=on: the stand-in's copies of the other player's swings hurt too
   bool decoy = true;                   // coop_decoy=on: enemies attack an invisible-ish ally where the stand-in stands
   int proxy_table_max = 200;          // coop_proxy_table_max: a proxy whose AI table holds this many entries is made again (0: never)
+  int standin_agent_off_secs = 6;     // coop_standin_agent_off: a stand-in whose AI agent stays switched off this long is made again (0: never)
   bool decoy_hurt_send = true;        // coop_decoy_hurt_send=off: health the decoy loses outside the hit function is only counted
   float decoy_still = 25.0f;          // coop_decoy_still: the decoy is not moved while within this of its place (0: written every frame)
   float decoy_remake = 1000.0f;        // coop_decoy_remake: a jump of the client's place this long (or 400 up or down) remakes the decoy (0: never)

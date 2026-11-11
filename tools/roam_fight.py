@@ -23,7 +23,7 @@ removal of proxies then runs the game's destructor on it. Rows show how many wer
 --ai-table (session cm: the client crashed twice in long fights on the game's check at 11244A, a 256-entry table at +0x140 of an
 object the AI manager updates, count at +0x1B0): each row adds, for B's proxies and B's player, the largest dword at
 [character+0x2CE8]+0x1B0 (the guess: that object is the character's AI data) and whose it is.
-Usage: roam_fight.py [secs, default 600] [orcs, default 3] [--seed=<s>] [--no-arena] [--no-roam] [--detail] [--spawn-dist=<d>] [--fresh-decoy] [--idle] [--no-strike] [--only-orcs] [--feel] [--break-refs] [--ai-table] [--archer-every=<k>]
+Usage: roam_fight.py [secs, default 600] [orcs, default 3] [--seed=<s>] [--no-arena] [--no-roam] [--detail] [--spawn-dist=<d>] [--fresh-decoy] [--idle] [--no-strike] [--only-orcs] [--feel] [--break-refs] [--ai-table] [--archer-every=<k>] [--max-spawns=<k>]
 (B needs coop_follow_travel=off; B's keephealth is left off at the end.)"""
 import math
 import os
@@ -51,6 +51,32 @@ ONLY_ORCS = '--only-orcs' in sys.argv  # every other hostile near B is stopped: 
 others_stopped = [0]
 HOSTILE = ('Orc_', 'Uruk', 'OlogHai', 'Warg_', 'Caragor', 'Ghul')
 NOT_HOSTILE = ('Tamed', 'Prisoner', 'Slave', 'Captive', 'Worker')
+
+
+host_freed = [0]  # windows in which the host's world stood still and was pressed through
+SLOTS = (0x118, 0x170, 0x1C8, 0x220, 0x2D0, 0x328)
+
+
+def stall_targets(pb):
+    """What the living grunts within 1000 of B are after on the host (their AI's active goal slot; orc_targets.py), for a stalled
+    window: host / decoy / old decoy / stand-in / none / other, with each one's distance to B."""
+    me, dec, standin = A.player()[2], ls.live_decoy(A), A.standin()[0]
+    old = set(int(x, 16) for x in re.findall(r'owner=abs:([0-9A-F]+)', A.ask('proxies'))) - {dec}
+    out = []
+    for d, o, _ in living(pb):
+        if d > 1000:
+            continue
+        ai = A.q(o + 0x2CE8)
+        t = 0
+        for sl in SLOTS:
+            b = A.read(ai + sl, 1) if ai else None
+            if b and b[0]:
+                t = A.q(ai + sl + 0x30)
+                break
+        what = ('host' if t == me else 'decoy' if t == dec else 'old-decoy' if t in old else 'stand-in' if t == standin
+                else 'none' if not t else 'other')
+        out.append(f'{d:.0f}:{what}')
+    return ' '.join(out)
 
 
 def stats(c):
@@ -258,6 +284,9 @@ end = t0 + secs
 next_hp = next_scan = next_full = 0.0
 next_report = t0 + 30
 spawn_dist = float(opt.get('spawn-dist', 700))  # how far from B a new orc is spawned
+# The tool spawns at most this many orcs in a run (the host's game keeps killed orcs near the players): 40 per orc slot by
+# default, reached after ~40 minutes; a 90-minute soak thinned out there for this reason alone (session cm). --max-spawns=<k>.
+max_spawns = int(opt.get('max-spawns', n * 40))
 detail = '--detail' in sys.argv  # per-orc cells under each row
 idle = '--idle' in sys.argv  # B does nothing at all (no moves, no strikes)
 no_strike = '--no-strike' in sys.argv  # B moves, never strikes
@@ -301,7 +330,7 @@ try:
                     stopped += 1
             near = [x for x in near if x[0] <= 2500]
             # A spawned orc shows in the scan only seconds later: one batch per 12 s (session ck: 12 orcs after 60 s)
-            if len([x for x in near if x[0] < 1500]) < n and spawned < n * 40 and now - last_spawn > 12:
+            if len([x for x in near if x[0] < 1500]) < n and spawned < max_spawns and now - last_spawn > 12:
                 last_spawn = now
                 for _ in range(n - len([x for x in near if x[0] < 1500])):
                     ang = rng.uniform(0, 2 * math.pi)
@@ -394,9 +423,17 @@ try:
                   f"re {row['re']:3d} unst {row['unst']} dd {dd:5.0f} alive {row['alive']} at {pb[0]:.0f},{pb[2]:.0f} "
                   f"B: stale {sb.get('dmg_stale', 0) - pb0.get('dmg_stale', 0)} proxies {sb.get('standing', 0)}/{sb.get('client_proxies', 0)} "
                   f"spawned {sb.get('spawned', 0) - pb0.get('spawned', 0)}"
-                  f"{'  STALL' if stall else ''}"
+                  f"{('  STALL [' + stall_targets(pb) + ']') if stall else ''}"
                   f"{f'  broken {len(broken)} B {unlink_counts(B)}' if BREAK else ''}"
                   f"{'  ai_table %d (%s)' % ai_table_max() if AI_TABLE else ''}", flush=True)
+            # The host's world stopped (no enemy snapshot in a whole window): a captain's presentation or the host's death screens wait
+            # for a press, as a player would give (session cm: a 45-minute run lost its last 30 minutes this way). A, then back.
+            if sa.get('host_snapshots', 0) == pa0.get('host_snapshots', -1):
+                for btn in ('1000', '1000', '2000', '1000'):
+                    A.ask(f'pad {btn} 0 0 0 0 200')
+                    time.sleep(1.2)
+                host_freed[0] += 1
+                print(f"{row['t']:5.0f}s the host's world stood still for the window: pressed through", flush=True)
             if detail:  # each orc within 1500 of B: distance to the decoy, target, current attack id's high half @ stamp
                 own = ls.host_own(A)
                 gmap = graphs()
@@ -441,7 +478,7 @@ applied = sb.get('dmg_applied', 0) - s_b0.get('dmg_applied', 0)
 stalls = sum(1 for r in rows if r['sent'] == 0 and r['scans'] and r['eng'] >= r['scans'] / 2)
 eng_windows = sum(1 for r in rows if r['scans'] and r['eng'] >= r['scans'] / 2)
 print(f'FINAL {dur:.0f} s: damage messages sent {sent} ({sent / max(dur, 1) * 60:.1f}/min), applied by B {applied}, B felt '
-      f'{felt_total:.0f} health in {felt_reads} reads; B\'s hits applied {sa.get("hits_applied", 0) - s_a0.get("hits_applied", 0)}; '
+      f'{felt_total:.0f} health in {felt_reads} reads; host pressed through {host_freed[0]}x; B\'s hits applied {sa.get("hits_applied", 0) - s_a0.get("hits_applied", 0)}; '
       f'windows engaged {eng_windows}/{len(rows)}, stalled {stalls}; longest engaged silence {max_silence:.0f} s (at {silence_at:.0f} s); '
       f'reanchors {sa.get("decoy_reanchors", 0) - s_a0.get("decoy_reanchors", 0)}, unstuck '
       f'{sa.get("hunt_unstuck", 0) - s_a0.get("hunt_unstuck", 0)}; orcs spawned {spawned}, stopped (strayed) {stopped}, others stopped '

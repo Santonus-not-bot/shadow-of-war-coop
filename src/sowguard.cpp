@@ -1053,6 +1053,12 @@ void Init(HMODULE self) {
       const std::wstring unlink = IniStr(ini, L"coop_unlink_fix");
       if (unlink == L"off") cc.unlink_fix = false;
       else if (!unlink.empty() && unlink != L"on") Fatal(kExitConfig, L"coop_unlink_fix must be on or off (got %s)", unlink.c_str());
+      const std::wstring allyh = IniStr(ini, L"coop_ally_hits");
+      if (allyh == L"on") cc.ally_hits = true;
+      else if (!allyh.empty() && allyh != L"off") Fatal(kExitConfig, L"coop_ally_hits must be on or off (got %s)", allyh.c_str());
+      const std::wstring huntd = IniStr(ini, L"coop_hunt_release_dead");
+      if (huntd == L"off") cc.hunt_release_dead = false;
+      else if (!huntd.empty() && huntd != L"on") Fatal(kExitConfig, L"coop_hunt_release_dead must be on or off (got %s)", huntd.c_str());
       const std::wstring huntp = IniStr(ini, L"coop_hunt_to_player");
       if (huntp == L"on") cc.hunt_to_player = true;
       else if (!huntp.empty() && huntp != L"off") Fatal(kExitConfig, L"coop_hunt_to_player must be on or off (got %s)", huntp.c_str());
@@ -1065,6 +1071,9 @@ void Init(HMODULE self) {
       const std::wstring aiguard = IniStr(ini, L"coop_ai_param_guard");
       if (aiguard == L"off") cc.ai_param_guard = false;
       else if (!aiguard.empty() && aiguard != L"on") Fatal(kExitConfig, L"coop_ai_param_guard must be on or off (got %s)", aiguard.c_str());
+      const std::wstring twait = IniStr(ini, L"coop_travel_wait_host");
+      if (twait == L"off") cc.travel_wait_host = false;
+      else if (!twait.empty() && twait != L"on") Fatal(kExitConfig, L"coop_travel_wait_host must be on or off (got %s)", twait.c_str());
       const std::wstring travel = IniStr(ini, L"coop_follow_travel");
       if (travel == L"off") cc.follow_travel = false;
       else if (!travel.empty() && travel != L"on") Fatal(kExitConfig, L"coop_follow_travel must be on or off (got %s)", travel.c_str());
@@ -1081,6 +1090,9 @@ void Init(HMODULE self) {
       cc.decoy_still = (float)GetPrivateProfileIntW(L"sowguard", L"coop_decoy_still", (INT)cc.decoy_still, ini.c_str());
       cc.proxy_table_max = (int)GetPrivateProfileIntW(L"sowguard", L"coop_proxy_table_max", cc.proxy_table_max, ini.c_str());
       if (cc.proxy_table_max < 0 || cc.proxy_table_max > 250) Fatal(kExitConfig, L"coop_proxy_table_max must be 0..250");
+      cc.standin_agent_off_secs =
+          (int)GetPrivateProfileIntW(L"sowguard", L"coop_standin_agent_off", cc.standin_agent_off_secs, ini.c_str());
+      if (cc.standin_agent_off_secs < 0 || cc.standin_agent_off_secs > 600) Fatal(kExitConfig, L"coop_standin_agent_off must be 0..600");
       cc.enemy_radius = (float)GetPrivateProfileIntW(L"sowguard", L"coop_enemy_radius", (INT)cc.enemy_radius, ini.c_str());
       if (cc.enemy_radius < 500 || cc.enemy_radius > 20000) Fatal(kExitConfig, L"coop_enemy_radius must be 500..20000");
     }

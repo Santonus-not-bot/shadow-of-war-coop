@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -24,6 +25,9 @@ enum Op : uint8_t { kOpNew = 1, kOpGone = 2, kOpHit = 3, kOpDamage = 4, kOpNemes
                     kOpLoss = 9 };
 enum Loco : uint8_t { kIdle = 0, kWalk = 1, kRun = 2 };
 enum Flag : uint8_t { kAlive = 1, kTargetsClient = 2 };  // kTargetsClient: the host's enemy is after the client's stand-in
+// The host's own state, in Snapshot::pad[0] (older clients ignore it). kHostPresentation: a presentation plays on the host (its
+// combat manager's flag: the death cinematic, a captain's presentation, the killer's presentation; session cm).
+enum HostFlag : uint8_t { kHostPresentation = 1 };
 
 #pragma pack(push, 1)
 struct Rec {
@@ -40,7 +44,7 @@ struct Snapshot {
   char magic[4];  // "SOWE"
   uint32_t seq;
   uint8_t count;
-  uint8_t pad[3];
+  uint8_t pad[3];  // pad[0]: HostFlag bits
   Rec rec[kMaxEnemies];
 };
 #pragma pack(pop)
@@ -48,6 +52,10 @@ static_assert(sizeof(Rec) == 32, "Rec is 32 bytes");
 constexpr size_t kSnapshotHead = 12;
 
 inline size_t SnapshotBytes(unsigned count) { return kSnapshotHead + count * sizeof(Rec); }
+// The host's HostFlag bits of a STATE2 body (0 when it is not a snapshot).
+inline uint8_t SnapshotHostFlags(const uint8_t* p, size_t n) {
+  return n >= kSnapshotHead && memcmp(p, "SOWE", 4) == 0 ? p[offsetof(Snapshot, pad)] : 0;
+}
 
 // The client's strike on a proxy, to the host (reliable, client to host): the enemy's id, the attack record that hit
 // (its name hash, the same in every copy) and where.
@@ -307,9 +315,11 @@ constexpr float kWalkSpeed = 40.0f, kRunSpeed = 350.0f;
 
 class HostTracker {
  public:
+  uint8_t host_flags = 0;  // HostFlag bits sent with each snapshot
   struct Out {
     std::vector<std::vector<uint8_t>> events;  // reliable, in order
-    std::vector<uint8_t> snapshot;             // empty: nothing to send
+    std::vector<uint8_t> snapshot;             // always one: a header alone when no enemy is near (session cm: the client's
+                                               // respawn wait reads the host's flags and the snapshots' arrival)
   };
 
   // `chosen`: the enemies to show now (the caller has limited them to kMaxEnemies). Entries not in it are gone.
@@ -320,11 +330,14 @@ class HostTracker {
     memset(&snap, 0, sizeof snap);
     memcpy(snap.magic, "SOWE", 4);
     snap.seq = ++seq_;
+    snap.pad[0] = host_flags;
     for (const Seen& s : chosen) {
       if (snap.count >= kMaxEnemies) break;
       present[s.key] = true;
       auto it = map_.find(s.key);
-      if (it != map_.end() && strncmp(it->second.type, s.type, kTypeBytes) != 0) {  // the address was reused
+      // The address was reused: another type, or the same type alive where a dead one was (session cm: an orc spawned at a
+      // dead orc's address kept the dead one's id, and the client's exact losses for it were dropped as stale).
+      if (it != map_.end() && (strncmp(it->second.type, s.type, kTypeBytes) != 0 || (!it->second.alive && s.alive))) {
         out.events.push_back(goneEvent(it->second.id));
         map_.erase(it);
         it = map_.end();
@@ -340,6 +353,7 @@ class HostTracker {
         out.events.push_back(newEvent(e.id, e.type));
       }
       Entry& e = it->second;
+      e.alive = s.alive;
       if (s.member_id != kNoMember && (e.member_id != s.member_id || e.faction_hash != s.faction_hash)) {
         e.member_id = s.member_id;
         e.faction_hash = s.faction_hash;
@@ -372,9 +386,7 @@ class HostTracker {
         ++it;
       }
     }
-    if (snap.count) {
-      out.snapshot.assign(reinterpret_cast<const uint8_t*>(&snap), reinterpret_cast<const uint8_t*>(&snap) + SnapshotBytes(snap.count));
-    }
+    out.snapshot.assign(reinterpret_cast<const uint8_t*>(&snap), reinterpret_cast<const uint8_t*>(&snap) + SnapshotBytes(snap.count));
     return out;
   }
 
@@ -404,6 +416,7 @@ class HostTracker {
     uint64_t last_ms = 0;
     float speed = 0;
     uint8_t loco = kIdle;
+    bool alive = true;  // as last seen
   };
   static std::vector<uint8_t> newEvent(uint32_t id, const char type[kTypeBytes]) {
     std::vector<uint8_t> e(1 + 4 + kTypeBytes);
