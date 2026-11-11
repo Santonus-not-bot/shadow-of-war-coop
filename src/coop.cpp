@@ -2525,7 +2525,7 @@ const wchar_t* NetStatusName(sownet::Status s) {
 bool g_join_active = false;
 HANDLE g_join_event = nullptr;
 volatile LONG g_join_state = 0;  // 0 waiting, 1 the host's save is in hand
-ULONGLONG g_join_deadline = 0;
+ULONGLONG g_join_deadline = 0, g_join_started = 0;
 std::vector<uint8_t> g_join_save;
 
 [[noreturn]] void JoinFail(const wchar_t* why) {
@@ -2556,8 +2556,22 @@ void JoinTick() {
   const sownet::Status st = g_net->status();
   const uint8_t reason = g_net->rejectReason();
   const size_t want = g_net->saveSize();
+  const size_t got = g_net->saveProgress();
   if (st == sownet::Status::kConnected && g_net->receivedSave().size() == want) g_join_save = g_net->receivedSave();
   LeaveCriticalSection(&g_net_lock);
+  // While the host's save arrives, the deadline moves on with it: coop_join_timeout_sec without a new byte, at most 10 minutes in
+  // all (session cm: over a 512 kbit/s link the 2.3 MB save needs about 40 s, and a fixed 20 s failed the join).
+  static size_t last_got = 0;
+  static ULONGLONG last_note = 0;
+  if (st == sownet::Status::kSyncing && got > last_got) {
+    last_got = got;
+    const ULONGLONG now = GetTickCount64(), ext = now + (ULONGLONG)g_cfg.join_timeout_sec * 1000;
+    if (ext > g_join_deadline) g_join_deadline = std::min(ext, g_join_started + 600000);
+    if (now - last_note >= 10000 && want) {
+      last_note = now;
+      SowLog(L"coop: the host's save: %zu of %zu bytes (%zu%%)", got, want, got * 100 / want);
+    }
+  }
   if (st == sownet::Status::kRejected) JoinFail(RejectText(reason));
   if (st == sownet::Status::kClosed) JoinFail(L"The host closed the connection.");
   if (st == sownet::Status::kConnected) {
@@ -2768,9 +2782,10 @@ bool StartNet(const CoopConfig& cfg) {
     if (cfg.join && !cfg.save_dir.empty()) {
       g_join_active = true;
       g_join_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-      g_join_deadline = GetTickCount64() + (ULONGLONG)cfg.join_timeout_sec * 1000;
+      g_join_started = GetTickCount64();
+      g_join_deadline = g_join_started + (ULONGLONG)cfg.join_timeout_sec * 1000;
       SteamSetBeforeSaveRead(&JoinGate);
-      SowLog(L"coop: this client plays in the host's save: it is taken before the game reads its own (%u s allowed)",
+      SowLog(L"coop: this client plays in the host's save: it is taken before the game reads its own (%u s allowed without an answer or a new byte of it)",
              cfg.join_timeout_sec);
     } else {
       SowLog(L"coop: this client keeps its own save (coop_join=off)");

@@ -6,7 +6,8 @@ host's enemies, fights them, and is hurt by them. Progress stays in the host's w
 touched.
 
 **Status: early.** Everything below was tested with two game copies on one PC, over loopback and over a simulated bad
-network, never yet between two PCs over a real network. Read "What works" and "Known problems" first.
+network, never yet between two PCs over a real network. Read "What works" and "Known problems" first. If you are among
+the first to play it on two PCs, [TWO-PC-TEST.md](TWO-PC-TEST.md) lists what to try and what to send back.
 
 ## What you need
 
@@ -45,7 +46,9 @@ network, never yet between two PCs over a real network. Read "What works" and "K
    coop_host=...`); open the host's firewall for the game once if Windows asks (UDP, private network).
 2. **Client** starts after the host is up. While the game starts, the mod connects and copies the host's save; the
    game then loads it. If that fails, the game closes with a message saying why (no host, wrong password, other
-   version, the host has no save yet, the transfer was damaged or too slow).
+   version, the host has no save yet, the transfer was damaged or stalled). On a slow link the save (about 2.3 MB) can take
+   minutes: the client waits as long as it keeps arriving (up to 10 minutes) and logs its progress
+   (`the host's save: ... bytes`); then press Start on the title screen if the game is still there.
 3. Both play in the same world. A client that starts far from where the host is now is taken next to the host once it is in the world; the host's enemies appear on the
    client; the client's strikes hurt them; they hit back.
 4. When the host fast-travels (or respawns), the client follows within a couple of seconds. A client that fast-travels (or respawns) alone is taken back to the host a few seconds after it arrives.
@@ -209,4 +212,5 @@ you did and roughly when the problem happened.
 - "The host did not answer": the host is not running yet, the address or port is wrong, a firewall blocks UDP, or the
   VPN is down (ping the host's VPN address).
 - "The co-op password is wrong" / "a different version": use the same password and the same mod build on both sides.
-- Stuck at a black screen while joining: wait up to 20 s; if the host is paused in a death screen, press Back there.
+- Stuck at a black screen while joining: the host's save is still arriving (the client's log shows `the host's save: ...
+  bytes`; on a slow link this takes minutes, up to 10). If the host is paused in a death screen, press Back there.

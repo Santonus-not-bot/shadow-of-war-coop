@@ -369,7 +369,7 @@ Build in the public tree, then pack:
 python -I release\make_package.py <out folder> --version 0.1.0
 ```
 
-It packs `bink2w64.dll`, `setup-copy.ps1`, `launch.ps1`, `README-PLAYERS.md` and `LICENSE`
+It packs `bink2w64.dll`, `setup-copy.ps1`, `launch.ps1`, `README-PLAYERS.md`, `TWO-PC-TEST.md` and `LICENSE`
 with a `SHA256SUMS.txt` into `shadow-of-war-coop-<version>.zip` and prints the zip's SHA-256
 for the release notes. It refuses a DLL that holds the private tree's two-copies-on-one-PC
 test code. Checked once (session cm): the package unpacked with all hashes matching, the setup

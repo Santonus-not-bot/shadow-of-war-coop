@@ -20,7 +20,8 @@ struct CoopConfig {
                                        // is given the host's under the name its game asks for
   std::wstring save_local_dir;         // client: the local copy of the same save is replaced too
   bool join = true;                    // coop_join=off: the client plays its own save (tests, tools)
-  unsigned join_timeout_sec = 20;      // coop_join_timeout_sec: no host save by then, the client stops
+  unsigned join_timeout_sec = 20;      // coop_join_timeout_sec: no host answer, or no new byte of its save, for this long: the client
+                                      // stops (a save still arriving moves the deadline on, up to 10 minutes; session cm)
   bool join_message = true;            // a failed join says so in a message box (off in tests)
   // Stage 2 (STAGE2-DESIGN.md): the host's enemies shown on the client as proxies. coop_enemies=on|off.
   bool enemies = false;

@@ -38,6 +38,7 @@ files = [
     ('setup-copy.ps1', os.path.join(here, 'setup-copy.ps1')),
     ('launch.ps1', os.path.join(here, 'launch.ps1')),
     ('README-PLAYERS.md', os.path.join(here, 'README-PLAYERS.md')),
+    ('TWO-PC-TEST.md', os.path.join(here, 'TWO-PC-TEST.md')),
 ]
 lic = os.path.join(root, 'LICENSE')
 if os.path.exists(lic):
